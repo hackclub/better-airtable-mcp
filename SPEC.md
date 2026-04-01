@@ -389,6 +389,12 @@ TTL expires (10 minutes with no tool calls)
   → Stop the sync worker
   → Delete the DuckDB file from disk
   → Clean up in-memory state
+
+Server starts or restarts
+  → Load active bases from `sync_state` where `active_until > now()`
+  → Restore sync workers for those still-active bases
+  → Sweep `DUCKDB_DATA_DIR` for stale `.db` files
+  → Delete any DuckDB file whose base is expired or has no corresponding active `sync_state`
 ```
 
 **Continuous sync scheduling:**
@@ -805,6 +811,7 @@ All configuration via environment variables:
 | **10-minute approval expiry** | Long enough to review, short enough to avoid stale operations |
 | **On-disk DuckDB (not in-memory)** | Survives sync worker restarts; shared across connections |
 | **DuckDB files wiped on redeploy** | Acceptable since they're caches; Postgres is the source of truth for everything durable |
+| **Startup sweep for stale DuckDB files** | TTL-based cleanup is lazy during normal operation, so boot should remove expired or orphaned cache files left behind by crashes/restarts |
 | **Single Airtable OAuth app** | Simpler onboarding; users authorize once, not per-base |
 | **Writes execute as the requesting user** | Shared caches are fine for reads, but Airtable must enforce write permissions for the specific approving/requesting user |
 | **Continuous resync while active** | Avoids drift from a fixed poll loop when sync duration exceeds the nominal interval |
