@@ -27,6 +27,63 @@ type MutationRecord struct {
 	Fields map[string]any `json:"fields,omitempty"`
 }
 
+func (o *MutationOperation) UnmarshalJSON(data []byte) error {
+	type mutationOperationAlias struct {
+		Type    string          `json:"type"`
+		Table   string          `json:"table"`
+		Records json.RawMessage `json:"records"`
+	}
+
+	var alias mutationOperationAlias
+	if err := json.Unmarshal(data, &alias); err != nil {
+		return err
+	}
+
+	o.Type = alias.Type
+	o.Table = alias.Table
+
+	if len(alias.Records) == 0 {
+		o.Records = nil
+		return nil
+	}
+
+	if strings.TrimSpace(alias.Type) == "delete_records" {
+		recordIDs, err := decodeDeleteRecordIDs(alias.Records)
+		if err == nil {
+			o.Records = make([]MutationRecord, 0, len(recordIDs))
+			for _, recordID := range recordIDs {
+				o.Records = append(o.Records, MutationRecord{ID: recordID})
+			}
+			return nil
+		}
+	}
+
+	var records []MutationRecord
+	if err := json.Unmarshal(alias.Records, &records); err != nil {
+		return fmt.Errorf("invalid records payload: %w", err)
+	}
+	o.Records = records
+	return nil
+}
+
+func decodeDeleteRecordIDs(raw json.RawMessage) ([]string, error) {
+	var recordIDs []string
+	if err := json.Unmarshal(raw, &recordIDs); err == nil {
+		return recordIDs, nil
+	}
+
+	var records []MutationRecord
+	if err := json.Unmarshal(raw, &records); err != nil {
+		return nil, fmt.Errorf("invalid delete_records payload")
+	}
+
+	recordIDs = make([]string, 0, len(records))
+	for _, record := range records {
+		recordIDs = append(recordIDs, record.ID)
+	}
+	return recordIDs, nil
+}
+
 type MutateTool struct {
 	runtime *Runtime
 }
@@ -61,8 +118,9 @@ func (MutateTool) Definition() mcp.ToolDefinition {
 								"type": "string",
 							},
 							"records": map[string]any{
-								"type":     "array",
-								"minItems": 1,
+								"type":        "array",
+								"minItems":    1,
+								"description": "For create_records and update_records, records are objects with id/fields. For delete_records, records may be either objects with an id field or plain Airtable record ID strings.",
 							},
 						},
 						"required":             []string{"type", "table", "records"},
@@ -104,13 +162,17 @@ func (t MutateTool) Call(ctx context.Context, raw json.RawMessage) (mcp.ToolCall
 		return mcp.ToolCallResult{}, err
 	}
 
-	return mcp.TextResult(prepared.Summary, map[string]any{
-		"operation_id": prepared.OperationID,
-		"status":       prepared.Status,
-		"approval_url": prepared.ApprovalURL,
-		"expires_at":   prepared.ExpiresAt.Format(time.RFC3339),
-		"summary":      prepared.Summary,
-	}), nil
+	payload := map[string]any{
+		"operation_id":          prepared.OperationID,
+		"status":                prepared.Status,
+		"approval_url":          prepared.ApprovalURL,
+		"expires_at":            prepared.ExpiresAt.Format(time.RFC3339),
+		"summary":               prepared.Summary,
+		"assistant_instruction": approvalURLAssistantInstruction,
+	}
+	return textOnlyResult(formatSingleRowCSV([]string{
+		"operation_id", "status", "approval_url", "expires_at", "summary", "assistant_instruction",
+	}, payload), payload), nil
 }
 
 func toApprovalRequest(ctx context.Context, input MutateInput) approval.MutationRequest {

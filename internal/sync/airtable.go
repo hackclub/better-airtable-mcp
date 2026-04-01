@@ -3,7 +3,9 @@ package syncer
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"net/http"
@@ -31,9 +33,16 @@ type HTTPClient struct {
 	baseURL    string
 	httpClient *http.Client
 	clock      func() time.Time
+	sleep      func(context.Context, time.Duration) error
 
 	mu             sync.Mutex
-	nextBaseWindow map[string]time.Time
+	nextBaseWindow map[string]*rateWindow
+	nextUserWindow map[string]*rateWindow
+}
+
+type rateWindow struct {
+	nextAllowedAt time.Time
+	lastSeen      time.Time
 }
 
 type Base struct {
@@ -93,7 +102,9 @@ func NewHTTPClient(baseURL string, httpClient *http.Client) *HTTPClient {
 		baseURL:        strings.TrimRight(baseURL, "/"),
 		httpClient:     httpClient,
 		clock:          time.Now,
-		nextBaseWindow: make(map[string]time.Time),
+		sleep:          sleepContext,
+		nextBaseWindow: make(map[string]*rateWindow),
+		nextUserWindow: make(map[string]*rateWindow),
 	}
 }
 
@@ -215,7 +226,7 @@ func (c *HTTPClient) doJSON(ctx context.Context, accessToken, method, requestPat
 	}
 
 	for attempt := 0; attempt < 2; attempt++ {
-		if err := c.waitForBaseRateLimit(ctx, requestPath); err != nil {
+		if err := c.waitForRateLimits(ctx, accessToken, requestPath); err != nil {
 			return err
 		}
 
@@ -248,7 +259,7 @@ func (c *HTTPClient) doJSON(ctx context.Context, accessToken, method, requestPat
 		if response.StatusCode == http.StatusTooManyRequests && attempt == 0 {
 			retryDelay := retryAfterDelay(response.Header.Get("Retry-After"))
 			response.Body.Close()
-			if err := sleepContext(ctx, retryDelay); err != nil {
+			if err := c.sleep(ctx, retryDelay); err != nil {
 				return err
 			}
 			continue
@@ -275,25 +286,69 @@ func (c *HTTPClient) doJSON(ctx context.Context, accessToken, method, requestPat
 	return fmt.Errorf("airtable API %s %s returned repeated rate limits", method, requestPath)
 }
 
+func (c *HTTPClient) waitForRateLimits(ctx context.Context, accessToken, requestPath string) error {
+	if err := c.waitForUserRateLimit(ctx, accessToken); err != nil {
+		return err
+	}
+	return c.waitForBaseRateLimit(ctx, requestPath)
+}
+
+func (c *HTTPClient) waitForUserRateLimit(ctx context.Context, accessToken string) error {
+	tokenKey := rateLimitTokenKey(accessToken)
+	if tokenKey == "" {
+		return nil
+	}
+	return c.waitForWindow(ctx, c.nextUserWindow, tokenKey, 20*time.Millisecond)
+}
+
 func (c *HTTPClient) waitForBaseRateLimit(ctx context.Context, requestPath string) error {
 	baseID, ok := airtableBaseIDFromPath(requestPath)
 	if !ok {
 		return nil
 	}
 
+	return c.waitForWindow(ctx, c.nextBaseWindow, baseID, 200*time.Millisecond)
+}
+
+func (c *HTTPClient) waitForWindow(ctx context.Context, windows map[string]*rateWindow, key string, interval time.Duration) error {
+	if strings.TrimSpace(key) == "" {
+		return nil
+	}
+
 	c.mu.Lock()
 	now := c.clock()
-	nextAllowedAt := c.nextBaseWindow[baseID]
+	entry, ok := windows[key]
+	if !ok {
+		entry = &rateWindow{}
+		windows[key] = entry
+	}
+	nextAllowedAt := entry.nextAllowedAt
 	if nextAllowedAt.Before(now) {
 		nextAllowedAt = now
 	}
-	c.nextBaseWindow[baseID] = nextAllowedAt.Add(200 * time.Millisecond)
+	entry.nextAllowedAt = nextAllowedAt.Add(interval)
+	entry.lastSeen = now
+	c.pruneRateWindowsLocked(now)
 	c.mu.Unlock()
 
 	if delay := nextAllowedAt.Sub(now); delay > 0 {
-		return sleepContext(ctx, delay)
+		return c.sleep(ctx, delay)
 	}
 	return nil
+}
+
+func (c *HTTPClient) pruneRateWindowsLocked(now time.Time) {
+	const ttl = 10 * time.Minute
+	for key, window := range c.nextBaseWindow {
+		if now.Sub(window.lastSeen) > ttl {
+			delete(c.nextBaseWindow, key)
+		}
+	}
+	for key, window := range c.nextUserWindow {
+		if now.Sub(window.lastSeen) > ttl {
+			delete(c.nextUserWindow, key)
+		}
+	}
 }
 
 func airtableBaseIDFromPath(requestPath string) (string, bool) {
@@ -325,6 +380,15 @@ func retryAfterDelay(header string) time.Duration {
 		}
 	}
 	return 30 * time.Second
+}
+
+func rateLimitTokenKey(accessToken string) string {
+	accessToken = strings.TrimSpace(accessToken)
+	if accessToken == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(accessToken))
+	return hex.EncodeToString(sum[:])
 }
 
 func sleepContext(ctx context.Context, delay time.Duration) error {

@@ -7,7 +7,7 @@ import (
 
 func NewCatalog(cfg config.Config, runtime *Runtime) []mcp.Tool {
 	return []mcp.Tool{
-		NewSearchBasesTool(runtime),
+		NewListBasesTool(runtime),
 		NewListSchemaTool(runtime),
 		NewQueryTool(cfg.QueryDefaultLimit, cfg.QueryMaxLimit, runtime),
 		NewMutateTool(runtime),

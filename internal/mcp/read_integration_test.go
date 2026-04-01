@@ -159,22 +159,50 @@ func TestAuthenticatedReadToolsOverMCP(t *testing.T) {
 
 	handler := oauth.NewMiddleware(store).RequireBearer(mcp.NewHandler("better-airtable-mcp", "0.1.0", tools.NewCatalog(cfg, runtime)))
 
-	searchResponse := performAuthenticatedToolCall(t, handler, bearerToken, "search_bases", map[string]any{"query": "project"})
+	searchResponse := performAuthenticatedToolCall(t, handler, bearerToken, "list_bases", map[string]any{"query": "project"})
+	searchText := firstToolText(t, searchResponse)
+	if !strings.Contains(searchText, "Project Tracker") {
+		t.Fatalf("expected list_bases text to include base name, got %q", searchText)
+	}
 	searchResult := searchResponse["result"].(map[string]any)["structuredContent"].(map[string]any)
 	bases := searchResult["bases"].([]any)
 	if len(bases) != 1 {
 		t.Fatalf("expected 1 base, got %#v", bases)
 	}
 
+	schemaResponse := performAuthenticatedToolCall(t, handler, bearerToken, "list_schema", map[string]any{
+		"base": "Project Tracker",
+	})
+	schemaText := firstToolText(t, schemaResponse)
+	if !strings.Contains(schemaText, "tables\n") || !strings.Contains(schemaText, "tblProjects,projects,Projects,1") {
+		t.Fatalf("expected list_schema text to contain CSV table metadata, got %q", schemaText)
+	}
+
 	queryResponse := performAuthenticatedToolCall(t, handler, bearerToken, "query", map[string]any{
 		"base": "Project Tracker",
 		"sql":  "SELECT p.name, t.name AS task_name FROM projects p, UNNEST(p.linked_tasks) AS u(task_id) JOIN tasks t ON t.id = u.task_id",
 	})
+	queryText := firstToolText(t, queryResponse)
+	if !strings.Contains(queryText, "query_rows\n") || !strings.Contains(queryText, "Website Redesign,Design new homepage") {
+		t.Fatalf("expected query text to contain CSV rows, got %q", queryText)
+	}
 	queryResult := queryResponse["result"].(map[string]any)["structuredContent"].(map[string]any)
 	rows := queryResult["rows"].([]any)
 	if len(rows) != 1 {
 		t.Fatalf("expected 1 query row, got %#v", rows)
 	}
+}
+
+func firstToolText(t *testing.T, response map[string]any) string {
+	t.Helper()
+	result := response["result"].(map[string]any)
+	content := result["content"].([]any)
+	if len(content) == 0 {
+		t.Fatal("expected tool result content")
+	}
+	block := content[0].(map[string]any)
+	text, _ := block["text"].(string)
+	return text
 }
 
 func TestAuthenticatedQueryReportsTruncationWhenServerAppliesDefaultLimit(t *testing.T) {

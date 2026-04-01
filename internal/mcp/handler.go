@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"time"
 
 	"github.com/hackclub/better-airtable-mcp/internal/httpx"
 	"github.com/hackclub/better-airtable-mcp/internal/oauth"
@@ -17,6 +18,7 @@ type Handler struct {
 	tools         []Tool
 	toolIndex     map[string]Tool
 	sessions      *SessionManager
+	heartbeat     time.Duration
 }
 
 type rpcRequest struct {
@@ -56,6 +58,7 @@ func NewHandler(serverName, serverVersion string, tools []Tool) *Handler {
 		tools:         tools,
 		toolIndex:     index,
 		sessions:      NewSessionManager(),
+		heartbeat:     25 * time.Second,
 	}
 }
 
@@ -77,14 +80,32 @@ func (h *Handler) handleGet(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		httpx.WriteError(w, http.StatusInternalServerError, "response writer does not support streaming")
+		return
+	}
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
 	w.Header().Set(SessionHeader, sessionID)
 	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write([]byte("event: ready\ndata: {}\n\n"))
-	if flusher, ok := w.(http.Flusher); ok {
-		flusher.Flush()
+
+	h.writeSSEEvent(w, "ready", "{}")
+	flusher.Flush()
+
+	ticker := time.NewTicker(h.heartbeat)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case <-ticker.C:
+			h.writeSSEEvent(w, "ping", "{}")
+			flusher.Flush()
+		}
 	}
 }
 
@@ -249,4 +270,8 @@ func currentSessionOwnerID(ctx context.Context) string {
 		return userID
 	}
 	return ""
+}
+
+func (h *Handler) writeSSEEvent(w http.ResponseWriter, eventName, data string) {
+	_, _ = fmt.Fprintf(w, "event: %s\ndata: %s\n\n", eventName, data)
 }

@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestHandlerInitialize(t *testing.T) {
@@ -81,12 +82,25 @@ func TestHandlerToolsCallReturnsToolErrorResult(t *testing.T) {
 
 func TestHandlerGetMCPReturnsSSEStream(t *testing.T) {
 	handler := NewHandler("better-airtable-mcp", "0.1.0", nil)
+	handler.heartbeat = 10 * time.Millisecond
 	sessionID := initializeSession(t, handler)
-	request := httptest.NewRequest(http.MethodGet, "/mcp", nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 35*time.Millisecond)
+	defer cancel()
+	request := httptest.NewRequest(http.MethodGet, "/mcp", nil).WithContext(ctx)
 	request.Header.Set(SessionHeader, sessionID)
 	recorder := httptest.NewRecorder()
 
-	handler.ServeHTTP(recorder, request)
+	done := make(chan struct{})
+	go func() {
+		handler.ServeHTTP(recorder, request)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("expected GET /mcp handler to exit after context cancellation")
+	}
 
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("expected GET /mcp to return 200, got %d", recorder.Code)
@@ -96,6 +110,9 @@ func TestHandlerGetMCPReturnsSSEStream(t *testing.T) {
 	}
 	if body := recorder.Body.String(); !strings.Contains(body, "event: ready") {
 		t.Fatalf("expected SSE ready event, got %q", body)
+	}
+	if body := recorder.Body.String(); !strings.Contains(body, "event: ping") {
+		t.Fatalf("expected SSE heartbeat ping event, got %q", body)
 	}
 }
 

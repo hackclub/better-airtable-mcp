@@ -16,5 +16,21 @@ services:
       timeout: 5s
       retries: 10
 
+  app:
+    build:
+      context: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/better_airtable_mcp?sslmode=disable
+      DUCKDB_DATA_DIR: /data/duckdb
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./data:/data
+
 volumes:
   postgres_data:

@@ -105,14 +105,18 @@ func (t QueryTool) Call(ctx context.Context, raw json.RawMessage) (mcp.ToolCallR
 	result, truncated := applyQueryResultLimit(result, normalized)
 
 	nextSyncAt := t.runtime.NextSyncTime(result.LastSyncedAt, result.LastSyncDuration)
-	return mcp.TextResult(fmt.Sprintf("Query returned %d row(s).", result.RowCount), map[string]any{
+	payload := map[string]any{
 		"columns":        result.Columns,
 		"rows":           result.Rows,
 		"row_count":      result.RowCount,
 		"truncated":      truncated,
 		"last_synced_at": result.LastSyncedAt.Format(time.RFC3339),
 		"next_sync_at":   nextSyncAt.Format(time.RFC3339),
-	}), nil
+	}
+	return textOnlyResult(
+		formatQueryCSV(result.Columns, result.Rows, result.RowCount, truncated, result.LastSyncedAt.Format(time.RFC3339), nextSyncAt.Format(time.RFC3339)),
+		payload,
+	), nil
 }
 
 func applyQueryResultLimit(result duckdb.QueryResult, normalized NormalizedQuery) (duckdb.QueryResult, bool) {

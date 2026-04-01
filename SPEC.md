@@ -113,7 +113,7 @@ Airtable refresh tokens are **single-use with rotation**. Using a refresh token 
 
 Six tools, designed to minimize context pollution while giving agents full power.
 
-### 3.1 `search_bases`
+### 3.1 `list_bases`
 
 Search for Airtable bases the user has access to.
 
@@ -187,7 +187,7 @@ List all tables in a base with field metadata and sample data.
 ```
 
 **Behavior:**
-- Resolves base by ID or name (via `search_bases` internally if name is given)
+- Resolves base by ID or name (via `list_bases` internally if name is given)
 - If the base is not yet synced, triggers a sync and waits for it to complete
 - Returns 3 sample rows per table from the DuckDB cache
 - Includes the metadata mapping (Airtable IDs ↔ DuckDB names) so the agent can construct mutations later
@@ -731,7 +731,7 @@ better-airtable-mcp/
 │   │   ├── list_schema.go       # list_schema tool implementation
 │   │   ├── mutate.go            # mutate tool implementation
 │   │   ├── sync.go              # sync tool implementation
-│   │   ├── search_bases.go      # search_bases tool implementation
+│   │   ├── search_bases.go      # list_bases tool implementation
 │   │   └── check_operation.go   # check_operation tool implementation
 │   ├── sync/
 │   │   ├── worker.go            # Per-base sync worker goroutine

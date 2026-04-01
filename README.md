@@ -2,29 +2,45 @@
 
 Hosted MCP server for Airtable with fast DuckDB-backed reads and human-approved writes.
 
-This repository is being implemented from [`SPEC.md`](/Users/zrl/dev/hackclub/better-airtable-mcp/SPEC.md). The current slice sets up the Go module, HTTP server scaffold, MCP/tool plumbing, configuration loading, and the pure logic that is already fully specified:
+This repository is being implemented from `SPEC.md`. The current implementation includes:
 
-- Airtable identifier sanitization to DuckDB-friendly `snake_case`
-- Airtable field type to DuckDB type mapping
-- Read-only SQL validation and limit normalization for the `query` tool
-- Initial MCP `initialize`, `tools/list`, and `tools/call` handling
+- OAuth provider flow for MCP clients chained to Airtable OAuth
+- Shared per-base DuckDB caching with continuous sync workers
+- Restart-safe sync restoration and startup cleanup of stale DuckDB files
+- MCP tools for `list_bases`, `list_schema`, `query`, `sync`, `mutate`, and `check_operation`
+- Human approval flow with a bundled React/Vite approval SPA
+- Go unit and integration tests plus frontend unit tests
 
 ## Toolchain
 
-The repo uses [`mise`](https://mise.jdx.dev/) to pin Go:
+The repo uses [`mise`](https://mise.jdx.dev/) to pin Go and Node:
 
 ```bash
 mise install
+mise exec -- npm --prefix frontend test
+mise exec -- npm --prefix frontend run build
 mise exec -- go test ./...
 mise exec -- go build ./...
 ```
 
+Container build:
+
+```bash
+docker build -t better-airtable-mcp:dev .
+```
+
 ## Local Development
 
-Start Postgres with Docker Compose:
+Start Postgres only:
 
 ```bash
 docker compose up -d postgres
+```
+
+Or start the full stack from Docker Compose:
+
+```bash
+docker compose up --build app
 ```
 
 Load the local environment file:
@@ -35,9 +51,11 @@ source .env
 set +a
 ```
 
-Run the test suite and start the server:
+Run the full test/build workflow and start the server locally:
 
 ```bash
+mise exec -- npm --prefix frontend test
+mise exec -- npm --prefix frontend run build
 mise exec -- go test ./...
 mise exec -- go run ./cmd/server
 ```
@@ -49,6 +67,8 @@ http://localhost:8080/oauth/airtable/callback
 ```
 
 `BASE_URL=http://localhost:8080` is fine for a same-machine browser-based smoke test. If you want to test from a hosted MCP client or anything not running against your local machine directly, switch `BASE_URL` to a public HTTPS tunnel URL and update the Airtable callback to match exactly.
+
+When running the app inside Docker Compose, the app container overrides `DATABASE_URL` to use the internal Postgres hostname, while the checked-in `.env.example` keeps the host-machine URL for local `go run` development.
 
 ## Environment
 

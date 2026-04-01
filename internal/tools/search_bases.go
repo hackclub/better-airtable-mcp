@@ -15,18 +15,18 @@ type SearchBasesInput struct {
 	Query string `json:"query,omitempty"`
 }
 
-type SearchBasesTool struct {
+type ListBasesTool struct {
 	runtime *Runtime
 }
 
-func NewSearchBasesTool(runtime *Runtime) mcp.Tool {
-	return SearchBasesTool{runtime: runtime}
+func NewListBasesTool(runtime *Runtime) mcp.Tool {
+	return ListBasesTool{runtime: runtime}
 }
 
-func (SearchBasesTool) Definition() mcp.ToolDefinition {
+func (ListBasesTool) Definition() mcp.ToolDefinition {
 	return mcp.ToolDefinition{
-		Name:        "search_bases",
-		Description: "Search Airtable bases the authenticated user can access.",
+		Name:        "list_bases",
+		Description: "List Airtable bases the authenticated user can access, optionally filtered by a query string.",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -40,7 +40,7 @@ func (SearchBasesTool) Definition() mcp.ToolDefinition {
 	}
 }
 
-func (t SearchBasesTool) Call(ctx context.Context, raw json.RawMessage) (mcp.ToolCallResult, error) {
+func (t ListBasesTool) Call(ctx context.Context, raw json.RawMessage) (mcp.ToolCallResult, error) {
 	var input SearchBasesInput
 	if err := decodeArgs(raw, &input); err != nil {
 		return mcp.ToolCallResult{}, err
@@ -48,7 +48,7 @@ func (t SearchBasesTool) Call(ctx context.Context, raw json.RawMessage) (mcp.Too
 
 	input.Query = strings.TrimSpace(input.Query)
 	if t.runtime == nil || t.runtime.Syncer == nil {
-		return mcp.ErrorResult("search_bases is not implemented yet", map[string]any{
+		return mcp.ErrorResult("list_bases is not implemented yet", map[string]any{
 			"query": input.Query,
 		}), nil
 	}
@@ -85,7 +85,8 @@ func (t SearchBasesTool) Call(ctx context.Context, raw json.RawMessage) (mcp.Too
 		})
 	}
 
-	return mcp.TextResult(fmt.Sprintf("Found %d Airtable base(s).", len(items)), map[string]any{
+	payload := map[string]any{
 		"bases": items,
-	}), nil
+	}
+	return textOnlyResult(formatListBasesCSV(items), payload), nil
 }

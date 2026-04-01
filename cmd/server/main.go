@@ -86,6 +86,7 @@ func main() {
 
 	approvalHandler := approval.NewHandler(toolRuntime.Approval)
 	mux.HandleFunc("/approve/", approvalHandler.ServeApprovalPage)
+	mux.HandleFunc("/approval-ui/", approvalHandler.ServeAssets)
 	mux.HandleFunc("/api/operations/", approvalHandler.ServeOperationAPI)
 
 	server := &http.Server{
@@ -93,7 +94,6 @@ func main() {
 		Handler:           mux,
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,
-		WriteTimeout:      30 * time.Second,
 		IdleTimeout:       2 * time.Minute,
 	}
 

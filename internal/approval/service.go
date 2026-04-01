@@ -184,25 +184,13 @@ func (s *Service) PrepareMutation(ctx context.Context, userID string, request Mu
 	}
 	currentValues := currentValuesSnapshot{}
 
-	tableByName := make(map[string]duckdb.TableSchema, len(schema.Tables))
-	tableNames := make([]string, 0, len(schema.Tables))
-	for _, table := range schema.Tables {
-		tableByName[table.DuckDBTableName] = table
-		tableNames = append(tableNames, table.DuckDBTableName)
-	}
-
 	for _, operation := range request.Operations {
-		table, ok := tableByName[operation.Table]
+		table, tableNames, ok := resolveTableSchema(schema.Tables, operation.Table)
 		if !ok {
 			return PreparedMutation{}, fmt.Errorf("unknown table %q; available tables: %s", operation.Table, strings.Join(suggestions(operation.Table, tableNames), ", "))
 		}
 
-		fieldByName := make(map[string]duckdb.FieldSchema, len(table.Fields))
-		fieldNames := make([]string, 0, len(table.Fields))
-		for _, field := range table.Fields {
-			fieldByName[field.DuckDBColumnName] = field
-			fieldNames = append(fieldNames, field.DuckDBColumnName)
-		}
+		fieldNames := collectFieldAliases(table.Fields)
 
 		resolved := pendingPayloadOperation{
 			Type:              operation.Type,
@@ -248,12 +236,18 @@ func (s *Service) PrepareMutation(ctx context.Context, userID string, request Mu
 				Fields:         cloneMap(record.Fields),
 				AirtableFields: map[string]any{},
 			}
+			resolvedFieldKeys := make(map[string]string, len(record.Fields))
 
 			for fieldName, value := range record.Fields {
-				field, ok := fieldByName[fieldName]
+				field, ok := resolveFieldSchema(table.Fields, fieldName)
 				if !ok {
 					return PreparedMutation{}, fmt.Errorf("unknown field %q on table %q; available fields: %s", fieldName, table.DuckDBTableName, strings.Join(suggestions(fieldName, fieldNames), ", "))
 				}
+				fieldKey := resolvedFieldIdentity(field)
+				if priorName, exists := resolvedFieldKeys[fieldKey]; exists {
+					return PreparedMutation{}, fmt.Errorf("field %q duplicates %q on table %q; use one reference per Airtable field", fieldName, priorName, table.DuckDBTableName)
+				}
+				resolvedFieldKeys[fieldKey] = fieldName
 				resolvedRecord.AirtableFields[field.OriginalName] = value
 			}
 
@@ -611,6 +605,93 @@ func distinctTableCount(operations []pendingPayloadOperation) int {
 		seen[operation.Table] = struct{}{}
 	}
 	return len(seen)
+}
+
+func resolveTableSchema(tables []duckdb.TableSchema, requested string) (duckdb.TableSchema, []string, bool) {
+	lookup := make(map[string]duckdb.TableSchema, len(tables)*3)
+	aliases := make([]string, 0, len(tables)*3)
+	for _, table := range tables {
+		for _, alias := range tableAliases(table) {
+			aliases = append(aliases, alias)
+			key := normalizedAlias(alias)
+			if key == "" {
+				continue
+			}
+			if _, exists := lookup[key]; !exists {
+				lookup[key] = table
+			}
+		}
+	}
+
+	table, ok := lookup[normalizedAlias(requested)]
+	return table, uniqueNonEmptyStrings(aliases...), ok
+}
+
+func resolveFieldSchema(fields []duckdb.FieldSchema, requested string) (duckdb.FieldSchema, bool) {
+	lookup := make(map[string]duckdb.FieldSchema, len(fields)*3)
+	for _, field := range fields {
+		for _, alias := range fieldAliases(field) {
+			key := normalizedAlias(alias)
+			if key == "" {
+				continue
+			}
+			if _, exists := lookup[key]; !exists {
+				lookup[key] = field
+			}
+		}
+	}
+
+	field, ok := lookup[normalizedAlias(requested)]
+	return field, ok
+}
+
+func collectFieldAliases(fields []duckdb.FieldSchema) []string {
+	aliases := make([]string, 0, len(fields)*3)
+	for _, field := range fields {
+		aliases = append(aliases, fieldAliases(field)...)
+	}
+	return uniqueNonEmptyStrings(aliases...)
+}
+
+func tableAliases(table duckdb.TableSchema) []string {
+	return uniqueNonEmptyStrings(table.DuckDBTableName, table.OriginalName, table.AirtableTableID)
+}
+
+func fieldAliases(field duckdb.FieldSchema) []string {
+	return uniqueNonEmptyStrings(field.DuckDBColumnName, field.OriginalName, field.AirtableFieldID)
+}
+
+func resolvedFieldIdentity(field duckdb.FieldSchema) string {
+	switch {
+	case strings.TrimSpace(field.AirtableFieldID) != "":
+		return "id:" + normalizedAlias(field.AirtableFieldID)
+	case strings.TrimSpace(field.OriginalName) != "":
+		return "name:" + normalizedAlias(field.OriginalName)
+	default:
+		return "duck:" + normalizedAlias(field.DuckDBColumnName)
+	}
+}
+
+func normalizedAlias(value string) string {
+	return strings.ToLower(strings.TrimSpace(value))
+}
+
+func uniqueNonEmptyStrings(values ...string) []string {
+	seen := make(map[string]struct{}, len(values))
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		key := normalizedAlias(value)
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		result = append(result, value)
+	}
+	return result
 }
 
 func suggestions(target string, candidates []string) []string {

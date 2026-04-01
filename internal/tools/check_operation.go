@@ -76,7 +76,9 @@ func (t CheckOperationTool) Call(ctx context.Context, raw json.RawMessage) (mcp.
 			if status.Error != "" {
 				payload["error"] = status.Error
 			}
-			return mcp.TextResult(fmt.Sprintf("Operation %s is %s.", status.OperationID, status.Status), payload), nil
+			return textOnlyResult(formatSingleRowCSV([]string{
+				"operation_id", "type", "status", "completed_at", "last_synced_at", "tables_synced", "records_synced", "error",
+			}, payload), payload), nil
 		}
 	}
 
@@ -92,13 +94,18 @@ func (t CheckOperationTool) Call(ctx context.Context, raw json.RawMessage) (mcp.
 			"approval_url": operation.ApprovalURL,
 			"summary":      operation.Summary,
 		}
+		if operation.Status == "pending_approval" {
+			payload["assistant_instruction"] = approvalURLAssistantInstruction
+		}
 		if operation.Result != nil {
 			payload["result"] = operation.Result
 		}
 		if operation.Error != "" {
 			payload["error"] = operation.Error
 		}
-		return mcp.TextResult(fmt.Sprintf("Operation %s is %s.", operation.OperationID, operation.Status), payload), nil
+		return textOnlyResult(formatSingleRowCSV([]string{
+			"operation_id", "type", "status", "approval_url", "summary", "assistant_instruction", "result", "error",
+		}, payload), payload), nil
 	}
 
 	return mcp.ErrorResult("operation tracking is not implemented yet", map[string]any{

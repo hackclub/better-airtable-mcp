@@ -201,18 +201,32 @@ func TestMutateApprovalFlowOverMCP(t *testing.T) {
 			},
 		},
 	})
+	mutateText := firstToolText(t, mutateResponse)
+	if !strings.Contains(mutateText, "operation_id,status,approval_url,expires_at,summary,assistant_instruction\n") {
+		t.Fatalf("expected mutate text CSV header, got %q", mutateText)
+	}
 	mutateStructured := mutateResponse["result"].(map[string]any)["structuredContent"].(map[string]any)
 	operationID := mutateStructured["operation_id"].(string)
 	if mutateStructured["status"].(string) != "pending_approval" {
 		t.Fatalf("expected pending_approval, got %#v", mutateStructured)
 	}
+	if mutateStructured["assistant_instruction"] != tools.AssistantInstructionForApprovalURL() {
+		t.Fatalf("expected assistant instruction in mutate response, got %#v", mutateStructured["assistant_instruction"])
+	}
 
 	checkPending := performAuthenticatedToolCall(t, mux, bearerToken, "check_operation", map[string]any{
 		"operation_id": operationID,
 	})
+	pendingText := firstToolText(t, checkPending)
+	if !strings.Contains(pendingText, "operation_id,type,status,approval_url,summary,assistant_instruction,result,error\n") {
+		t.Fatalf("expected check_operation CSV header, got %q", pendingText)
+	}
 	pendingPayload := checkPending["result"].(map[string]any)["structuredContent"].(map[string]any)
 	if pendingPayload["status"].(string) != "pending_approval" {
 		t.Fatalf("expected pending operation, got %#v", pendingPayload)
+	}
+	if pendingPayload["assistant_instruction"] != tools.AssistantInstructionForApprovalURL() {
+		t.Fatalf("expected assistant instruction in pending operation, got %#v", pendingPayload["assistant_instruction"])
 	}
 
 	getRequest := httptest.NewRequest(http.MethodGet, "/api/operations/"+operationID, nil)
@@ -271,9 +285,412 @@ func TestMutateApprovalFlowOverMCP(t *testing.T) {
 	checkCompleted := performAuthenticatedToolCall(t, mux, bearerToken, "check_operation", map[string]any{
 		"operation_id": operationID,
 	})
+	completedText := firstToolText(t, checkCompleted)
+	if !strings.Contains(completedText, "completed") {
+		t.Fatalf("expected completed operation text to include CSV row, got %q", completedText)
+	}
 	completedPayload := checkCompleted["result"].(map[string]any)["structuredContent"].(map[string]any)
 	if completedPayload["status"].(string) != "completed" {
 		t.Fatalf("expected completed mutate status, got %#v", completedPayload)
+	}
+}
+
+func TestMutateCreateRecordsAcceptsOriginalAirtableFieldNamesOverMCP(t *testing.T) {
+	port := mutateFreePort(t)
+	postgres := embeddedpostgres.NewDatabase(
+		embeddedpostgres.DefaultConfig().
+			Port(uint32(port)).
+			Database("better_airtable_create_mutate_test").
+			Username("postgres").
+			Password("postgres").
+			BinariesPath(filepath.Join(t.TempDir(), "postgres-binaries")).
+			DataPath(filepath.Join(t.TempDir(), "postgres-data")).
+			RuntimePath(filepath.Join(t.TempDir(), "postgres-runtime")),
+	)
+	if err := postgres.Start(); err != nil {
+		t.Fatalf("embedded postgres start failed: %v", err)
+	}
+	defer postgres.Stop()
+
+	store, err := db.Open(context.Background(), fmt.Sprintf("postgres://postgres:postgres@127.0.0.1:%d/better_airtable_create_mutate_test?sslmode=disable", port))
+	if err != nil {
+		t.Fatalf("db.Open() returned error: %v", err)
+	}
+	defer store.Close()
+	if err := store.Migrate(context.Background()); err != nil {
+		t.Fatalf("store.Migrate() returned error: %v", err)
+	}
+
+	var createBodies []map[string]any
+	var recordsMu sync.Mutex
+	records := map[string]map[string]any{}
+	nextRecordNumber := 1
+
+	fakeAirtable := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/v0/meta/bases":
+			writeMCPJSON(t, w, map[string]any{
+				"bases": []map[string]any{
+					{"id": "appProjects", "name": "Project Tracker", "permissionLevel": "create"},
+				},
+			})
+		case r.URL.Path == "/v0/meta/bases/appProjects/tables":
+			writeMCPJSON(t, w, map[string]any{
+				"tables": []map[string]any{
+					{
+						"id":   "tblTable1",
+						"name": "Table 1",
+						"fields": []map[string]any{
+							{"id": "fldName", "name": "Name", "type": "singleLineText"},
+							{"id": "fldNotes", "name": "Notes", "type": "multilineText"},
+							{"id": "fldStatus", "name": "Status", "type": "singleSelect"},
+						},
+					},
+				},
+			})
+		case r.URL.Path == "/v0/appProjects/tblTable1" && r.Method == http.MethodGet:
+			recordsMu.Lock()
+			defer recordsMu.Unlock()
+
+			payload := make([]map[string]any, 0, len(records))
+			for id, fields := range records {
+				payload = append(payload, map[string]any{
+					"id":          id,
+					"createdTime": "2026-04-01T12:00:00Z",
+					"fields":      fields,
+				})
+			}
+			writeMCPJSON(t, w, map[string]any{"records": payload})
+		case r.URL.Path == "/v0/appProjects/tblTable1" && r.Method == http.MethodPost:
+			var request struct {
+				Records []struct {
+					Fields map[string]any `json:"fields"`
+				} `json:"records"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+				t.Fatalf("decode create payload: %v", err)
+			}
+
+			recordsMu.Lock()
+			defer recordsMu.Unlock()
+
+			responseRecords := make([]map[string]any, 0, len(request.Records))
+			for _, record := range request.Records {
+				createBodies = append(createBodies, record.Fields)
+				recordID := fmt.Sprintf("recCreated%d", nextRecordNumber)
+				nextRecordNumber++
+				records[recordID] = cloneAnyMap(record.Fields)
+				responseRecords = append(responseRecords, map[string]any{
+					"id":          recordID,
+					"createdTime": "2026-04-01T12:00:00Z",
+					"fields":      record.Fields,
+				})
+			}
+			writeMCPJSON(t, w, map[string]any{"records": responseRecords})
+		default:
+			t.Fatalf("unexpected Airtable %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer fakeAirtable.Close()
+
+	secret, err := cryptoutil.New([]byte(strings.Repeat("k", 32)))
+	if err != nil {
+		t.Fatalf("cryptoutil.New() returned error: %v", err)
+	}
+	if err := store.UpsertUser(context.Background(), db.User{ID: "user_1"}); err != nil {
+		t.Fatalf("store.UpsertUser() returned error: %v", err)
+	}
+	encryptedToken, err := secret.Encrypt([]byte("airtable-access-token"))
+	if err != nil {
+		t.Fatalf("secret.Encrypt() returned error: %v", err)
+	}
+	if err := store.PutAirtableToken(context.Background(), db.AirtableTokenRecord{
+		UserID:                 "user_1",
+		AccessTokenCiphertext:  encryptedToken,
+		RefreshTokenCiphertext: encryptedToken,
+		ExpiresAt:              time.Now().Add(time.Hour),
+		Scopes:                 "data.records:read data.records:write schema.bases:read",
+	}); err != nil {
+		t.Fatalf("store.PutAirtableToken() returned error: %v", err)
+	}
+
+	bearerToken := "mcp-access-token"
+	if err := store.PutMCPToken(context.Background(), db.MCPTokenRecord{
+		TokenHash:  oauth.HashToken(bearerToken),
+		UserID:     "user_1",
+		ClientID:   ptr("client_claude"),
+		ClientName: ptr("Claude"),
+		CreatedAt:  time.Now().UTC(),
+		ExpiresAt:  time.Now().Add(time.Hour).UTC(),
+	}); err != nil {
+		t.Fatalf("store.PutMCPToken() returned error: %v", err)
+	}
+
+	cfg := config.Config{
+		BaseURL:           mustParseTestURL(t, "http://example.test"),
+		SyncInterval:      time.Minute,
+		SyncTTL:           10 * time.Minute,
+		ApprovalTTL:       10 * time.Minute,
+		QueryDefaultLimit: 100,
+		QueryMaxLimit:     1000,
+	}
+	syncService := syncer.NewService(syncer.NewHTTPClient(fakeAirtable.URL, fakeAirtable.Client()), t.TempDir())
+	runtime := &tools.Runtime{
+		Store:  store,
+		Cipher: secret,
+		Syncer: syncService,
+		Config: cfg,
+	}
+	runtime.SyncManager = syncer.NewManager(syncService, store, runtime, cfg.SyncInterval, cfg.SyncTTL)
+	runtime.Approval = approval.NewService(store, secret, syncService, runtime.SyncManager, runtime, syncer.NewHTTPClient(fakeAirtable.URL, fakeAirtable.Client()), cfg.BaseURLString(), cfg.ApprovalTTL)
+
+	mux := http.NewServeMux()
+	mux.Handle("/mcp", oauth.NewMiddleware(store).RequireBearer(mcp.NewHandler("better-airtable-mcp", "0.1.0", tools.NewCatalog(cfg, runtime))))
+	approvalHandler := approval.NewHandler(runtime.Approval)
+	mux.HandleFunc("/api/operations/", approvalHandler.ServeOperationAPI)
+
+	mutateResponse := performAuthenticatedToolCall(t, mux, bearerToken, "mutate", map[string]any{
+		"base": "appProjects",
+		"operations": []map[string]any{
+			{
+				"type":  "create_records",
+				"table": "table_1",
+				"records": []map[string]any{
+					{
+						"fields": map[string]any{
+							"Name":   "Set up project repo",
+							"Notes":  "Initialized with Next.js and Tailwind",
+							"Status": "Done",
+						},
+					},
+					{
+						"fields": map[string]any{
+							"Name":   "Implement user auth",
+							"Notes":  "OAuth with Google and GitHub",
+							"Status": "Todo",
+						},
+					},
+				},
+			},
+		},
+	})
+
+	mutateStructured := mutateResponse["result"].(map[string]any)["structuredContent"].(map[string]any)
+	if mutateStructured["status"].(string) != "pending_approval" {
+		t.Fatalf("expected pending_approval, got %#v", mutateStructured)
+	}
+	operationID := mutateStructured["operation_id"].(string)
+
+	getRequest := httptest.NewRequest(http.MethodGet, "/api/operations/"+operationID, nil)
+	getRecorder := httptest.NewRecorder()
+	mux.ServeHTTP(getRecorder, getRequest)
+	if getRecorder.Code != http.StatusOK {
+		t.Fatalf("expected GET operation to return 200, got %d: %s", getRecorder.Code, getRecorder.Body.String())
+	}
+
+	var operation approval.OperationView
+	if err := json.Unmarshal(getRecorder.Body.Bytes(), &operation); err != nil {
+		t.Fatalf("json.Unmarshal() returned error: %v", err)
+	}
+	if operation.Operations[0].Table != "table_1" || operation.Operations[0].OriginalTableName != "Table 1" {
+		t.Fatalf("expected table aliases to resolve cleanly, got %#v", operation.Operations[0])
+	}
+
+	approveRequest := httptest.NewRequest(http.MethodPost, "/api/operations/"+operationID+"/approve", strings.NewReader(`{}`))
+	approveRecorder := httptest.NewRecorder()
+	mux.ServeHTTP(approveRecorder, approveRequest)
+	if approveRecorder.Code != http.StatusOK {
+		t.Fatalf("expected approve to return 200, got %d: %s", approveRecorder.Code, approveRecorder.Body.String())
+	}
+
+	var approved approval.OperationView
+	if err := json.Unmarshal(approveRecorder.Body.Bytes(), &approved); err != nil {
+		t.Fatalf("json.Unmarshal() returned error: %v", err)
+	}
+	if approved.Status != "completed" {
+		t.Fatalf("expected approved operation to complete, got %#v", approved)
+	}
+	if approved.Result == nil || len(approved.Result.CreatedRecordIDs) != 2 {
+		t.Fatalf("expected create result to include two record IDs, got %#v", approved.Result)
+	}
+
+	if len(createBodies) != 2 {
+		t.Fatalf("expected two Airtable create payloads, got %#v", createBodies)
+	}
+	for _, body := range createBodies {
+		if _, ok := body["Name"]; !ok {
+			t.Fatalf("expected Airtable create payload to use original field names, got %#v", body)
+		}
+		if _, ok := body["Notes"]; !ok {
+			t.Fatalf("expected Airtable create payload to use original field names, got %#v", body)
+		}
+		if _, ok := body["Status"]; !ok {
+			t.Fatalf("expected Airtable create payload to use original field names, got %#v", body)
+		}
+		if _, ok := body["name"]; ok {
+			t.Fatalf("expected Airtable create payload to avoid duckdb aliases, got %#v", body)
+		}
+	}
+}
+
+func TestMutateDeleteRecordIDsOverMCP(t *testing.T) {
+	port := mutateFreePort(t)
+	postgres := embeddedpostgres.NewDatabase(
+		embeddedpostgres.DefaultConfig().
+			Port(uint32(port)).
+			Database("better_airtable_delete_mutate_test").
+			Username("postgres").
+			Password("postgres").
+			BinariesPath(filepath.Join(t.TempDir(), "postgres-binaries")).
+			DataPath(filepath.Join(t.TempDir(), "postgres-data")).
+			RuntimePath(filepath.Join(t.TempDir(), "postgres-runtime")),
+	)
+	if err := postgres.Start(); err != nil {
+		t.Fatalf("embedded postgres start failed: %v", err)
+	}
+	defer postgres.Stop()
+
+	store, err := db.Open(context.Background(), fmt.Sprintf("postgres://postgres:postgres@127.0.0.1:%d/better_airtable_delete_mutate_test?sslmode=disable", port))
+	if err != nil {
+		t.Fatalf("db.Open() returned error: %v", err)
+	}
+	defer store.Close()
+	if err := store.Migrate(context.Background()); err != nil {
+		t.Fatalf("store.Migrate() returned error: %v", err)
+	}
+
+	fakeAirtable := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/v0/meta/bases":
+			writeMCPJSON(t, w, map[string]any{
+				"bases": []map[string]any{
+					{"id": "appProjects", "name": "Project Tracker", "permissionLevel": "create"},
+				},
+			})
+		case r.URL.Path == "/v0/meta/bases/appProjects/tables":
+			writeMCPJSON(t, w, map[string]any{
+				"tables": []map[string]any{
+					{
+						"id":   "tblProjects",
+						"name": "Projects",
+						"fields": []map[string]any{
+							{"id": "fldName", "name": "Name", "type": "singleLineText"},
+							{"id": "fldStatus", "name": "Status", "type": "singleSelect"},
+						},
+					},
+				},
+			})
+		case r.URL.Path == "/v0/appProjects/tblProjects" && r.Method == http.MethodGet:
+			writeMCPJSON(t, w, map[string]any{
+				"records": []map[string]any{
+					{
+						"id":          "recProject1",
+						"createdTime": "2026-04-01T12:00:00Z",
+						"fields": map[string]any{
+							"Name":   "Website Redesign",
+							"Status": "Planning",
+						},
+					},
+				},
+			})
+		default:
+			t.Fatalf("unexpected Airtable %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer fakeAirtable.Close()
+
+	secret, err := cryptoutil.New([]byte(strings.Repeat("k", 32)))
+	if err != nil {
+		t.Fatalf("cryptoutil.New() returned error: %v", err)
+	}
+	if err := store.UpsertUser(context.Background(), db.User{ID: "user_1"}); err != nil {
+		t.Fatalf("store.UpsertUser() returned error: %v", err)
+	}
+	encryptedToken, err := secret.Encrypt([]byte("airtable-access-token"))
+	if err != nil {
+		t.Fatalf("secret.Encrypt() returned error: %v", err)
+	}
+	if err := store.PutAirtableToken(context.Background(), db.AirtableTokenRecord{
+		UserID:                 "user_1",
+		AccessTokenCiphertext:  encryptedToken,
+		RefreshTokenCiphertext: encryptedToken,
+		ExpiresAt:              time.Now().Add(time.Hour),
+		Scopes:                 "data.records:read data.records:write schema.bases:read",
+	}); err != nil {
+		t.Fatalf("store.PutAirtableToken() returned error: %v", err)
+	}
+
+	bearerToken := "mcp-access-token"
+	if err := store.PutMCPToken(context.Background(), db.MCPTokenRecord{
+		TokenHash:  oauth.HashToken(bearerToken),
+		UserID:     "user_1",
+		ClientID:   ptr("client_claude"),
+		ClientName: ptr("Claude"),
+		CreatedAt:  time.Now().UTC(),
+		ExpiresAt:  time.Now().Add(time.Hour).UTC(),
+	}); err != nil {
+		t.Fatalf("store.PutMCPToken() returned error: %v", err)
+	}
+
+	cfg := config.Config{
+		BaseURL:           mustParseTestURL(t, "http://example.test"),
+		SyncInterval:      time.Minute,
+		SyncTTL:           10 * time.Minute,
+		ApprovalTTL:       10 * time.Minute,
+		QueryDefaultLimit: 100,
+		QueryMaxLimit:     1000,
+	}
+	syncService := syncer.NewService(syncer.NewHTTPClient(fakeAirtable.URL, fakeAirtable.Client()), t.TempDir())
+	runtime := &tools.Runtime{
+		Store:  store,
+		Cipher: secret,
+		Syncer: syncService,
+		Config: cfg,
+	}
+	runtime.SyncManager = syncer.NewManager(syncService, store, runtime, cfg.SyncInterval, cfg.SyncTTL)
+	runtime.Approval = approval.NewService(store, secret, syncService, runtime.SyncManager, runtime, syncer.NewHTTPClient(fakeAirtable.URL, fakeAirtable.Client()), cfg.BaseURLString(), cfg.ApprovalTTL)
+
+	mux := http.NewServeMux()
+	mux.Handle("/mcp", oauth.NewMiddleware(store).RequireBearer(mcp.NewHandler("better-airtable-mcp", "0.1.0", tools.NewCatalog(cfg, runtime))))
+	approvalHandler := approval.NewHandler(runtime.Approval)
+	mux.HandleFunc("/api/operations/", approvalHandler.ServeOperationAPI)
+
+	mutateResponse := performAuthenticatedToolCall(t, mux, bearerToken, "mutate", map[string]any{
+		"base": "appProjects",
+		"operations": []map[string]any{
+			{
+				"type":    "delete_records",
+				"table":   "projects",
+				"records": []string{"recProject1"},
+			},
+		},
+	})
+
+	mutateStructured := mutateResponse["result"].(map[string]any)["structuredContent"].(map[string]any)
+	if mutateStructured["status"].(string) != "pending_approval" {
+		t.Fatalf("expected pending_approval, got %#v", mutateStructured)
+	}
+	operationID := mutateStructured["operation_id"].(string)
+
+	getRequest := httptest.NewRequest(http.MethodGet, "/api/operations/"+operationID, nil)
+	getRecorder := httptest.NewRecorder()
+	mux.ServeHTTP(getRecorder, getRequest)
+	if getRecorder.Code != http.StatusOK {
+		t.Fatalf("expected GET operation to return 200, got %d: %s", getRecorder.Code, getRecorder.Body.String())
+	}
+
+	var operation approval.OperationView
+	if err := json.Unmarshal(getRecorder.Body.Bytes(), &operation); err != nil {
+		t.Fatalf("json.Unmarshal() returned error: %v", err)
+	}
+	if len(operation.Operations) != 1 || len(operation.Operations[0].Records) != 1 {
+		t.Fatalf("unexpected approval preview %#v", operation.Operations)
+	}
+	if operation.Operations[0].Records[0].ID != "recProject1" {
+		t.Fatalf("expected delete preview to reference recProject1, got %#v", operation.Operations[0].Records[0])
+	}
+	if got := operation.Operations[0].Records[0].CurrentFields["name"]; got != "Website Redesign" {
+		t.Fatalf("expected delete preview current data, got %#v", operation.Operations[0].Records[0].CurrentFields)
 	}
 }
 
@@ -297,4 +714,12 @@ func mustParseTestURL(t *testing.T, raw string) *url.URL {
 		t.Fatalf("url.Parse() returned error: %v", err)
 	}
 	return parsed
+}
+
+func cloneAnyMap(input map[string]any) map[string]any {
+	cloned := make(map[string]any, len(input))
+	for key, value := range input {
+		cloned[key] = value
+	}
+	return cloned
 }

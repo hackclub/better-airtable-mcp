@@ -1,0 +1,15 @@
+.git
+.gitignore
+.claude
+.env
+.env.*
+!.env.example
+.DS_Store
+*.swp
+*.swo
+data
+tmp
+coverage.out
+frontend/node_modules
+frontend/.vite
+internal/approval/dist

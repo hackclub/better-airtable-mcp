@@ -73,14 +73,17 @@ func (t SyncTool) Call(ctx context.Context, raw json.RawMessage) (mcp.ToolCallRe
 			return mcp.ToolCallResult{}, err
 		}
 
-		return mcp.TextResult(fmt.Sprintf("Synced base %q.", result.BaseName), map[string]any{
+		payload := map[string]any{
 			"operation_id":      "sync_" + result.BaseID,
 			"status":            "completed",
 			"estimated_seconds": 0,
 			"last_synced_at":    result.LastSyncedAt.Format(time.RFC3339),
 			"tables_synced":     result.TablesSynced,
 			"records_synced":    result.RecordsSynced,
-		}), nil
+		}
+		return textOnlyResult(formatSingleRowCSV([]string{
+			"operation_id", "status", "estimated_seconds", "last_synced_at", "tables_synced", "records_synced",
+		}, payload), payload), nil
 	}
 
 	status, err := t.runtime.SyncManager.RequestSync(ctx, userID, input.Base)
@@ -97,5 +100,7 @@ func (t SyncTool) Call(ctx context.Context, raw json.RawMessage) (mcp.ToolCallRe
 		payload["last_synced_at"] = status.LastSyncedAt.Format(time.RFC3339)
 	}
 
-	return mcp.TextResult(fmt.Sprintf("Started sync for base %q.", status.BaseName), payload), nil
+	return textOnlyResult(formatSingleRowCSV([]string{
+		"operation_id", "status", "estimated_seconds", "last_synced_at",
+	}, payload), payload), nil
 }

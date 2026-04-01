@@ -100,10 +100,14 @@ func (t ListSchemaTool) Call(ctx context.Context, raw json.RawMessage) (mcp.Tool
 		})
 	}
 
-	return mcp.TextResult(fmt.Sprintf("Loaded schema for base %q.", schema.BaseName), map[string]any{
+	payload := map[string]any{
 		"base_id":        schema.BaseID,
 		"base_name":      schema.BaseName,
 		"last_synced_at": schema.LastSyncedAt.Format(time.RFC3339),
 		"tables":         tables,
-	}), nil
+	}
+	return textOnlyResult(
+		formatSchemaCSV(schema.BaseID, schema.BaseName, schema.LastSyncedAt.Format(time.RFC3339), tables),
+		payload,
+	), nil
 }

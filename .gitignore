@@ -1,9 +1,32 @@
+# OS and editor files
 .DS_Store
 *.swp
 *.swo
+.idea/
+.vscode/
+.claude/
+frontend/node_modules/
+frontend/.vite/
+
+# Local environment and secrets
 .env
 .env.*
 !.env.example
+.direnv/
+
+# Local runtime data and caches
+data/
 *.db
 *.duckdb
-data/
+*.log
+tmp/
+
+# Go build and test artifacts
+bin/
+dist/
+!internal/approval/dist/
+!internal/approval/dist/**
+coverage.out
+*.coverprofile
+*.prof
+*.test
