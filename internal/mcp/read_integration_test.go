@@ -180,16 +180,44 @@ func TestAuthenticatedReadToolsOverMCP(t *testing.T) {
 
 	queryResponse := performAuthenticatedToolCall(t, handler, bearerToken, "query", map[string]any{
 		"base": "Project Tracker",
-		"sql":  "SELECT p.name, t.name AS task_name FROM projects p, UNNEST(p.linked_tasks) AS u(task_id) JOIN tasks t ON t.id = u.task_id",
+		"sql": []string{
+			"SELECT p.name, t.name AS task_name FROM projects p, UNNEST(p.linked_tasks) AS u(task_id) JOIN tasks t ON t.id = u.task_id",
+		},
 	})
 	queryText := firstToolText(t, queryResponse)
 	if !strings.Contains(queryText, "query_rows\n") || !strings.Contains(queryText, "Website Redesign,Design new homepage") {
 		t.Fatalf("expected query text to contain CSV rows, got %q", queryText)
 	}
 	queryResult := queryResponse["result"].(map[string]any)["structuredContent"].(map[string]any)
-	rows := queryResult["rows"].([]any)
+	results := queryResult["results"].([]any)
+	if len(results) != 1 {
+		t.Fatalf("expected 1 query result, got %#v", queryResult)
+	}
+	rows := results[0].(map[string]any)["rows"].([]any)
 	if len(rows) != 1 {
 		t.Fatalf("expected 1 query row, got %#v", rows)
+	}
+
+	batchResponse := performAuthenticatedToolCall(t, handler, bearerToken, "query", map[string]any{
+		"base": "Project Tracker",
+		"sql": []string{
+			"SELECT name FROM projects ORDER BY id",
+			"SELECT name FROM tasks ORDER BY id",
+		},
+	})
+	batchText := firstToolText(t, batchResponse)
+	if !strings.Contains(batchText, "query_1_rows\n") || !strings.Contains(batchText, "query_2_rows\n") {
+		t.Fatalf("expected batch query text to contain indexed sections, got %q", batchText)
+	}
+	batchResult := batchResponse["result"].(map[string]any)["structuredContent"].(map[string]any)
+	batchResults := batchResult["results"].([]any)
+	if len(batchResults) != 2 {
+		t.Fatalf("expected 2 batch query results, got %#v", batchResult)
+	}
+	firstRows := batchResults[0].(map[string]any)["rows"].([]any)
+	secondRows := batchResults[1].(map[string]any)["rows"].([]any)
+	if len(firstRows) != 1 || len(secondRows) != 1 {
+		t.Fatalf("expected 1 row per batch result, got first=%#v second=%#v", firstRows, secondRows)
 	}
 }
 
@@ -320,16 +348,23 @@ func TestAuthenticatedQueryReportsTruncationWhenServerAppliesDefaultLimit(t *tes
 
 	queryResponse := performAuthenticatedToolCall(t, handler, bearerToken, "query", map[string]any{
 		"base": "Project Tracker",
-		"sql":  "SELECT id, name FROM projects ORDER BY id",
+		"sql": []string{
+			"SELECT id, name FROM projects ORDER BY id",
+		},
 	})
 	queryResult := queryResponse["result"].(map[string]any)["structuredContent"].(map[string]any)
-	if truncated, ok := queryResult["truncated"].(bool); !ok || !truncated {
+	results := queryResult["results"].([]any)
+	if len(results) != 1 {
+		t.Fatalf("expected 1 query result, got %#v", queryResult)
+	}
+	firstResult := results[0].(map[string]any)
+	if truncated, ok := firstResult["truncated"].(bool); !ok || !truncated {
 		t.Fatalf("expected query to report truncation, got %#v", queryResult)
 	}
-	if rowCount := int(queryResult["row_count"].(float64)); rowCount != 100 {
-		t.Fatalf("expected row_count 100 after truncation, got %#v", queryResult["row_count"])
+	if rowCount := int(firstResult["row_count"].(float64)); rowCount != 100 {
+		t.Fatalf("expected row_count 100 after truncation, got %#v", firstResult["row_count"])
 	}
-	rows := queryResult["rows"].([]any)
+	rows := firstResult["rows"].([]any)
 	if len(rows) != 100 {
 		t.Fatalf("expected 100 rows after truncation, got %d", len(rows))
 	}

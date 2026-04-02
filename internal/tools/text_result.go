@@ -48,6 +48,35 @@ func formatQueryCSV(columns []string, rows [][]any, rowCount int, truncated bool
 	return joinSections(sections...)
 }
 
+func formatBatchQueryCSV(results []formattedQueryResult) string {
+	if len(results) == 1 {
+		result := results[0]
+		return formatQueryCSV(result.Columns, result.Rows, result.RowCount, result.Truncated, result.LastSyncedAt, result.NextSyncAt)
+	}
+
+	sections := make([]string, 0, len(results)*4)
+	for index, result := range results {
+		sections = append(
+			sections,
+			fmt.Sprintf("query_%d_metadata", index+1),
+			csvSection(
+				[]string{"sql", "row_count", "truncated", "last_synced_at", "next_sync_at"},
+				[][]string{{
+					result.SQL,
+					fmt.Sprint(result.RowCount),
+					fmt.Sprint(result.Truncated),
+					result.LastSyncedAt,
+					result.NextSyncAt,
+				}},
+			),
+			fmt.Sprintf("query_%d_rows", index+1),
+			csvSection(result.Columns, csvRows(result.Rows)),
+		)
+	}
+
+	return joinSections(sections...)
+}
+
 func formatSchemaCSV(baseID, baseName, lastSyncedAt string, tables []map[string]any) string {
 	tableRows := make([][]string, 0, len(tables))
 	fieldRows := make([][]string, 0)

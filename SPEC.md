@@ -197,13 +197,16 @@ List all tables in a base with field metadata and sample data.
 
 ### 3.3 `query`
 
-Execute a read-only SQL query against a base's DuckDB cache.
+Execute one or more read-only SQL queries against a base's DuckDB cache.
 
 **Input:**
 ```json
 {
   "base": "string — base ID or base name",
-  "sql": "string — exactly one SELECT or WITH query",
+  "sql": [
+    "string — exactly one SELECT or WITH query",
+    "string — exactly one SELECT or WITH query"
+  ],
   "limit": "number (optional, default 100, max 1000)"
 }
 ```
@@ -211,32 +214,88 @@ Execute a read-only SQL query against a base's DuckDB cache.
 **Output:**
 ```json
 {
-  "columns": ["name", "status", "due_date"],
-  "rows": [
-    ["Website Redesign", "In Progress", "2026-04-15"],
-    ...
-  ],
-  "row_count": 42,
-  "truncated": false,
-  "last_synced_at": "2026-04-01T12:00:00Z",
-  "next_sync_at": "2026-04-01T12:01:00Z"
+  "results": [
+    {
+      "sql": "SELECT name, status, due_date FROM projects WHERE status = 'In Progress' LIMIT 100",
+      "columns": ["name", "status", "due_date"],
+      "rows": [
+        ["Website Redesign", "In Progress", "2026-04-15"],
+        "..."
+      ],
+      "row_count": 42,
+      "truncated": false,
+      "last_synced_at": "2026-04-01T12:00:00Z",
+      "next_sync_at": "2026-04-01T12:01:00Z"
+    }
+  ]
 }
 ```
 
+**MCP tool result format:**
+- `structuredContent` contains the JSON payload above
+- `content[0].text` contains a CSV-style text summary for agents that prefer plain text
+
+Single-query text format:
+```text
+query_metadata
+row_count,truncated,last_synced_at,next_sync_at
+42,false,2026-04-01T12:00:00Z,2026-04-01T12:01:00Z
+
+query_rows
+name,status,due_date
+Website Redesign,In Progress,2026-04-15
+```
+
+Multi-query text format:
+```text
+query_1_metadata
+sql,row_count,truncated,last_synced_at,next_sync_at
+"SELECT name, status FROM projects ORDER BY name LIMIT 100",42,false,2026-04-01T12:00:00Z,2026-04-01T12:01:00Z
+
+query_1_rows
+name,status
+Website Redesign,In Progress
+
+query_2_metadata
+sql,row_count,truncated,last_synced_at,next_sync_at
+"SELECT name FROM tasks ORDER BY name LIMIT 100",12,false,2026-04-01T12:00:00Z,2026-04-01T12:01:00Z
+
+query_2_rows
+name
+Design new homepage
+```
+
 **Behavior:**
-- Validates that the SQL is exactly one top-level `SELECT` or `WITH` statement; rejects multi-statement SQL and anything containing write/DDL/admin statements
+- Requires `sql` to be an array of SQL strings, even when executing only one query; results are returned in the same order as the input batch
+- Validates that each SQL string is exactly one top-level `SELECT` or `WITH` statement; rejects multi-statement SQL and anything containing write/DDL/admin statements
 - Opens a **read-only** DuckDB connection (enforced at the connection level)
-- Applies a default `LIMIT 100` only if the SQL text contains no `LIMIT` token anywhere
-- If the SQL text contains `LIMIT` anywhere, the server assumes the caller is intentionally controlling row count and does not inject its own top-level limit
-- Returns freshness metadata so the agent can inform the user how current the data is
+- Applies a default `LIMIT 100` independently to each query only if that query's SQL text contains no `LIMIT` token anywhere
+- If a query's SQL text contains `LIMIT` anywhere, the server assumes the caller is intentionally controlling row count and does not inject its own top-level limit for that query
+- Returns freshness metadata for each query result so the agent can inform the user how current the data is
 - If the base is not yet synced, triggers a sync and waits
 - DuckDB is hardened as if SQL is hostile: external file access disabled, extension install/load disabled, and arbitrary `ATTACH`, `COPY`, `INSTALL`, `LOAD`, and `PRAGMA` statements rejected
 
 **SQL examples:**
 
-Simple query:
-```sql
-SELECT name, status, due_date FROM projects WHERE status = 'In Progress'
+Single query:
+```json
+{
+  "base": "Project Tracker",
+  "sql": [
+    "SELECT name, status, due_date FROM projects WHERE status = 'In Progress'"
+  ]
+}
+```
+
+Multiple queries:
+```json
+{
+  "base": "Project Tracker",
+  "sql": [
+    "SELECT name, status FROM projects ORDER BY name",
+    "SELECT name FROM tasks ORDER BY name"
+  ]
+}
 ```
 
 Join on linked records:
