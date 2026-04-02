@@ -27,6 +27,7 @@ RUN useradd --uid 10001 --create-home appuser
 WORKDIR /app
 
 COPY --from=go-build /out/better-airtable-mcp /app/better-airtable-mcp
+COPY --from=go-build /src/README.md /app/README.md
 RUN mkdir -p /data/duckdb && chown -R appuser:appuser /app /data
 
 USER appuser
