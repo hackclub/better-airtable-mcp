@@ -22,6 +22,33 @@ func TestNormalizeQueryBatchAcceptsArray(t *testing.T) {
 	}
 }
 
+func TestQueryToolDefinitionRequiresSQLArray(t *testing.T) {
+	definition := NewQueryTool(100, 1000, nil).Definition()
+
+	if definition.Name != "query" {
+		t.Fatalf("expected query tool name, got %q", definition.Name)
+	}
+
+	properties := definition.InputSchema["properties"].(map[string]any)
+	sqlProperty := properties["sql"].(map[string]any)
+	if sqlType, _ := sqlProperty["type"].(string); sqlType != "array" {
+		t.Fatalf("expected sql type array, got %#v", sqlProperty["type"])
+	}
+	if minItems, _ := sqlProperty["minItems"].(int); minItems != 1 {
+		t.Fatalf("expected sql minItems 1, got %#v", sqlProperty["minItems"])
+	}
+
+	items := sqlProperty["items"].(map[string]any)
+	if itemType, _ := items["type"].(string); itemType != "string" {
+		t.Fatalf("expected sql items type string, got %#v", items["type"])
+	}
+
+	required := definition.InputSchema["required"].([]string)
+	if len(required) != 2 || required[0] != "base" || required[1] != "sql" {
+		t.Fatalf("unexpected required fields %#v", required)
+	}
+}
+
 func TestFormatBatchQueryCSVIncludesIndexedSectionsForMultipleQueries(t *testing.T) {
 	text := formatBatchQueryCSV([]formattedQueryResult{
 		{
