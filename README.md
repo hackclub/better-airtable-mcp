@@ -1,5 +1,13 @@
 # Better Airtable MCP
 
+1. Go to https://claude.ai/customize/connectors
+2. Create a new Connector titled **Airtable** with this URL: https://better-airtable-mcp.hackclub.com/mcp
+3. Set permissions to "Always Allow" - `better-airtable-mcp` has an approval flow built-in and will prompt you before creating / modifying / delete records with a web interface
+
+![Google Chrome](https://github.com/user-attachments/assets/5c463e4d-33ad-4f76-973c-a1437c3abfcb)
+
+---
+
 Hosted MCP server for Airtable with fast DuckDB-backed reads and human-approved writes.
 
 This repository is being implemented from `SPEC.md`. The current implementation includes:
