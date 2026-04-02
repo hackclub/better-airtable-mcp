@@ -4,8 +4,8 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
-	"encoding/json"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -21,6 +21,7 @@ const defaultAPIBaseURL = "https://api.airtable.com"
 type Client interface {
 	ListBases(ctx context.Context, accessToken string) ([]Base, error)
 	GetBaseSchema(ctx context.Context, accessToken, baseID string) ([]Table, error)
+	ListRecordsPage(ctx context.Context, accessToken, baseID, tableID string, options ListRecordsPageOptions) (ListRecordsPageResult, error)
 	ListRecords(ctx context.Context, accessToken, baseID, tableID string) ([]Record, error)
 }
 
@@ -90,6 +91,17 @@ type listRecordsResponse struct {
 	Offset  string   `json:"offset"`
 }
 
+type ListRecordsPageOptions struct {
+	Offset        string
+	SortFieldName string
+	SortDirection string
+}
+
+type ListRecordsPageResult struct {
+	Records []Record
+	Offset  string
+}
+
 func NewHTTPClient(baseURL string, httpClient *http.Client) *HTTPClient {
 	if strings.TrimSpace(baseURL) == "" {
 		baseURL = defaultAPIBaseURL
@@ -149,26 +161,48 @@ func (c *HTTPClient) ListRecords(ctx context.Context, accessToken, baseID, table
 	offset := ""
 
 	for {
-		query := url.Values{}
-		query.Set("pageSize", "100")
-		if offset != "" {
-			query.Set("offset", offset)
-		}
-
-		var payload listRecordsResponse
-		recordPath := fmt.Sprintf("/v0/%s/%s", url.PathEscape(baseID), url.PathEscape(tableID))
-		if err := c.doJSON(ctx, accessToken, http.MethodGet, recordPath, query, nil, &payload); err != nil {
+		page, err := c.ListRecordsPage(ctx, accessToken, baseID, tableID, ListRecordsPageOptions{
+			Offset: offset,
+		})
+		if err != nil {
 			return nil, err
 		}
 
-		records = append(records, payload.Records...)
-		if payload.Offset == "" {
+		records = append(records, page.Records...)
+		if page.Offset == "" {
 			break
 		}
-		offset = payload.Offset
+		offset = page.Offset
 	}
 
 	return records, nil
+}
+
+func (c *HTTPClient) ListRecordsPage(ctx context.Context, accessToken, baseID, tableID string, options ListRecordsPageOptions) (ListRecordsPageResult, error) {
+	query := url.Values{}
+	query.Set("pageSize", "100")
+	if options.Offset != "" {
+		query.Set("offset", options.Offset)
+	}
+	if strings.TrimSpace(options.SortFieldName) != "" {
+		query.Set("sort[0][field]", strings.TrimSpace(options.SortFieldName))
+		direction := strings.ToLower(strings.TrimSpace(options.SortDirection))
+		if direction == "" {
+			direction = "desc"
+		}
+		query.Set("sort[0][direction]", direction)
+	}
+
+	var payload listRecordsResponse
+	recordPath := fmt.Sprintf("/v0/%s/%s", url.PathEscape(baseID), url.PathEscape(tableID))
+	if err := c.doJSON(ctx, accessToken, http.MethodGet, recordPath, query, nil, &payload); err != nil {
+		return ListRecordsPageResult{}, err
+	}
+
+	return ListRecordsPageResult{
+		Records: payload.Records,
+		Offset:  payload.Offset,
+	}, nil
 }
 
 func (c *HTTPClient) CreateRecords(ctx context.Context, accessToken, baseID, tableID string, records []MutationRecord) ([]Record, error) {

@@ -69,7 +69,7 @@ func TestFormatBatchQueryCSVIncludesIndexedSectionsForMultipleQueries(t *testing
 			LastSyncedAt: "2026-04-01T12:00:00Z",
 			NextSyncAt:   "2026-04-01T12:01:00Z",
 		},
-	})
+	}, nil)
 
 	if !strings.Contains(text, "query_1_metadata\n") {
 		t.Fatalf("expected first query metadata section, got %q", text)

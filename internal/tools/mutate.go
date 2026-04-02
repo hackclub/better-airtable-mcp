@@ -3,6 +3,7 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -159,6 +160,18 @@ func (t MutateTool) Call(ctx context.Context, raw json.RawMessage) (mcp.ToolCall
 
 	prepared, err := t.runtime.Approval.PrepareMutation(ctx, userID, toApprovalRequest(ctx, input))
 	if err != nil {
+		var notReady approval.RecordsNotSyncedError
+		if errors.As(err, &notReady) {
+			payload := map[string]any{
+				"reason":     "records_not_synced_yet",
+				"base_id":    notReady.BaseID,
+				"base_name":  notReady.BaseName,
+				"table":      notReady.Table,
+				"record_ids": notReady.RecordIDs,
+				"sync":       syncStatusPayload(notReady.Sync),
+			}
+			return mcp.ErrorResult(err.Error(), payload), nil
+		}
 		return mcp.ToolCallResult{}, err
 	}
 

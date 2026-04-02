@@ -90,6 +90,7 @@ func main() {
 
 	approvalHandler := approval.NewHandler(toolRuntime.Approval)
 	mux.HandleFunc("/approve/", approvalHandler.ServeApprovalPage)
+	mux.HandleFunc("/debug", approvalHandler.ServeDebugPage)
 	mux.HandleFunc("/approval-ui/", approvalHandler.ServeAssets)
 	mux.HandleFunc("/api/operations/", approvalHandler.ServeOperationAPI)
 

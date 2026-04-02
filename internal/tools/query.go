@@ -143,10 +143,23 @@ func (t QueryTool) Call(ctx context.Context, raw json.RawMessage) (mcp.ToolCallR
 		return mcp.ToolCallResult{}, fmt.Errorf("missing authenticated user")
 	}
 
+	var baseID string
+	var syncPayload map[string]any
+	var syncStatus *formattedSyncStatus
 	if t.runtime.SyncManager != nil {
-		if _, err := t.runtime.SyncManager.EnsureBaseReady(ctx, userID, input.Base); err != nil {
+		base, err := t.runtime.SyncManager.EnsureBaseReadable(ctx, userID, input.Base)
+		if err != nil {
 			return mcp.ToolCallResult{}, err
 		}
+		baseID = base.ID
+		if status, found := t.runtime.SyncManager.BaseStatus(base.ID); found {
+			syncPayload = syncStatusPayload(status)
+			formatted := formattedSyncStatusFromOperation(status)
+			syncStatus = &formatted
+		}
+	}
+	if baseID == "" {
+		baseID = input.Base
 	}
 
 	accessToken, err := t.runtime.AirtableAccessToken(ctx, userID)
@@ -158,15 +171,17 @@ func (t QueryTool) Call(ctx context.Context, raw json.RawMessage) (mcp.ToolCallR
 	formattedResults := make([]formattedQueryResult, 0, len(normalizedQueries))
 
 	for index, query := range normalizedQueries {
-		result, err := t.runtime.Syncer.QueryBase(ctx, accessToken, input.Base, query.Normalized.ExecutionSQL)
+		result, err := t.runtime.Syncer.QueryBase(ctx, accessToken, baseID, query.Normalized.ExecutionSQL)
 		if err != nil {
 			return mcp.ToolCallResult{}, wrapQueryError(index, len(normalizedQueries), err)
 		}
 		result, truncated := applyQueryResultLimit(result, query.Normalized)
 
-		nextSyncAt := t.runtime.NextSyncTime(result.LastSyncedAt, result.LastSyncDuration)
-		lastSyncedAt := result.LastSyncedAt.Format(time.RFC3339)
-		nextSyncAtText := nextSyncAt.Format(time.RFC3339)
+		lastSyncedAt := formatTimeOrBlank(result.LastSyncedAt)
+		nextSyncAtText := ""
+		if !result.LastSyncedAt.IsZero() {
+			nextSyncAtText = t.runtime.NextSyncTime(result.LastSyncedAt, result.LastSyncDuration).Format(time.RFC3339)
+		}
 
 		payloadResults = append(payloadResults, map[string]any{
 			"sql":             query.Normalized.SQL,
@@ -192,7 +207,10 @@ func (t QueryTool) Call(ctx context.Context, raw json.RawMessage) (mcp.ToolCallR
 	payload := map[string]any{
 		"results": payloadResults,
 	}
-	return textOnlyResult(formatBatchQueryCSV(formattedResults), payload), nil
+	if syncPayload != nil {
+		payload["sync"] = syncPayload
+	}
+	return textOnlyResult(formatBatchQueryCSV(formattedResults, syncStatus), payload), nil
 }
 
 func applyQueryResultLimit(result duckdb.QueryResult, normalized NormalizedQuery) (duckdb.QueryResult, bool) {

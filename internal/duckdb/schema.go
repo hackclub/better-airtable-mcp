@@ -86,15 +86,30 @@ func SanitizeIdentifier(name string) string {
 }
 
 func SanitizeIdentifiers(names []string) []SanitizedName {
+	return sanitizeIdentifiers(names, nil)
+}
+
+func SanitizeFieldIdentifiers(names []string) []SanitizedName {
+	return sanitizeIdentifiers(names, map[string]string{
+		"id":           "_airtable_id",
+		"created_time": "_airtable_created_time",
+	})
+}
+
+func sanitizeIdentifiers(names []string, reserved map[string]string) []SanitizedName {
 	results := make([]SanitizedName, 0, len(names))
 	seen := make(map[string]int, len(names))
 
 	for _, name := range names {
 		base := SanitizeIdentifier(name)
-		seen[base]++
 		sanitized := base
-		if seen[base] > 1 {
-			sanitized = fmt.Sprintf("%s_%d", strings.TrimRight(base, "_"), seen[base])
+		if replacement, ok := reserved[base]; ok {
+			sanitized = replacement
+		}
+
+		seen[sanitized]++
+		if seen[sanitized] > 1 {
+			sanitized = fmt.Sprintf("%s_%d", strings.TrimRight(sanitized, "_"), seen[sanitized])
 		}
 
 		results = append(results, SanitizedName{

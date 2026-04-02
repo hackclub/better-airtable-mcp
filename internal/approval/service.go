@@ -61,6 +61,18 @@ type PreparedMutation struct {
 	Summary     string
 }
 
+type RecordsNotSyncedError struct {
+	BaseID    string
+	BaseName  string
+	Table     string
+	RecordIDs []string
+	Sync      syncer.SyncOperationStatus
+}
+
+func (e RecordsNotSyncedError) Error() string {
+	return fmt.Sprintf("records are not synced yet for table %q: %s", e.Table, strings.Join(e.RecordIDs, ", "))
+}
+
 type OperationView struct {
 	OperationID             string             `json:"operation_id"`
 	Status                  string             `json:"status"`
@@ -161,7 +173,7 @@ func (s *Service) PrepareMutation(ctx context.Context, userID string, request Mu
 
 	var base syncer.Base
 	if s.syncManager != nil {
-		base, err = s.syncManager.EnsureBaseReady(ctx, userID, request.Base)
+		base, err = s.syncManager.EnsureBaseReadable(ctx, userID, request.Base)
 		if err != nil {
 			return PreparedMutation{}, err
 		}
@@ -173,6 +185,7 @@ func (s *Service) PrepareMutation(ctx context.Context, userID string, request Mu
 	if err != nil {
 		return PreparedMutation{}, err
 	}
+	syncStatus, _ := s.syncManager.BaseStatus(base.ID)
 
 	payload := pendingPayload{
 		BaseID:        schema.BaseID,
@@ -217,10 +230,23 @@ func (s *Service) PrepareMutation(ctx context.Context, userID string, request Mu
 				id, _ := row["id"].(string)
 				currentRows[id] = row
 			}
+			missingRecordIDs := make([]string, 0)
 			for _, recordID := range recordIDs {
 				if _, ok := currentRows[recordID]; !ok {
-					return PreparedMutation{}, fmt.Errorf("record %q was not found in table %q", recordID, table.DuckDBTableName)
+					missingRecordIDs = append(missingRecordIDs, recordID)
 				}
+			}
+			if len(missingRecordIDs) > 0 {
+				if !table.TableComplete {
+					return PreparedMutation{}, RecordsNotSyncedError{
+						BaseID:    base.ID,
+						BaseName:  base.Name,
+						Table:     table.DuckDBTableName,
+						RecordIDs: missingRecordIDs,
+						Sync:      syncStatus,
+					}
+				}
+				return PreparedMutation{}, fmt.Errorf("record %q was not found in table %q", missingRecordIDs[0], table.DuckDBTableName)
 			}
 			if currentValues[table.DuckDBTableName] == nil {
 				currentValues[table.DuckDBTableName] = map[string]map[string]any{}
