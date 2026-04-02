@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { DeletePreview } from "./components/DeletePreview";
 import { DiffView } from "./components/DiffView";
+import { McpDebugPage } from "./McpDebugPage";
 import { RecordTable } from "./components/RecordTable";
 import {
   countdownLabel,
@@ -12,6 +13,10 @@ import "./styles.css";
 interface AppProps {
   pathname?: string;
   fetchImpl?: typeof fetch;
+}
+
+function isDebugPath(pathname: string): boolean {
+  return pathname === "/debug" || pathname === "/debug/";
 }
 
 function operationClientLabel(operation: OperationView): string {
@@ -101,6 +106,10 @@ export default function App({
   pathname = window.location.pathname,
   fetchImpl = window.fetch.bind(window),
 }: AppProps) {
+  if (isDebugPath(pathname)) {
+    return <McpDebugPage fetchImpl={fetchImpl} />;
+  }
+
   const operationID = useMemo(() => getOperationIDFromPath(pathname), [pathname]);
   const [operation, setOperation] = useState<OperationView | null>(null);
   const [error, setError] = useState("");

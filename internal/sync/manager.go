@@ -36,10 +36,16 @@ type SyncOperationStatus struct {
 	BaseName         string
 	Type             string
 	Status           string
+	ReadSnapshot     string
+	SyncStartedAt    *time.Time
 	EstimatedSeconds int
 	LastSyncedAt     *time.Time
 	CompletedAt      *time.Time
+	TablesTotal      int
+	TablesStarted    int
 	TablesSynced     int
+	PagesFetched     int64
+	RecordsVisible   int64
 	RecordsSynced    int
 	Error            string
 }
@@ -52,16 +58,24 @@ type workerState struct {
 	manager *Manager
 	wakeCh  chan struct{}
 
-	mu              sync.Mutex
-	activeUntil     time.Time
-	syncTokenUserID string
-	inProgress      bool
-	syncRequested   bool
-	ready           bool
-	lastStartedAt   time.Time
-	lastCompletedAt *time.Time
-	lastResult      SyncResult
-	lastError       string
+	mu                   sync.Mutex
+	activeUntil          time.Time
+	syncTokenUserID      string
+	inProgress           bool
+	syncRequested        bool
+	readable             bool
+	readSnapshotComplete bool
+	needsInitialRefresh  bool
+	lastStartedAt        time.Time
+	lastCompletedAt      *time.Time
+	lastResult           SyncResult
+	lastError            string
+	tablesTotal          int
+	tablesStarted        int
+	tablesCompleted      int
+	pagesFetched         int64
+	recordsVisible       int64
+	recordsSyncedThisRun int64
 }
 
 func NewManager(service *Service, store *db.Store, tokens TokenSource, interval, ttl time.Duration) *Manager {
@@ -144,16 +158,50 @@ func (m *Manager) EnsureBaseReady(ctx context.Context, userID, baseRef string) (
 		return Base{}, err
 	}
 
-	if worker.isReady() {
+	if worker.isCompleteReadable() && !worker.requiresInitialRefresh() {
 		return base, nil
 	}
 
 	hadSnapshot := duckdb.DatabaseFileExists(m.service.basePath(base.ID))
 	worker.requestImmediateSync()
-	if err := worker.waitUntilReady(ctx); err != nil {
+	if err := worker.waitUntilComplete(ctx); err != nil {
 		if hadSnapshot {
 			return base, nil
 		}
+		return Base{}, err
+	}
+	return base, nil
+}
+
+func (m *Manager) EnsureBaseReadable(ctx context.Context, userID, baseRef string) (Base, error) {
+	base, worker, err := m.activateBase(ctx, userID, baseRef)
+	if err != nil {
+		return Base{}, err
+	}
+
+	if worker.isReadable() {
+		return base, nil
+	}
+
+	worker.requestImmediateSync()
+	if err := worker.waitUntilReadable(ctx); err != nil {
+		return Base{}, err
+	}
+	return base, nil
+}
+
+func (m *Manager) EnsureBaseSchemaSampled(ctx context.Context, userID, baseRef string) (Base, error) {
+	base, worker, err := m.activateBase(ctx, userID, baseRef)
+	if err != nil {
+		return Base{}, err
+	}
+
+	if worker.isSchemaSampled() {
+		return base, nil
+	}
+
+	worker.requestImmediateSync()
+	if err := worker.waitUntilSchemaSampled(ctx); err != nil {
 		return Base{}, err
 	}
 	return base, nil
@@ -205,10 +253,11 @@ func (m *Manager) CheckOperation(ctx context.Context, operationID string) (SyncO
 	}
 
 	status := SyncOperationStatus{
-		OperationID: "sync_" + baseID,
-		BaseID:      baseID,
-		Type:        "sync",
-		Status:      "completed",
+		OperationID:  "sync_" + baseID,
+		BaseID:       baseID,
+		Type:         "sync",
+		Status:       "completed",
+		ReadSnapshot: "complete",
 	}
 	if state.LastSyncedAt != nil {
 		status.LastSyncedAt = state.LastSyncedAt
@@ -218,13 +267,28 @@ func (m *Manager) CheckOperation(ctx context.Context, operationID string) (SyncO
 		status.EstimatedSeconds = int((*state.LastSyncDurationMS + 999) / 1000)
 	}
 	if state.TotalTables != nil {
+		status.TablesTotal = *state.TotalTables
+		status.TablesStarted = *state.TotalTables
 		status.TablesSynced = *state.TotalTables
 	}
 	if state.TotalRecords != nil {
+		status.RecordsVisible = *state.TotalRecords
 		status.RecordsSynced = int(*state.TotalRecords)
 	}
 
 	return status, true, nil
+}
+
+func (m *Manager) BaseStatus(baseID string) (SyncOperationStatus, bool) {
+	m.mu.Lock()
+	worker := m.workers[baseID]
+	m.mu.Unlock()
+	if worker == nil {
+		return SyncOperationStatus{}, false
+	}
+	status := worker.snapshotStatus()
+	status.BaseID = baseID
+	return status, true
 }
 
 func (m *Manager) activateBase(ctx context.Context, userID, baseRef string) (Base, *workerState, error) {
@@ -275,6 +339,7 @@ func (m *Manager) getOrCreateWorker(base Base) *workerState {
 		manager:  m,
 		wakeCh:   make(chan struct{}, 1),
 	}
+	worker.seedFromSnapshot()
 	m.workers[base.ID] = worker
 	go worker.run()
 	return worker
@@ -293,6 +358,7 @@ func (m *Manager) restoreWorker(state db.SyncState) {
 			manager:  m,
 			wakeCh:   make(chan struct{}, 1),
 		}
+		worker.seedFromSnapshot()
 		m.workers[state.BaseID] = worker
 		go worker.run()
 	}
@@ -329,9 +395,15 @@ func (w *workerState) run() {
 		startedAt := now.UTC()
 		w.mu.Lock()
 		w.lastStartedAt = startedAt
+		w.lastError = ""
+		w.tablesTotal = 0
+		w.tablesStarted = 0
+		w.tablesCompleted = 0
+		w.pagesFetched = 0
+		w.recordsSyncedThisRun = 0
 		w.mu.Unlock()
 
-		result, err := w.manager.syncOnce(context.Background(), userID, w.baseID)
+		result, err := w.manager.syncOnce(context.Background(), userID, w.baseID, w.baseName, w.handleProgress)
 		completedAt := w.manager.now().UTC()
 
 		w.mu.Lock()
@@ -339,11 +411,23 @@ func (w *workerState) run() {
 		w.lastCompletedAt = &completedAt
 		if err != nil {
 			w.lastError = err.Error()
+			if w.readSnapshotComplete {
+				// A failed refresh should not block readers when a complete snapshot already exists.
+				// Fall back to the existing snapshot and retry on the normal schedule.
+				w.needsInitialRefresh = false
+			}
 		} else {
 			w.lastError = ""
-			w.ready = true
+			w.readable = true
+			w.readSnapshotComplete = true
+			w.needsInitialRefresh = false
 			w.lastResult = result
 			w.baseName = result.BaseName
+			w.tablesTotal = result.TablesSynced
+			w.tablesStarted = result.TablesSynced
+			w.tablesCompleted = result.TablesSynced
+			w.recordsVisible = int64(result.RecordsSynced)
+			w.recordsSyncedThisRun = int64(result.RecordsSynced)
 		}
 		w.mu.Unlock()
 	}
@@ -357,7 +441,7 @@ func (w *workerState) nextAction(now time.Time) (shouldSync bool, waitFor time.D
 		return false, 0, ""
 	}
 
-	if !w.inProgress && (!duckdb.DatabaseFileExists(w.manager.service.basePath(w.baseID)) || w.syncRequested || w.lastStartedAt.IsZero() || !now.Before(w.lastStartedAt.Add(w.manager.interval))) {
+	if !w.inProgress && (!duckdb.DatabaseFileExists(w.manager.service.basePath(w.baseID)) || w.syncRequested || w.needsInitialRefresh || (!w.readSnapshotComplete && (w.lastStartedAt.IsZero() || !now.Before(w.lastStartedAt.Add(w.manager.interval)))) || (w.readSnapshotComplete && (w.lastStartedAt.IsZero() || !now.Before(w.lastStartedAt.Add(w.manager.interval))))) {
 		w.inProgress = true
 		w.syncRequested = false
 		w.lastError = ""
@@ -379,12 +463,77 @@ func (w *workerState) cleanupExpired() {
 	w.manager.removeWorker(w.baseID)
 }
 
+func (w *workerState) seedFromSnapshot() {
+	path := w.manager.service.basePath(w.baseID)
+	if !duckdb.DatabaseFileExists(path) {
+		return
+	}
+
+	w.readable = true
+	info, err := duckdb.ReadSyncInfo(context.Background(), path)
+	if err != nil {
+		return
+	}
+	w.recordsVisible = info.TotalRecords
+	w.recordsSyncedThisRun = info.RecordsSyncedThisRun
+	w.tablesTotal = info.TotalTables
+	if !info.LastSyncedAt.IsZero() && info.Status == "completed" {
+		w.readSnapshotComplete = true
+		w.needsInitialRefresh = true
+		completedAt := info.LastSyncedAt
+		w.lastCompletedAt = &completedAt
+		w.lastResult = SyncResult{
+			BaseID:        w.baseID,
+			BaseName:      w.baseName,
+			LastSyncedAt:  info.LastSyncedAt,
+			TablesSynced:  info.TotalTables,
+			RecordsSynced: int(info.TotalRecords),
+			SyncDuration:  time.Duration(info.SyncDurationMS) * time.Millisecond,
+		}
+		w.tablesStarted = info.TotalTables
+		w.tablesCompleted = info.TotalTables
+	}
+}
+
 func (w *workerState) touch(userID string, activeUntil time.Time) {
 	w.mu.Lock()
 	w.syncTokenUserID = userID
 	w.activeUntil = activeUntil.UTC()
 	w.mu.Unlock()
 	w.notify()
+}
+
+func (w *workerState) handleProgress(progress SyncProgress) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	w.baseName = progress.BaseName
+	w.readable = true
+	w.tablesTotal = progress.TablesTotal
+	w.tablesStarted = progress.TablesStarted
+	w.tablesCompleted = progress.TablesCompleted
+	w.pagesFetched = progress.PagesFetched
+	w.recordsSyncedThisRun = progress.RecordsSyncedThisRun
+	if !progress.SyncStartedAt.IsZero() {
+		startedAt := progress.SyncStartedAt.UTC()
+		w.lastStartedAt = startedAt
+	}
+	if progress.ReadSnapshot == "complete" {
+		w.readSnapshotComplete = true
+	} else if progress.ReadSnapshot == "partial" {
+		w.readSnapshotComplete = false
+		w.recordsVisible = progress.RecordsSyncedThisRun
+	}
+	if progress.Status == "completed" {
+		w.readSnapshotComplete = true
+		w.needsInitialRefresh = false
+		w.recordsVisible = progress.RecordsSyncedThisRun
+		if !progress.LastSyncedAt.IsZero() {
+			w.lastResult.LastSyncedAt = progress.LastSyncedAt.UTC()
+		}
+	} else if progress.Status == "syncing" && !w.readSnapshotComplete {
+		w.needsInitialRefresh = false
+	}
 }
 
 func (w *workerState) restoreFromState(state db.SyncState) {
@@ -399,6 +548,8 @@ func (w *workerState) restoreFromState(state db.SyncState) {
 		completedAt := state.LastSyncedAt.UTC()
 		w.lastCompletedAt = &completedAt
 		w.lastResult.LastSyncedAt = completedAt
+		w.readSnapshotComplete = duckdb.DatabaseFileExists(w.manager.service.basePath(w.baseID))
+		w.readable = w.readSnapshotComplete
 		if state.LastSyncDurationMS != nil {
 			duration := time.Duration(*state.LastSyncDurationMS) * time.Millisecond
 			w.lastResult.SyncDuration = duration
@@ -413,12 +564,18 @@ func (w *workerState) restoreFromState(state db.SyncState) {
 	}
 	if state.TotalTables != nil {
 		w.lastResult.TablesSynced = *state.TotalTables
+		w.tablesTotal = *state.TotalTables
+		w.tablesStarted = *state.TotalTables
+		w.tablesCompleted = *state.TotalTables
 	}
 	if state.TotalRecords != nil {
 		w.lastResult.RecordsSynced = int(*state.TotalRecords)
+		w.recordsVisible = *state.TotalRecords
 	}
 	w.lastResult.BaseID = state.BaseID
-	w.ready = duckdb.DatabaseFileExists(w.manager.service.basePath(w.baseID))
+	if !w.readable {
+		w.readable = duckdb.DatabaseFileExists(w.manager.service.basePath(w.baseID))
+	}
 	w.mu.Unlock()
 	w.notify()
 }
@@ -432,10 +589,35 @@ func (w *workerState) requestImmediateSync() {
 	w.notify()
 }
 
-func (w *workerState) isReady() bool {
+func (w *workerState) isReadable() bool {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	return w.ready
+	return w.readable
+}
+
+func (w *workerState) isCompleteReadable() bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.readable && w.readSnapshotComplete
+}
+
+func (w *workerState) isSchemaSampled() bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if w.readable && w.readSnapshotComplete {
+		return true
+	}
+	if !w.readable {
+		return false
+	}
+	return w.tablesTotal == 0 || w.tablesStarted >= w.tablesTotal
+}
+
+func (w *workerState) requiresInitialRefresh() bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.needsInitialRefresh
 }
 
 func (w *workerState) notify() {
@@ -445,9 +627,61 @@ func (w *workerState) notify() {
 	}
 }
 
-func (w *workerState) waitUntilReady(ctx context.Context) error {
+func (w *workerState) waitUntilReadable(ctx context.Context) error {
 	for {
-		if w.isReady() {
+		if w.isReadable() {
+			return nil
+		}
+
+		w.mu.Lock()
+		lastError := w.lastError
+		inProgress := w.inProgress
+		w.mu.Unlock()
+		if lastError != "" && !inProgress {
+			return fmt.Errorf("sync base %s: %s", w.baseID, lastError)
+		}
+
+		timer := time.NewTimer(100 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
+func (w *workerState) waitUntilComplete(ctx context.Context) error {
+	for {
+		if w.isCompleteReadable() && !w.requiresInitialRefresh() {
+			return nil
+		}
+
+		w.mu.Lock()
+		lastError := w.lastError
+		inProgress := w.inProgress
+		w.mu.Unlock()
+		if lastError != "" && !inProgress {
+			return fmt.Errorf("sync base %s: %s", w.baseID, lastError)
+		}
+
+		timer := time.NewTimer(100 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
+func (w *workerState) waitUntilSchemaSampled(ctx context.Context) error {
+	for {
+		if w.isSchemaSampled() {
 			return nil
 		}
 
@@ -476,11 +710,12 @@ func (w *workerState) snapshotStatus() SyncOperationStatus {
 	defer w.mu.Unlock()
 
 	status := SyncOperationStatus{
-		OperationID: w.opID,
-		BaseID:      w.baseID,
-		BaseName:    w.baseName,
-		Type:        "sync",
-		Status:      "completed",
+		OperationID:  w.opID,
+		BaseID:       w.baseID,
+		BaseName:     w.baseName,
+		Type:         "sync",
+		Status:       "completed",
+		ReadSnapshot: "partial",
 	}
 	if w.inProgress || w.syncRequested {
 		status.Status = "syncing"
@@ -488,6 +723,13 @@ func (w *workerState) snapshotStatus() SyncOperationStatus {
 	if w.lastError != "" && !w.inProgress {
 		status.Status = "failed"
 		status.Error = w.lastError
+	}
+	if w.readSnapshotComplete {
+		status.ReadSnapshot = "complete"
+	}
+	if !w.lastStartedAt.IsZero() {
+		startedAt := w.lastStartedAt
+		status.SyncStartedAt = &startedAt
 	}
 	if !w.lastResult.LastSyncedAt.IsZero() {
 		lastSyncedAt := w.lastResult.LastSyncedAt
@@ -497,8 +739,12 @@ func (w *workerState) snapshotStatus() SyncOperationStatus {
 		completedAt := *w.lastCompletedAt
 		status.CompletedAt = &completedAt
 	}
-	status.TablesSynced = w.lastResult.TablesSynced
-	status.RecordsSynced = w.lastResult.RecordsSynced
+	status.TablesTotal = w.tablesTotal
+	status.TablesStarted = w.tablesStarted
+	status.TablesSynced = w.tablesCompleted
+	status.PagesFetched = w.pagesFetched
+	status.RecordsVisible = w.recordsVisible
+	status.RecordsSynced = int(w.recordsSyncedThisRun)
 	if w.lastResult.SyncDuration > 0 {
 		status.EstimatedSeconds = int((w.lastResult.SyncDuration + time.Second - 1) / time.Second)
 	}
@@ -508,13 +754,13 @@ func (w *workerState) snapshotStatus() SyncOperationStatus {
 	return status
 }
 
-func (m *Manager) syncOnce(ctx context.Context, userID, baseID string) (SyncResult, error) {
+func (m *Manager) syncOnce(ctx context.Context, userID, baseID, baseName string, progress func(SyncProgress)) (SyncResult, error) {
 	accessToken, err := m.tokens.AirtableAccessToken(ctx, userID)
 	if err != nil {
 		return SyncResult{}, err
 	}
 
-	result, err := m.service.SyncBase(ctx, accessToken, baseID)
+	result, err := m.service.runSync(ctx, accessToken, Base{ID: baseID, Name: baseName}, progress)
 	if err != nil {
 		return SyncResult{}, err
 	}

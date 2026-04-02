@@ -68,6 +68,8 @@ mise exec -- go test ./...
 mise exec -- go run ./cmd/server
 ```
 
+Once the server is running locally, open `http://localhost:8080/debug` to run the built-in OAuth flow, mint a bearer token for the local server, inspect the live MCP tool catalog, and execute tool calls manually.
+
 For local Airtable OAuth testing, register this callback URL in your Airtable OAuth app:
 
 ```text

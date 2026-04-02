@@ -91,16 +91,13 @@ func (t SyncTool) Call(ctx context.Context, raw json.RawMessage) (mcp.ToolCallRe
 		return mcp.ToolCallResult{}, err
 	}
 
-	payload := map[string]any{
-		"operation_id":      status.OperationID,
-		"status":            status.Status,
-		"estimated_seconds": status.EstimatedSeconds,
-	}
+	payload := syncStatusPayload(status)
+	payload["estimated_seconds"] = status.EstimatedSeconds
 	if status.LastSyncedAt != nil {
 		payload["last_synced_at"] = status.LastSyncedAt.Format(time.RFC3339)
 	}
 
 	return textOnlyResult(formatSingleRowCSV([]string{
-		"operation_id", "status", "estimated_seconds", "last_synced_at",
+		"operation_id", "status", "read_snapshot", "sync_started_at", "estimated_seconds", "last_synced_at", "tables_total", "tables_started", "tables_completed", "pages_fetched", "records_visible", "records_synced_this_run", "error",
 	}, payload), payload), nil
 }

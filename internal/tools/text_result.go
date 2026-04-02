@@ -10,6 +10,21 @@ import (
 	"github.com/hackclub/better-airtable-mcp/internal/mcp"
 )
 
+type formattedSyncStatus struct {
+	OperationID          string
+	Status               string
+	ReadSnapshot         string
+	SyncStartedAt        string
+	LastSyncedAt         string
+	TablesTotal          int
+	TablesStarted        int
+	TablesCompleted      int
+	PagesFetched         int64
+	RecordsVisible       int64
+	RecordsSyncedThisRun int64
+	Error                string
+}
+
 func textOnlyResult(text string, structured any) mcp.ToolCallResult {
 	return mcp.ToolCallResult{
 		Content:           []mcp.ToolContent{{Type: "text", Text: text}},
@@ -35,8 +50,13 @@ func formatListBasesCSV(rows []map[string]any) string {
 	return csvSection([]string{"id", "name", "permission_level"}, items)
 }
 
-func formatQueryCSV(columns []string, rows [][]any, rowCount int, truncated bool, lastSyncedAt, nextSyncAt string) string {
-	sections := []string{
+func formatQueryCSV(columns []string, rows [][]any, rowCount int, truncated bool, lastSyncedAt, nextSyncAt string, syncStatus *formattedSyncStatus) string {
+	sections := make([]string, 0, 6)
+	if syncStatus != nil {
+		sections = append(sections, "sync_status", formatSyncStatusCSV(*syncStatus))
+	}
+	sections = append(
+		sections,
 		"query_metadata",
 		csvSection(
 			[]string{"row_count", "truncated", "last_synced_at", "next_sync_at"},
@@ -44,17 +64,20 @@ func formatQueryCSV(columns []string, rows [][]any, rowCount int, truncated bool
 		),
 		"query_rows",
 		csvSection(columns, csvRows(rows)),
-	}
+	)
 	return joinSections(sections...)
 }
 
-func formatBatchQueryCSV(results []formattedQueryResult) string {
+func formatBatchQueryCSV(results []formattedQueryResult, syncStatus *formattedSyncStatus) string {
 	if len(results) == 1 {
 		result := results[0]
-		return formatQueryCSV(result.Columns, result.Rows, result.RowCount, result.Truncated, result.LastSyncedAt, result.NextSyncAt)
+		return formatQueryCSV(result.Columns, result.Rows, result.RowCount, result.Truncated, result.LastSyncedAt, result.NextSyncAt, syncStatus)
 	}
 
-	sections := make([]string, 0, len(results)*4)
+	sections := make([]string, 0, len(results)*4+2)
+	if syncStatus != nil {
+		sections = append(sections, "sync_status", formatSyncStatusCSV(*syncStatus))
+	}
 	for index, result := range results {
 		sections = append(
 			sections,
@@ -77,81 +100,53 @@ func formatBatchQueryCSV(results []formattedQueryResult) string {
 	return joinSections(sections...)
 }
 
-func formatSchemaCSV(baseID, baseName, lastSyncedAt string, tables []map[string]any) string {
-	tableRows := make([][]string, 0, len(tables))
-	fieldRows := make([][]string, 0)
-	sampleRows := make([][]string, 0)
+func formatSchemaCSV(baseID, baseName string, tables []map[string]any, syncStatus *formattedSyncStatus) string {
+	sort.SliceStable(tables, func(i, j int) bool {
+		return fmt.Sprint(tables[i]["duckdb_table_name"]) < fmt.Sprint(tables[j]["duckdb_table_name"])
+	})
+
+	sections := make([]string, 0, len(tables)*2+4)
+	if syncStatus != nil {
+		sections = append(sections, "sync_status", formatSyncStatusCSV(*syncStatus))
+	}
+	sections = append(
+		sections,
+		"base",
+		csvSection(
+			[]string{"base_id", "base_name"},
+			[][]string{{baseID, baseName}},
+		),
+		"tables",
+	)
 
 	for _, table := range tables {
 		tableName := fmt.Sprint(table["duckdb_table_name"])
-		tableRows = append(tableRows, []string{
-			fmt.Sprint(table["airtable_table_id"]),
-			tableName,
-			fmt.Sprint(table["original_name"]),
-			fmt.Sprint(table["total_record_count"]),
-		})
-
-		if fields, ok := table["fields"].([]map[string]any); ok {
-			for _, field := range fields {
-				fieldRows = append(fieldRows, []string{
-					tableName,
-					fmt.Sprint(field["airtable_field_id"]),
-					fmt.Sprint(field["duckdb_column_name"]),
-					fmt.Sprint(field["original_name"]),
-					fmt.Sprint(field["type"]),
-					fmt.Sprint(field["airtable_type"]),
-				})
-			}
-		}
-
-		if samples, ok := table["sample_rows"].([]map[string]any); ok {
-			for index, sample := range samples {
-				sampleRows = append(sampleRows, []string{
-					tableName,
-					fmt.Sprint(index + 1),
-					jsonString(sample),
-				})
-			}
-		}
+		headers := schemaTableHeaders(table)
+		rows := schemaSampleRows(table, headers)
+		sections = append(sections, "# "+tableName, csvSection(headers, rows))
 	}
 
-	sort.SliceStable(tableRows, func(i, j int) bool { return tableRows[i][1] < tableRows[j][1] })
-	sort.SliceStable(fieldRows, func(i, j int) bool {
-		if fieldRows[i][0] == fieldRows[j][0] {
-			return fieldRows[i][2] < fieldRows[j][2]
-		}
-		return fieldRows[i][0] < fieldRows[j][0]
-	})
-	sort.SliceStable(sampleRows, func(i, j int) bool {
-		if sampleRows[i][0] == sampleRows[j][0] {
-			return sampleRows[i][1] < sampleRows[j][1]
-		}
-		return sampleRows[i][0] < sampleRows[j][0]
-	})
-
-	sections := []string{
-		"base",
-		csvSection(
-			[]string{"base_id", "base_name", "last_synced_at"},
-			[][]string{{baseID, baseName, lastSyncedAt}},
-		),
-		"tables",
-		csvSection(
-			[]string{"airtable_table_id", "duckdb_table_name", "original_name", "total_record_count"},
-			tableRows,
-		),
-		"fields",
-		csvSection(
-			[]string{"table", "airtable_field_id", "duckdb_column_name", "original_name", "type", "airtable_type"},
-			fieldRows,
-		),
-		"sample_rows",
-		csvSection(
-			[]string{"table", "row_index", "row_json"},
-			sampleRows,
-		),
-	}
 	return joinSections(sections...)
+}
+
+func formatSyncStatusCSV(syncStatus formattedSyncStatus) string {
+	return csvSection(
+		[]string{"operation_id", "status", "read_snapshot", "sync_started_at", "last_synced_at", "tables_total", "tables_started", "tables_completed", "pages_fetched", "records_visible", "records_synced_this_run", "error"},
+		[][]string{{
+			syncStatus.OperationID,
+			syncStatus.Status,
+			syncStatus.ReadSnapshot,
+			syncStatus.SyncStartedAt,
+			syncStatus.LastSyncedAt,
+			fmt.Sprint(syncStatus.TablesTotal),
+			fmt.Sprint(syncStatus.TablesStarted),
+			fmt.Sprint(syncStatus.TablesCompleted),
+			fmt.Sprint(syncStatus.PagesFetched),
+			fmt.Sprint(syncStatus.RecordsVisible),
+			fmt.Sprint(syncStatus.RecordsSyncedThisRun),
+			syncStatus.Error,
+		}},
+	)
 }
 
 func formatSingleRowCSV(headers []string, row map[string]any) string {
@@ -247,4 +242,27 @@ func joinSections(sections ...string) string {
 		}
 	}
 	return buffer.String()
+}
+
+func schemaTableHeaders(table map[string]any) []string {
+	headers := []string{"id", "created_time"}
+	if fields, ok := table["fields"].([]map[string]any); ok {
+		for _, field := range fields {
+			headers = append(headers, fmt.Sprint(field["duckdb_column_name"]))
+		}
+	}
+	return headers
+}
+
+func schemaSampleRows(table map[string]any, headers []string) [][]string {
+	samples, _ := table["sample_rows"].([]map[string]any)
+	rows := make([][]string, 0, len(samples))
+	for _, sample := range samples {
+		row := make([]string, 0, len(headers))
+		for _, header := range headers {
+			row = append(row, csvCell(sample[header]))
+		}
+		rows = append(rows, row)
+	}
+	return rows
 }

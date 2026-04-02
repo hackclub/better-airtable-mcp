@@ -160,7 +160,19 @@ List all tables in a base with field metadata and sample data.
 {
   "base_id": "appXXXXXXXXXX",
   "base_name": "Project Tracker",
-  "last_synced_at": "2026-04-01T12:00:00Z",
+  "last_synced_at": "",
+  "sync": {
+    "operation_id": "sync_appXXXXXXXXXX",
+    "status": "syncing",
+    "read_snapshot": "partial",
+    "sync_started_at": "2026-04-01T12:00:00Z",
+    "tables_total": 8,
+    "tables_started": 8,
+    "tables_completed": 1,
+    "pages_fetched": 8,
+    "records_visible": 430,
+    "records_synced_this_run": 430
+  },
   "tables": [
     {
       "airtable_table_id": "tblXXXXXXXXXX",
@@ -180,17 +192,49 @@ List all tables in a base with field metadata and sample data.
         {"id": "recYYY", "name": "API Migration", "status": "Done"},
         {"id": "recZZZ", "name": "Mobile App", "status": "Planning"}
       ],
-      "total_record_count": 142
+      "visible_record_count": 37,
+      "total_record_count": null,
+      "table_complete": false,
+      "sync_status": "syncing"
     }
   ]
 }
 ```
 
+**MCP tool result text format:**
+```text
+sync_status
+operation_id,status,read_snapshot,sync_started_at,last_synced_at,tables_total,tables_started,tables_completed,pages_fetched,records_visible,records_synced_this_run,error
+sync_appXXXXXXXXXX,syncing,partial,2026-04-01T12:00:00Z,,8,8,1,8,430,430,
+
+base
+base_id,base_name
+appXXXXXXXXXX,Project Tracker
+
+tables
+
+# projects
+id,created_time,name,status
+recXXX,2026-04-01T12:00:00Z,Website Redesign,In Progress
+recYYY,2026-04-01T12:05:00Z,API Migration,Done
+recZZZ,2026-04-01T12:10:00Z,Mobile App,Planning
+
+# tasks
+id,created_time,name
+recTask1,2026-04-01T13:00:00Z,Design new homepage
+recTask2,2026-04-01T13:15:00Z,QA revised layout
+```
+
 **Behavior:**
 - Resolves base by ID or name (via `list_bases` internally if name is given)
-- If the base is not yet synced, triggers a sync and waits for it to complete
-- Returns 3 sample rows per table from the DuckDB cache
+- If the base has no local snapshot yet, initializes schema immediately, creates empty/queryable DuckDB tables, starts a background sync, and waits until the first page for every table has been ingested (or an empty first page proves that table currently has no records) before returning
+- Returns up to 3 sample rows per table from the DuckDB cache
 - Includes the metadata mapping (Airtable IDs ↔ DuckDB names) so the agent can construct mutations later
+- Includes top-level sync progress plus per-table sync state
+- `last_synced_at` is blank until the first full sync completes
+- `visible_record_count` is the number of rows currently queryable from that table
+- `total_record_count` is only authoritative after `table_complete=true`
+- `content[0].text` is organized as `sync_status`, `base`, `tables`, then one `# {duckdb_table_name}` CSV section per table using the queryable column names as headers (`id`, `created_time`, and sanitized Airtable field names)
 - The agent should call this before writing queries or mutations to understand the schema
 
 ---
@@ -214,6 +258,18 @@ Execute one or more read-only SQL queries against a base's DuckDB cache.
 **Output:**
 ```json
 {
+  "sync": {
+    "operation_id": "sync_appXXXXXXXXXX",
+    "status": "syncing",
+    "read_snapshot": "partial",
+    "sync_started_at": "2026-04-01T12:00:00Z",
+    "tables_total": 8,
+    "tables_started": 3,
+    "tables_completed": 1,
+    "pages_fetched": 12,
+    "records_visible": 430,
+    "records_synced_this_run": 430
+  },
   "results": [
     {
       "sql": "SELECT name, status, due_date FROM projects WHERE status = 'In Progress' LIMIT 100",
@@ -224,8 +280,8 @@ Execute one or more read-only SQL queries against a base's DuckDB cache.
       ],
       "row_count": 42,
       "truncated": false,
-      "last_synced_at": "2026-04-01T12:00:00Z",
-      "next_sync_at": "2026-04-01T12:01:00Z"
+      "last_synced_at": "",
+      "next_sync_at": ""
     }
   ]
 }
@@ -237,9 +293,13 @@ Execute one or more read-only SQL queries against a base's DuckDB cache.
 
 Single-query text format:
 ```text
+sync_status
+operation_id,status,read_snapshot,sync_started_at,last_synced_at,tables_total,tables_started,tables_completed,pages_fetched,records_visible,records_synced_this_run,error
+sync_appXXXXXXXXXX,syncing,partial,2026-04-01T12:00:00Z,,8,3,1,12,430,430,
+
 query_metadata
 row_count,truncated,last_synced_at,next_sync_at
-42,false,2026-04-01T12:00:00Z,2026-04-01T12:01:00Z
+42,false,,
 
 query_rows
 name,status,due_date
@@ -248,9 +308,13 @@ Website Redesign,In Progress,2026-04-15
 
 Multi-query text format:
 ```text
+sync_status
+operation_id,status,read_snapshot,sync_started_at,last_synced_at,tables_total,tables_started,tables_completed,pages_fetched,records_visible,records_synced_this_run,error
+sync_appXXXXXXXXXX,syncing,partial,2026-04-01T12:00:00Z,,8,3,1,12,430,430,
+
 query_1_metadata
 sql,row_count,truncated,last_synced_at,next_sync_at
-"SELECT name, status FROM projects ORDER BY name LIMIT 100",42,false,2026-04-01T12:00:00Z,2026-04-01T12:01:00Z
+"SELECT name, status FROM projects ORDER BY name LIMIT 100",42,false,,
 
 query_1_rows
 name,status
@@ -258,7 +322,7 @@ Website Redesign,In Progress
 
 query_2_metadata
 sql,row_count,truncated,last_synced_at,next_sync_at
-"SELECT name FROM tasks ORDER BY name LIMIT 100",12,false,2026-04-01T12:00:00Z,2026-04-01T12:01:00Z
+"SELECT name FROM tasks ORDER BY name LIMIT 100",12,false,,
 
 query_2_rows
 name
@@ -272,7 +336,9 @@ Design new homepage
 - Applies a default `LIMIT 100` independently to each query only if that query's SQL text contains no `LIMIT` token anywhere
 - If a query's SQL text contains `LIMIT` anywhere, the server assumes the caller is intentionally controlling row count and does not inject its own top-level limit for that query
 - Returns freshness metadata for each query result so the agent can inform the user how current the data is
-- If the base is not yet synced, triggers a sync and waits
+- Returns top-level sync progress so the agent can warn the user when they are looking at a partial initial snapshot
+- If the base has no local snapshot yet, initializes schema immediately, starts a background sync, and executes against whatever subset is already visible instead of waiting for a full sync
+- During the very first sync, queries may legitimately return partial or zero-row results even though more data is still loading
 - DuckDB is hardened as if SQL is hostile: external file access disabled, extension install/load disabled, and arbitrary `ATTACH`, `COPY`, `INSTALL`, `LOAD`, and `PRAGMA` statements rejected
 
 **SQL examples:**
@@ -334,6 +400,8 @@ Request a record mutation. All mutations go through the approval flow.
 }
 ```
 
+For `delete_records`, `records` may be either objects containing `id` or plain Airtable record ID strings.
+
 **Field name resolution:** The agent uses snake_case column names (matching DuckDB). The server resolves these to Airtable field IDs internally using the metadata table. If a snake_case name is ambiguous or unresolved, the server returns an error with suggestions.
 
 **Output:**
@@ -347,9 +415,36 @@ Request a record mutation. All mutations go through the approval flow.
 }
 ```
 
+**Alternative output when an update/delete target has not synced yet:**
+```json
+{
+  "reason": "records_not_synced_yet",
+  "base_id": "appXXXXXXXXXX",
+  "base_name": "Project Tracker",
+  "table": "projects",
+  "record_ids": ["recXXX"],
+  "sync": {
+    "operation_id": "sync_appXXXXXXXXXX",
+    "status": "syncing",
+    "read_snapshot": "partial",
+    "sync_started_at": "2026-04-01T12:00:00Z",
+    "tables_total": 8,
+    "tables_started": 3,
+    "tables_completed": 1,
+    "pages_fetched": 12,
+    "records_visible": 430,
+    "records_synced_this_run": 430
+  }
+}
+```
+
 **Behavior:**
 - Validates the payload (field names resolve, record IDs exist for updates, etc.)
-- For updates, fetches current record values from DuckDB to generate the diff
+- `create_records` only requires schema readiness; it does not wait for a full base snapshot
+- For updates/deletes, fetches current record values from DuckDB to generate the diff
+- If an update/delete target ID is absent and that table is still incomplete, returns `records_not_synced_yet` instead of guessing whether the record exists
+- If an update/delete target ID is absent and that table is complete, returns the normal `record not found` validation error
+- Mixed requests are still all-or-nothing at approval-preparation time: if any update/delete target is not yet synced, the whole mutate request is rejected
 - Stores the pending operation in Postgres
 - Returns immediately with the approval URL and operation ID
 - `operation_id` is generated from at least 128 bits of randomness; the approval URL itself is the credential
@@ -376,17 +471,27 @@ Force a refresh of a base's DuckDB cache.
 **Output:**
 ```json
 {
-  "operation_id": "sync_XXXXXXXX",
+  "operation_id": "sync_appXXXXXXXXXX",
   "status": "syncing",
+  "read_snapshot": "partial",
+  "sync_started_at": "2026-04-01T12:00:00Z",
   "estimated_seconds": 15,
-  "last_synced_at": "2026-04-01T11:59:00Z"
+  "last_synced_at": "2026-04-01T11:59:00Z",
+  "tables_total": 8,
+  "tables_started": 3,
+  "tables_completed": 1,
+  "pages_fetched": 12,
+  "records_visible": 430,
+  "records_synced_this_run": 430,
+  "error": ""
 }
 ```
 
 **Behavior:**
 - Non-blocking: returns immediately with an operation ID and ETA
-- ETA is estimated from the last sync's duration for this base (or a rough estimate based on table/record count)
+- ETA is estimated from the last completed sync's duration for this base (or a rough default if no history exists)
 - If a sync is already in progress, returns the existing operation ID
+- Includes live progress counters for the current run
 - The agent can use `check_operation` to poll for completion
 
 ---
@@ -405,12 +510,20 @@ Poll the status of a sync or mutate operation.
 **Output (sync):**
 ```json
 {
-  "operation_id": "sync_XXXXXXXX",
+  "operation_id": "sync_appXXXXXXXXXX",
   "type": "sync",
   "status": "completed | syncing | failed",
+  "read_snapshot": "partial | complete",
+  "sync_started_at": "2026-04-01T12:00:00Z",
   "completed_at": "2026-04-01T12:00:15Z",
-  "tables_synced": 8,
-  "records_synced": 4230
+  "last_synced_at": "2026-04-01T12:00:15Z",
+  "tables_total": 8,
+  "tables_started": 8,
+  "tables_completed": 8,
+  "pages_fetched": 42,
+  "records_visible": 4230,
+  "records_synced_this_run": 4230,
+  "error": ""
 }
 ```
 
@@ -441,7 +554,9 @@ Each active base has a dedicated **sync worker** goroutine.
 ```
 Base becomes active (first query/list_schema)
   → Spawn sync worker goroutine
-  → Immediately perform full sync
+  → Fetch schema and create an empty/queryable DuckDB snapshot immediately
+  → Mark the base readable as soon as schema initialization succeeds
+  → Continue syncing records in the background
   → Enter continuous sync loop while active
   → On each tool call touching this base, reset the TTL timer
 
@@ -467,16 +582,23 @@ Server starts or restarts
 ### 4.2 Full Sync Process
 
 1. Fetch the base schema from Airtable (`GET /v0/meta/bases/{baseId}/tables`)
-2. For each table:
-   a. Paginate through all records (`GET /v0/{baseId}/{tableId}`, 100 records/page)
-   b. Respect rate limit: 5 requests/sec/base
-3. Open the DuckDB write connection
-4. Within a transaction:
-   a. Drop and recreate all tables (full refresh)
-   b. Create the `_metadata` table (see §4.3)
-   c. Insert all records
-   d. Update the `_sync_info` table with the current timestamp
-5. Close the write transaction (readers see the new data atomically)
+2. Create empty DuckDB tables plus `_metadata`, `_sync_info`, and `_table_sync` immediately
+3. For each table, determine a best-effort server-side sort:
+   a. If the table has a real Airtable field of type `createdTime`, request descending sort on that field
+   b. Otherwise, use Airtable's default order
+4. Fetch record pages in a fair round-robin schedule:
+   a. At most one outstanding page request per table at a time
+   b. First page of every table is fetched before the second page of any table, subject to response timing
+   c. Requests are started as aggressively as allowed by the Airtable rate limiter
+5. Apply each fetched page to DuckDB as it arrives and update `_sync_info` / `_table_sync`
+6. Initial sync behavior:
+   a. Pages are written directly into the active DuckDB file
+   b. `query` and `list_schema` can read partial data as soon as schema initialization completes
+7. Refresh behavior after a base already has a complete snapshot:
+   a. Sync into `{base_id}.staging.db`
+   b. Keep serving the last complete active snapshot during the refresh
+   c. Atomically swap the staging DB into place on success
+   d. Discard the staging DB on failure
 
 ### 4.3 DuckDB Schema
 
@@ -499,10 +621,28 @@ CREATE TABLE _metadata (
 **Sync info table** (`_sync_info`):
 ```sql
 CREATE TABLE _sync_info (
+  sync_started_at TIMESTAMP,
   last_synced_at TIMESTAMP,
   sync_duration_ms BIGINT,
   total_records BIGINT,
-  total_tables INTEGER
+  total_tables INTEGER,
+  status VARCHAR,
+  tables_started INTEGER,
+  tables_completed INTEGER,
+  pages_fetched BIGINT,
+  records_synced_this_run BIGINT,
+  error VARCHAR
+);
+```
+
+**Per-table sync table** (`_table_sync`):
+```sql
+CREATE TABLE _table_sync (
+  duckdb_table_name VARCHAR PRIMARY KEY,
+  sync_status VARCHAR,
+  visible_record_count BIGINT,
+  pages_fetched BIGINT,
+  has_more BOOLEAN
 );
 ```
 
@@ -552,6 +692,11 @@ Examples:
 
 Field names follow the same sanitization rules.
 
+Reserved field-name handling:
+- Every synced table already has implicit DuckDB columns named `id` and `created_time`
+- If an Airtable field would sanitize to `id` or `created_time`, the server remaps it to `_airtable_id` or `_airtable_created_time`
+- If those remapped names also collide, numeric suffixes are appended (`_airtable_id_2`, `_airtable_created_time_2`, etc.)
+
 ### 4.6 Shared Cache Model
 
 DuckDB files are **shared across all users** who have access to the same base for reads.
@@ -562,6 +707,8 @@ DuckDB files are **shared across all users** who have access to the same base fo
 - Before allowing a user to mutate a base, verify they still have access to the base, then execute the mutation using that same requesting user's Airtable token so Airtable enforces that user's write permissions
 - **Global rate limiter per base ID** ensures that even with many users, we respect Airtable's 5 req/sec/base limit
 - DuckDB concurrent access: one write connection (sync worker), multiple read-only connections (query handlers)
+- During the first sync of a base, reads use the active partial snapshot
+- During a refresh of an already-complete base, reads stay on the last complete snapshot until the staging refresh finishes successfully
 
 ---
 
@@ -572,7 +719,8 @@ DuckDB files are **shared across all users** who have access to the same base fo
 ```
 Agent calls `mutate` tool
   → Server validates payload, resolves field names to IDs
-  → Server fetches current values for updates (to build diff)
+  → Server fetches current values for updates/deletes (to build diff)
+  → If an update/delete target row has not synced yet, return `records_not_synced_yet` with sync progress instead of creating an approval
   → Server stores pending operation in Postgres
   → Server returns approval URL + operation ID to agent
   → Agent tells user: "Please review and approve: <url>"
@@ -625,7 +773,32 @@ The approval page is a small React/Vite app bundled into the Go binary via `embe
 - **Reject** button (red) — cancels the operation
 - Both require a single click (no second confirmation)
 
-### 5.3 Approval Persistence (Postgres)
+### 5.3 MCP Debug Page
+
+The same embedded React/Vite bundle also exposes a lightweight MCP debugging page at `/debug`.
+
+**Purpose:**
+- Show the live MCP tool catalog exposed by the running server
+- Let a developer complete the normal OAuth flow directly from the browser and obtain a bearer token for this server
+- Let a developer initialize an MCP session directly against `/mcp`
+- Let a developer execute individual tools with editable JSON arguments
+- Show the full JSON-RPC request and response payloads for each tool call
+
+**Behavior:**
+- The page is intended for development/debugging and is not part of the normal end-user approval flow
+- The page is OAuth-only; it does not accept a manually pasted bearer token
+- Clicking `Connect with OAuth` uses the same browser-facing auth flow as any normal MCP client:
+  - register or reuse a public OAuth client via `POST /oauth/register`
+  - generate a browser PKCE verifier/challenge pair
+  - redirect to `GET /oauth/authorize`
+  - return to `/debug?code=...&state=...`
+  - exchange the authorization code at `POST /oauth/token`
+- The page stores the issued bearer token plus debug OAuth client metadata in browser local storage for local debugging convenience
+- After OAuth succeeds, the page can initialize a session, call `tools/list`, and render one interactive card per tool
+- Each tool card shows the tool name, description, input schema, editable JSON arguments, and the full raw response from `tools/call`
+- MCP sessions are in-memory, so a server restart or hot reload invalidates them; if a tool call returns `session was not found`, the page should reinitialize the MCP session once and retry that tool call
+
+### 5.4 Approval Persistence (Postgres)
 
 ```sql
 CREATE TABLE pending_operations (
@@ -766,7 +939,13 @@ CREATE TABLE oauth_clients (
 | POST | `/api/operations/{operation_id}/approve` | API: approve operation |
 | POST | `/api/operations/{operation_id}/reject` | API: reject operation |
 
-### 7.5 Landing
+### 7.5 Debug
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/debug` | Serve embedded MCP debugging page |
+
+### 7.6 Landing
 
 | Method | Path | Purpose |
 |---|---|---|
@@ -862,6 +1041,7 @@ All configuration via environment variables:
 | Decision | Rationale |
 |---|---|
 | **Full sync, not incremental** | Simpler implementation; Airtable's API doesn't support efficient deltas without webhooks |
+| **Schema-first partial reads on initial sync** | Agents can start querying immediately while still seeing explicit sync progress |
 | **Polling, not webhooks** | User reports webhooks are unreliable |
 | **Shared DuckDB per base** | Avoids redundant syncs; Airtable permissions are base-level for reads |
 | **Read-only DuckDB + SQL allowlist** | Prevents agents from corrupting the cache or escaping to the filesystem; enforced by connection config and SQL validation |
@@ -875,6 +1055,8 @@ All configuration via environment variables:
 | **Single Airtable OAuth app** | Simpler onboarding; users authorize once, not per-base |
 | **Writes execute as the requesting user** | Shared caches are fine for reads, but Airtable must enforce write permissions for the specific approving/requesting user |
 | **Continuous resync while active** | Avoids drift from a fixed poll loop when sync duration exceeds the nominal interval |
+| **Round-robin page scheduling across tables** | Prevents one large table from starving every other table during the first sync |
+| **Staging refreshes after the first complete snapshot** | Keeps existing readers on a full snapshot while a refresh is in flight |
 | **Records-only mutations in V1** | Keeps the approval flow and executor focused on the core use case |
 | **Encrypt sensitive state at rest** | Protects third-party tokens and pending mutation payloads stored in Postgres |
 
@@ -887,6 +1069,7 @@ All configuration via environment variables:
 - **50 requests/sec per user token** — enforced per-user
 - **10 records per batch** for create/update/delete
 - **429 responses**: back off for 30 seconds
+- Record sync requests are scheduled round-robin across tables and pushed as hard as the limiter allows
 
 ### Sync Performance (estimates)
 | Base size | Tables | Records | Estimated sync time |
@@ -909,10 +1092,12 @@ All configuration via environment variables:
 |---|---|
 | Airtable token expired, refresh succeeds | Transparent to user |
 | Airtable token expired, refresh fails | Return error; agent tells user to re-authenticate |
-| Sync fails mid-way | Retain previous DuckDB state; log error; retry on next interval |
-| Query on unsynced base | Trigger sync, wait for completion, then execute query |
+| Initial sync fails mid-way | Keep the partial snapshot and mark sync status as failed; retry on next interval or manual sync |
+| Refresh fails mid-way after a base already has a complete snapshot | Retain the previous complete DuckDB state; discard staging DB; log error; retry on next interval |
+| Query on a base with no local snapshot yet | Initialize schema immediately, start a background sync, and execute against the currently visible subset |
 | Query is not exactly one `SELECT` or `WITH` statement | Return validation error; do not execute |
 | Mutate with invalid field names | Return error with suggestions (closest matching field names) |
+| Mutate update/delete target not yet synced | Return `records_not_synced_yet` plus sync progress; do not create an approval |
 | Mutate approved but Airtable API fails before any batch succeeds | Operation status → `failed` with error details |
 | Mutate approved but Airtable API fails after one or more batches succeed | Operation status → `partially_completed`; include partial result details and stop on first failed Airtable request |
 | DuckDB file missing (post-redeploy) | Triggers fresh sync transparently |

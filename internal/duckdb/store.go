@@ -46,10 +46,17 @@ type RecordSnapshot struct {
 }
 
 type SyncInfo struct {
-	LastSyncedAt   time.Time
-	SyncDurationMS int64
-	TotalRecords   int64
-	TotalTables    int
+	SyncStartedAt        time.Time
+	LastSyncedAt         time.Time
+	SyncDurationMS       int64
+	TotalRecords         int64
+	TotalTables          int
+	Status               string
+	TablesStarted        int
+	TablesCompleted      int
+	PagesFetched         int64
+	RecordsSyncedThisRun int64
+	Error                string
 }
 
 type BaseSchema struct {
@@ -60,12 +67,17 @@ type BaseSchema struct {
 }
 
 type TableSchema struct {
-	AirtableTableID  string
-	DuckDBTableName  string
-	OriginalName     string
-	Fields           []FieldSchema
-	SampleRows       []map[string]any
-	TotalRecordCount int64
+	AirtableTableID    string
+	DuckDBTableName    string
+	OriginalName       string
+	Fields             []FieldSchema
+	SampleRows         []map[string]any
+	TotalRecordCount   int64
+	VisibleRecordCount int64
+	TableComplete      bool
+	SyncStatus         string
+	HasMore            bool
+	PagesFetched       int64
 }
 
 type FieldSchema struct {
@@ -82,6 +94,21 @@ type QueryResult struct {
 	RowCount         int
 	LastSyncedAt     time.Time
 	LastSyncDuration time.Duration
+}
+
+type SnapshotInit struct {
+	BaseID        string
+	BaseName      string
+	Tables        []TableSnapshot
+	SyncStartedAt time.Time
+}
+
+type TableSyncState struct {
+	TableName          string
+	SyncStatus         string
+	VisibleRecordCount int64
+	PagesFetched       int64
+	HasMore            bool
 }
 
 func DatabaseFileExists(path string) bool {
@@ -136,18 +163,29 @@ func WriteSnapshot(ctx context.Context, path string, snapshot BaseSnapshot) erro
 		totalRecords += int64(len(table.Records))
 	}
 
-	if _, err := tx.ExecContext(ctx, `DELETE FROM _sync_info`); err != nil {
-		return fmt.Errorf("clear sync info: %w", err)
+	if err := upsertSyncInfo(ctx, tx, SyncInfo{
+		SyncStartedAt:        snapshot.SyncedAt.Add(-snapshot.SyncDuration).UTC(),
+		LastSyncedAt:         snapshot.SyncedAt.UTC(),
+		SyncDurationMS:       snapshot.SyncDuration.Milliseconds(),
+		TotalRecords:         totalRecords,
+		TotalTables:          len(snapshot.Tables),
+		Status:               "completed",
+		TablesStarted:        len(snapshot.Tables),
+		TablesCompleted:      len(snapshot.Tables),
+		PagesFetched:         0,
+		RecordsSyncedThisRun: totalRecords,
+	}); err != nil {
+		return err
 	}
-	if _, err := tx.ExecContext(
-		ctx,
-		`INSERT INTO _sync_info (last_synced_at, sync_duration_ms, total_records, total_tables) VALUES (?, ?, ?, ?)`,
-		snapshot.SyncedAt.UTC(),
-		snapshot.SyncDuration.Milliseconds(),
-		totalRecords,
-		len(snapshot.Tables),
-	); err != nil {
-		return fmt.Errorf("insert sync info: %w", err)
+	for _, table := range snapshot.Tables {
+		if err := upsertTableSyncState(ctx, tx, TableSyncState{
+			TableName:          table.DuckDBTableName,
+			SyncStatus:         "completed",
+			VisibleRecordCount: int64(len(table.Records)),
+			HasMore:            false,
+		}); err != nil {
+			return err
+		}
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -155,6 +193,138 @@ func WriteSnapshot(ctx context.Context, path string, snapshot BaseSnapshot) erro
 	}
 
 	return nil
+}
+
+func InitializeSnapshot(ctx context.Context, path string, init SnapshotInit) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return fmt.Errorf("create duckdb data dir: %w", err)
+	}
+
+	db, err := openDatabase(path, "READ_WRITE")
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin duckdb transaction: %w", err)
+	}
+	defer func() {
+		_ = tx.Rollback()
+	}()
+
+	tableNames, err := listUserTables(ctx, tx)
+	if err != nil {
+		return err
+	}
+	for _, tableName := range tableNames {
+		if _, err := tx.ExecContext(ctx, fmt.Sprintf(`DROP TABLE IF EXISTS %s`, quoteIdent(tableName))); err != nil {
+			return fmt.Errorf("drop table %s: %w", tableName, err)
+		}
+	}
+
+	if err := createMetadataTables(ctx, tx); err != nil {
+		return err
+	}
+	for _, table := range init.Tables {
+		if err := createDataTable(ctx, tx, table); err != nil {
+			return err
+		}
+		if err := insertMetadataRows(ctx, tx, table); err != nil {
+			return err
+		}
+		if err := upsertTableSyncState(ctx, tx, TableSyncState{
+			TableName:          table.DuckDBTableName,
+			SyncStatus:         "pending",
+			VisibleRecordCount: 0,
+			HasMore:            true,
+		}); err != nil {
+			return err
+		}
+	}
+	if err := upsertSyncInfo(ctx, tx, SyncInfo{
+		SyncStartedAt:        init.SyncStartedAt.UTC(),
+		TotalRecords:         0,
+		TotalTables:          len(init.Tables),
+		Status:               "syncing",
+		TablesStarted:        0,
+		TablesCompleted:      0,
+		PagesFetched:         0,
+		RecordsSyncedThisRun: 0,
+	}); err != nil {
+		return err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit initialized duckdb snapshot: %w", err)
+	}
+
+	return nil
+}
+
+func ApplyTablePage(ctx context.Context, path string, table TableSnapshot, records []RecordSnapshot, tableState TableSyncState, info SyncInfo) error {
+	db, err := openDatabase(path, "READ_WRITE")
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin duckdb transaction: %w", err)
+	}
+	defer func() {
+		_ = tx.Rollback()
+	}()
+
+	if err := insertRecords(ctx, tx, TableSnapshot{
+		DuckDBTableName: table.DuckDBTableName,
+		Fields:          table.Fields,
+		Records:         records,
+	}); err != nil {
+		return err
+	}
+	if err := upsertTableSyncState(ctx, tx, tableState); err != nil {
+		return err
+	}
+	if err := upsertSyncInfo(ctx, tx, info); err != nil {
+		return err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit duckdb page: %w", err)
+	}
+
+	return nil
+}
+
+func UpdateSyncFailure(ctx context.Context, path string, info SyncInfo) error {
+	db, err := openDatabase(path, "READ_WRITE")
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin duckdb transaction: %w", err)
+	}
+	defer func() {
+		_ = tx.Rollback()
+	}()
+
+	if err := upsertSyncInfo(ctx, tx, info); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit duckdb sync failure: %w", err)
+	}
+	return nil
+}
+
+func FinalizeSnapshot(ctx context.Context, path string, info SyncInfo) error {
+	return UpdateSyncFailure(ctx, path, info)
 }
 
 func ReadSchema(ctx context.Context, path, baseID, baseName string) (BaseSchema, error) {
@@ -238,6 +408,31 @@ func ReadSchema(ctx context.Context, path, baseID, baseName string) (BaseSchema,
 		return BaseSchema{}, fmt.Errorf("iterate metadata rows: %w", err)
 	}
 
+	tableSync := map[string]TableSyncState{}
+	if hasTableSync, err := tableExists(ctx, db, "_table_sync"); err != nil {
+		return BaseSchema{}, err
+	} else if hasTableSync {
+		syncRows, err := db.QueryContext(ctx, `
+			SELECT duckdb_table_name, sync_status, visible_record_count, pages_fetched, has_more
+			FROM _table_sync
+		`)
+		if err != nil {
+			return BaseSchema{}, fmt.Errorf("read table sync rows: %w", err)
+		}
+		defer syncRows.Close()
+
+		for syncRows.Next() {
+			var state TableSyncState
+			if err := syncRows.Scan(&state.TableName, &state.SyncStatus, &state.VisibleRecordCount, &state.PagesFetched, &state.HasMore); err != nil {
+				return BaseSchema{}, fmt.Errorf("scan table sync row: %w", err)
+			}
+			tableSync[state.TableName] = state
+		}
+		if err := syncRows.Err(); err != nil {
+			return BaseSchema{}, fmt.Errorf("iterate table sync rows: %w", err)
+		}
+	}
+
 	tables := make([]TableSchema, 0, len(order))
 	for _, tableName := range order {
 		table := tablesByName[tableName]
@@ -250,6 +445,17 @@ func ReadSchema(ctx context.Context, path, baseID, baseName string) (BaseSchema,
 
 		if err := db.QueryRowContext(ctx, fmt.Sprintf(`SELECT COUNT(*) FROM %s`, quoteIdent(table.DuckDBTableName))).Scan(&table.TotalRecordCount); err != nil {
 			return BaseSchema{}, fmt.Errorf("count rows for %s: %w", table.DuckDBTableName, err)
+		}
+		table.VisibleRecordCount = table.TotalRecordCount
+		if state, ok := tableSync[table.DuckDBTableName]; ok {
+			table.VisibleRecordCount = state.VisibleRecordCount
+			table.SyncStatus = state.SyncStatus
+			table.TableComplete = state.SyncStatus == "completed"
+			table.HasMore = state.HasMore
+			table.PagesFetched = state.PagesFetched
+		} else {
+			table.SyncStatus = "completed"
+			table.TableComplete = true
 		}
 
 		tables = append(tables, *table)
@@ -393,10 +599,24 @@ func createMetadataTables(ctx context.Context, tx *sql.Tx) error {
 			duckdb_type VARCHAR
 		)`,
 		`CREATE TABLE _sync_info (
+			sync_started_at TIMESTAMP,
 			last_synced_at TIMESTAMP,
 			sync_duration_ms BIGINT,
 			total_records BIGINT,
-			total_tables INTEGER
+			total_tables INTEGER,
+			status VARCHAR,
+			tables_started INTEGER,
+			tables_completed INTEGER,
+			pages_fetched BIGINT,
+			records_synced_this_run BIGINT,
+			error VARCHAR
+		)`,
+		`CREATE TABLE _table_sync (
+			duckdb_table_name VARCHAR PRIMARY KEY,
+			sync_status VARCHAR,
+			visible_record_count BIGINT,
+			pages_fetched BIGINT,
+			has_more BOOLEAN
 		)`,
 	}
 
@@ -404,6 +624,80 @@ func createMetadataTables(ctx context.Context, tx *sql.Tx) error {
 		if _, err := tx.ExecContext(ctx, statement); err != nil {
 			return fmt.Errorf("create metadata table: %w", err)
 		}
+	}
+
+	return nil
+}
+
+func upsertSyncInfo(ctx context.Context, tx *sql.Tx, info SyncInfo) error {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM _sync_info`); err != nil {
+		return fmt.Errorf("clear sync info: %w", err)
+	}
+
+	var syncStartedAt any
+	if !info.SyncStartedAt.IsZero() {
+		syncStartedAt = info.SyncStartedAt.UTC()
+	}
+	var lastSyncedAt any
+	if !info.LastSyncedAt.IsZero() {
+		lastSyncedAt = info.LastSyncedAt.UTC()
+	}
+
+	if _, err := tx.ExecContext(
+		ctx,
+		`INSERT INTO _sync_info (
+			sync_started_at,
+			last_synced_at,
+			sync_duration_ms,
+			total_records,
+			total_tables,
+			status,
+			tables_started,
+			tables_completed,
+			pages_fetched,
+			records_synced_this_run,
+			error
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		syncStartedAt,
+		lastSyncedAt,
+		info.SyncDurationMS,
+		info.TotalRecords,
+		info.TotalTables,
+		info.Status,
+		info.TablesStarted,
+		info.TablesCompleted,
+		info.PagesFetched,
+		info.RecordsSyncedThisRun,
+		nullableString(info.Error),
+	); err != nil {
+		return fmt.Errorf("insert sync info: %w", err)
+	}
+
+	return nil
+}
+
+func upsertTableSyncState(ctx context.Context, tx *sql.Tx, state TableSyncState) error {
+	if _, err := tx.ExecContext(
+		ctx,
+		`INSERT INTO _table_sync (
+			duckdb_table_name,
+			sync_status,
+			visible_record_count,
+			pages_fetched,
+			has_more
+		) VALUES (?, ?, ?, ?, ?)
+		ON CONFLICT (duckdb_table_name) DO UPDATE
+		SET sync_status = EXCLUDED.sync_status,
+		    visible_record_count = EXCLUDED.visible_record_count,
+		    pages_fetched = EXCLUDED.pages_fetched,
+		    has_more = EXCLUDED.has_more`,
+		state.TableName,
+		state.SyncStatus,
+		state.VisibleRecordCount,
+		state.PagesFetched,
+		state.HasMore,
+	); err != nil {
+		return fmt.Errorf("upsert table sync state for %s: %w", state.TableName, err)
 	}
 
 	return nil
@@ -563,16 +857,155 @@ func buildDSN(path, accessMode string) string {
 }
 
 func readSyncInfo(ctx context.Context, db *sql.DB) (SyncInfo, error) {
-	var info SyncInfo
+	if hasExpandedSyncInfo, err := hasExpandedSyncInfoSchema(ctx, db); err != nil {
+		return SyncInfo{}, err
+	} else if hasExpandedSyncInfo {
+		var (
+			info              SyncInfo
+			syncStartedAt     sql.NullTime
+			lastSyncedAt      sql.NullTime
+			errorText         sql.NullString
+			status            sql.NullString
+			syncDurationMS    sql.NullInt64
+			totalRecords      sql.NullInt64
+			totalTables       sql.NullInt64
+			tablesStarted     sql.NullInt64
+			tablesCompleted   sql.NullInt64
+			pagesFetched      sql.NullInt64
+			recordsSyncedThis sql.NullInt64
+		)
+		if err := db.QueryRowContext(ctx, `
+			SELECT
+				sync_started_at,
+				last_synced_at,
+				sync_duration_ms,
+				total_records,
+				total_tables,
+				status,
+				tables_started,
+				tables_completed,
+				pages_fetched,
+				records_synced_this_run,
+				error
+			FROM _sync_info
+			LIMIT 1
+		`).Scan(
+			&syncStartedAt,
+			&lastSyncedAt,
+			&syncDurationMS,
+			&totalRecords,
+			&totalTables,
+			&status,
+			&tablesStarted,
+			&tablesCompleted,
+			&pagesFetched,
+			&recordsSyncedThis,
+			&errorText,
+		); err != nil {
+			return SyncInfo{}, fmt.Errorf("read sync info: %w", err)
+		}
+		if syncStartedAt.Valid {
+			info.SyncStartedAt = syncStartedAt.Time.UTC()
+		}
+		if lastSyncedAt.Valid {
+			info.LastSyncedAt = lastSyncedAt.Time.UTC()
+		}
+		if syncDurationMS.Valid {
+			info.SyncDurationMS = syncDurationMS.Int64
+		}
+		if totalRecords.Valid {
+			info.TotalRecords = totalRecords.Int64
+		}
+		if totalTables.Valid {
+			info.TotalTables = int(totalTables.Int64)
+		}
+		if status.Valid {
+			info.Status = status.String
+		}
+		if tablesStarted.Valid {
+			info.TablesStarted = int(tablesStarted.Int64)
+		}
+		if tablesCompleted.Valid {
+			info.TablesCompleted = int(tablesCompleted.Int64)
+		}
+		if pagesFetched.Valid {
+			info.PagesFetched = pagesFetched.Int64
+		}
+		if recordsSyncedThis.Valid {
+			info.RecordsSyncedThisRun = recordsSyncedThis.Int64
+		}
+		if errorText.Valid {
+			info.Error = errorText.String
+		}
+		return info, nil
+	}
+
+	var (
+		info           SyncInfo
+		lastSyncedAt   sql.NullTime
+		syncDurationMS sql.NullInt64
+		totalRecords   sql.NullInt64
+		totalTables    sql.NullInt64
+	)
 	if err := db.QueryRowContext(ctx, `
 		SELECT last_synced_at, sync_duration_ms, total_records, total_tables
 		FROM _sync_info
 		LIMIT 1
-	`).Scan(&info.LastSyncedAt, &info.SyncDurationMS, &info.TotalRecords, &info.TotalTables); err != nil {
+	`).Scan(&lastSyncedAt, &syncDurationMS, &totalRecords, &totalTables); err != nil {
 		return SyncInfo{}, fmt.Errorf("read sync info: %w", err)
 	}
+	if lastSyncedAt.Valid {
+		info.LastSyncedAt = lastSyncedAt.Time.UTC()
+	}
+	if syncDurationMS.Valid {
+		info.SyncDurationMS = syncDurationMS.Int64
+	}
+	if totalRecords.Valid {
+		info.TotalRecords = totalRecords.Int64
+	}
+	if totalTables.Valid {
+		info.TotalTables = int(totalTables.Int64)
+	}
+	info.Status = "completed"
+	info.TablesStarted = info.TotalTables
+	info.TablesCompleted = info.TotalTables
 
 	return info, nil
+}
+
+func hasExpandedSyncInfoSchema(ctx context.Context, db *sql.DB) (bool, error) {
+	return columnExists(ctx, db, "_sync_info", "status")
+}
+
+func tableExists(ctx context.Context, db *sql.DB, tableName string) (bool, error) {
+	var exists bool
+	if err := db.QueryRowContext(ctx, `
+		SELECT EXISTS (
+			SELECT 1
+			FROM information_schema.tables
+			WHERE table_schema = 'main'
+			  AND table_name = ?
+		)
+	`, tableName).Scan(&exists); err != nil {
+		return false, fmt.Errorf("check table %s exists: %w", tableName, err)
+	}
+	return exists, nil
+}
+
+func columnExists(ctx context.Context, db *sql.DB, tableName, columnName string) (bool, error) {
+	var exists bool
+	if err := db.QueryRowContext(ctx, `
+		SELECT EXISTS (
+			SELECT 1
+			FROM information_schema.columns
+			WHERE table_schema = 'main'
+			  AND table_name = ?
+			  AND column_name = ?
+		)
+	`, tableName, columnName).Scan(&exists); err != nil {
+		return false, fmt.Errorf("check column %s.%s exists: %w", tableName, columnName, err)
+	}
+	return exists, nil
 }
 
 func queryRowsAsMaps(ctx context.Context, db *sql.DB, query string) ([]map[string]any, error) {
@@ -753,4 +1186,11 @@ func mustMarshalJSON(value any) string {
 
 func quoteIdent(identifier string) string {
 	return `"` + strings.ReplaceAll(identifier, `"`, `""`) + `"`
+}
+
+func nullableString(value string) any {
+	if strings.TrimSpace(value) == "" {
+		return nil
+	}
+	return value
 }

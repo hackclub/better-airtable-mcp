@@ -184,6 +184,8 @@ func TestMutateApprovalFlowOverMCP(t *testing.T) {
 	approvalHandler := approval.NewHandler(runtime.Approval)
 	mux.HandleFunc("/api/operations/", approvalHandler.ServeOperationAPI)
 
+	ensureBaseSyncedForMutationTest(t, runtime, "user_1", "Project Tracker")
+
 	mutateResponse := performAuthenticatedToolCall(t, mux, bearerToken, "mutate", map[string]any{
 		"base": "Project Tracker",
 		"operations": []map[string]any{
@@ -655,6 +657,8 @@ func TestMutateDeleteRecordIDsOverMCP(t *testing.T) {
 	approvalHandler := approval.NewHandler(runtime.Approval)
 	mux.HandleFunc("/api/operations/", approvalHandler.ServeOperationAPI)
 
+	ensureBaseSyncedForMutationTest(t, runtime, "user_1", "appProjects")
+
 	mutateResponse := performAuthenticatedToolCall(t, mux, bearerToken, "mutate", map[string]any{
 		"base": "appProjects",
 		"operations": []map[string]any{
@@ -691,6 +695,199 @@ func TestMutateDeleteRecordIDsOverMCP(t *testing.T) {
 	}
 	if got := operation.Operations[0].Records[0].CurrentFields["name"]; got != "Website Redesign" {
 		t.Fatalf("expected delete preview current data, got %#v", operation.Operations[0].Records[0].CurrentFields)
+	}
+}
+
+func TestMutateReturnsNotReadyWhenTargetRecordHasNotSyncedYetOverMCP(t *testing.T) {
+	port := mutateFreePort(t)
+	postgres := embeddedpostgres.NewDatabase(
+		embeddedpostgres.DefaultConfig().
+			Port(uint32(port)).
+			Database("better_airtable_mutate_not_ready_test").
+			Username("postgres").
+			Password("postgres").
+			BinariesPath(filepath.Join(t.TempDir(), "postgres-binaries")).
+			DataPath(filepath.Join(t.TempDir(), "postgres-data")).
+			RuntimePath(filepath.Join(t.TempDir(), "postgres-runtime")),
+	)
+	if err := postgres.Start(); err != nil {
+		t.Fatalf("embedded postgres start failed: %v", err)
+	}
+	defer postgres.Stop()
+
+	store, err := db.Open(context.Background(), fmt.Sprintf("postgres://postgres:postgres@127.0.0.1:%d/better_airtable_mutate_not_ready_test?sslmode=disable", port))
+	if err != nil {
+		t.Fatalf("db.Open() returned error: %v", err)
+	}
+	defer store.Close()
+	if err := store.Migrate(context.Background()); err != nil {
+		t.Fatalf("store.Migrate() returned error: %v", err)
+	}
+
+	var recordRequests atomic.Int32
+	fakeAirtable := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/v0/meta/bases":
+			writeMCPJSON(t, w, map[string]any{
+				"bases": []map[string]any{
+					{"id": "appProjects", "name": "Project Tracker", "permissionLevel": "create"},
+				},
+			})
+		case r.URL.Path == "/v0/meta/bases/appProjects/tables":
+			writeMCPJSON(t, w, map[string]any{
+				"tables": []map[string]any{
+					{
+						"id":   "tblProjects",
+						"name": "Projects",
+						"fields": []map[string]any{
+							{"id": "fldName", "name": "Name", "type": "singleLineText"},
+							{"id": "fldStatus", "name": "Status", "type": "singleSelect"},
+						},
+					},
+				},
+			})
+		case r.URL.Path == "/v0/appProjects/tblProjects" && r.Method == http.MethodGet:
+			recordRequests.Add(1)
+			time.Sleep(250 * time.Millisecond)
+			writeMCPJSON(t, w, map[string]any{
+				"records": []map[string]any{
+					{
+						"id":          "recProject1",
+						"createdTime": "2026-04-01T12:00:00Z",
+						"fields": map[string]any{
+							"Name":   "Website Redesign",
+							"Status": "Planning",
+						},
+					},
+				},
+			})
+		default:
+			t.Fatalf("unexpected Airtable %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer fakeAirtable.Close()
+
+	secret, err := cryptoutil.New([]byte(strings.Repeat("k", 32)))
+	if err != nil {
+		t.Fatalf("cryptoutil.New() returned error: %v", err)
+	}
+	if err := store.UpsertUser(context.Background(), db.User{ID: "user_1"}); err != nil {
+		t.Fatalf("store.UpsertUser() returned error: %v", err)
+	}
+	encryptedToken, err := secret.Encrypt([]byte("airtable-access-token"))
+	if err != nil {
+		t.Fatalf("secret.Encrypt() returned error: %v", err)
+	}
+	if err := store.PutAirtableToken(context.Background(), db.AirtableTokenRecord{
+		UserID:                 "user_1",
+		AccessTokenCiphertext:  encryptedToken,
+		RefreshTokenCiphertext: encryptedToken,
+		ExpiresAt:              time.Now().Add(time.Hour),
+		Scopes:                 "data.records:read data.records:write schema.bases:read",
+	}); err != nil {
+		t.Fatalf("store.PutAirtableToken() returned error: %v", err)
+	}
+
+	bearerToken := "mcp-access-token"
+	if err := store.PutMCPToken(context.Background(), db.MCPTokenRecord{
+		TokenHash:  oauth.HashToken(bearerToken),
+		UserID:     "user_1",
+		ClientID:   ptr("client_claude"),
+		ClientName: ptr("Claude"),
+		CreatedAt:  time.Now().UTC(),
+		ExpiresAt:  time.Now().Add(time.Hour).UTC(),
+	}); err != nil {
+		t.Fatalf("store.PutMCPToken() returned error: %v", err)
+	}
+
+	cfg := config.Config{
+		BaseURL:           mustParseTestURL(t, "http://example.test"),
+		SyncInterval:      time.Minute,
+		SyncTTL:           10 * time.Minute,
+		ApprovalTTL:       10 * time.Minute,
+		QueryDefaultLimit: 100,
+		QueryMaxLimit:     1000,
+	}
+	syncService := syncer.NewService(syncer.NewHTTPClient(fakeAirtable.URL, fakeAirtable.Client()), t.TempDir())
+	runtime := &tools.Runtime{
+		Store:  store,
+		Cipher: secret,
+		Syncer: syncService,
+		Config: cfg,
+	}
+	runtime.SyncManager = syncer.NewManager(syncService, store, runtime, cfg.SyncInterval, cfg.SyncTTL)
+	runtime.Approval = approval.NewService(store, secret, syncService, runtime.SyncManager, runtime, syncer.NewHTTPClient(fakeAirtable.URL, fakeAirtable.Client()), cfg.BaseURLString(), cfg.ApprovalTTL)
+
+	mux := http.NewServeMux()
+	mux.Handle("/mcp", oauth.NewMiddleware(store).RequireBearer(mcp.NewHandler("better-airtable-mcp", "0.1.0", tools.NewCatalog(cfg, runtime))))
+
+	mutateResponse := performAuthenticatedToolCall(t, mux, bearerToken, "mutate", map[string]any{
+		"base": "Project Tracker",
+		"operations": []map[string]any{
+			{
+				"type":  "update_records",
+				"table": "projects",
+				"records": []map[string]any{
+					{
+						"id": "recProject1",
+						"fields": map[string]any{
+							"status": "Done",
+						},
+					},
+				},
+			},
+		},
+	})
+
+	result := mutateResponse["result"].(map[string]any)
+	if isError, ok := result["isError"].(bool); !ok || !isError {
+		t.Fatalf("expected mutate call to return error while sync is still partial, got %#v", result)
+	}
+
+	mutateText := firstToolText(t, mutateResponse)
+	if !strings.Contains(mutateText, `records are not synced yet for table "projects": recProject1`) {
+		t.Fatalf("expected partial-sync error text, got %q", mutateText)
+	}
+
+	mutateStructured := result["structuredContent"].(map[string]any)
+	if got := mutateStructured["reason"]; got != "records_not_synced_yet" {
+		t.Fatalf("expected records_not_synced_yet reason, got %#v", mutateStructured)
+	}
+	if got := mutateStructured["table"]; got != "projects" {
+		t.Fatalf("expected projects table in error payload, got %#v", mutateStructured)
+	}
+	recordIDs := mutateStructured["record_ids"].([]any)
+	if len(recordIDs) != 1 || recordIDs[0].(string) != "recProject1" {
+		t.Fatalf("expected recProject1 in error payload, got %#v", mutateStructured)
+	}
+	syncPayload := mutateStructured["sync"].(map[string]any)
+	if got := syncPayload["read_snapshot"]; got != "partial" {
+		t.Fatalf("expected partial read snapshot, got %#v", syncPayload)
+	}
+	if got := syncPayload["status"]; got != "syncing" {
+		t.Fatalf("expected syncing status, got %#v", syncPayload)
+	}
+
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if recordRequests.Load() > 0 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if recordRequests.Load() == 0 {
+		t.Fatalf("expected sync to begin fetching records")
+	}
+}
+
+func ensureBaseSyncedForMutationTest(t *testing.T, runtime *tools.Runtime, userID, baseRef string) {
+	t.Helper()
+
+	if runtime == nil || runtime.SyncManager == nil {
+		t.Fatal("runtime sync manager is not configured")
+	}
+	if _, err := runtime.SyncManager.EnsureBaseReady(context.Background(), userID, baseRef); err != nil {
+		t.Fatalf("runtime.SyncManager.EnsureBaseReady() returned error: %v", err)
 	}
 }
 

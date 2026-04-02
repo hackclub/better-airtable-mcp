@@ -60,24 +60,13 @@ func (t CheckOperationTool) Call(ctx context.Context, raw json.RawMessage) (mcp.
 			return mcp.ToolCallResult{}, err
 		}
 		if found {
-			payload := map[string]any{
-				"operation_id":   status.OperationID,
-				"type":           status.Type,
-				"status":         status.Status,
-				"tables_synced":  status.TablesSynced,
-				"records_synced": status.RecordsSynced,
-			}
+			payload := syncStatusPayload(status)
+			payload["type"] = status.Type
 			if status.CompletedAt != nil {
 				payload["completed_at"] = status.CompletedAt.Format(time.RFC3339)
 			}
-			if status.LastSyncedAt != nil {
-				payload["last_synced_at"] = status.LastSyncedAt.Format(time.RFC3339)
-			}
-			if status.Error != "" {
-				payload["error"] = status.Error
-			}
 			return textOnlyResult(formatSingleRowCSV([]string{
-				"operation_id", "type", "status", "completed_at", "last_synced_at", "tables_synced", "records_synced", "error",
+				"operation_id", "type", "status", "read_snapshot", "sync_started_at", "completed_at", "last_synced_at", "tables_total", "tables_started", "tables_completed", "pages_fetched", "records_visible", "records_synced_this_run", "error",
 			}, payload), payload), nil
 		}
 	}

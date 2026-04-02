@@ -174,15 +174,30 @@ func TestAuthenticatedReadToolsOverMCP(t *testing.T) {
 		"base": "Project Tracker",
 	})
 	schemaText := firstToolText(t, schemaResponse)
-	if !strings.Contains(schemaText, "tables\n") || !strings.Contains(schemaText, "tblProjects,projects,Projects,1") {
-		t.Fatalf("expected list_schema text to contain CSV table metadata, got %q", schemaText)
+	if !strings.Contains(schemaText, "sync_status\n") ||
+		!strings.Contains(schemaText, "base\n\nbase_id,base_name\nappProjects,Project Tracker\n") ||
+		!strings.Contains(schemaText, "tables\n\n# projects\n") ||
+		!strings.Contains(schemaText, "# projects\n\nid,created_time,name,linked_tasks\n") ||
+		!strings.Contains(schemaText, "# tasks\n\nid,created_time,name\n") {
+		t.Fatalf("expected list_schema text to contain sync status, base, and per-table sample sections, got %q", schemaText)
+	}
+	schemaResult := schemaResponse["result"].(map[string]any)["structuredContent"].(map[string]any)
+	if _, ok := schemaResult["sync"].(map[string]any); !ok {
+		t.Fatalf("expected list_schema structured content to include sync metadata, got %#v", schemaResult)
 	}
 
-	queryResponse := performAuthenticatedToolCall(t, handler, bearerToken, "query", map[string]any{
-		"base": "Project Tracker",
-		"sql": []string{
-			"SELECT p.name, t.name AS task_name FROM projects p, UNNEST(p.linked_tasks) AS u(task_id) JOIN tasks t ON t.id = u.task_id",
-		},
+	queryResponse := waitForToolResult(t, func() map[string]any {
+		return performAuthenticatedToolCall(t, handler, bearerToken, "query", map[string]any{
+			"base": "Project Tracker",
+			"sql": []string{
+				"SELECT p.name, t.name AS task_name FROM projects p, UNNEST(p.linked_tasks) AS u(task_id) JOIN tasks t ON t.id = u.task_id",
+			},
+		})
+	}, func(response map[string]any) bool {
+		queryResult := response["result"].(map[string]any)["structuredContent"].(map[string]any)
+		results := queryResult["results"].([]any)
+		rows := results[0].(map[string]any)["rows"].([]any)
+		return len(rows) == 1
 	})
 	queryText := firstToolText(t, queryResponse)
 	if !strings.Contains(queryText, "query_rows\n") || !strings.Contains(queryText, "Website Redesign,Design new homepage") {
@@ -198,12 +213,19 @@ func TestAuthenticatedReadToolsOverMCP(t *testing.T) {
 		t.Fatalf("expected 1 query row, got %#v", rows)
 	}
 
-	batchResponse := performAuthenticatedToolCall(t, handler, bearerToken, "query", map[string]any{
-		"base": "Project Tracker",
-		"sql": []string{
-			"SELECT name FROM projects ORDER BY id",
-			"SELECT name FROM tasks ORDER BY id",
-		},
+	batchResponse := waitForToolResult(t, func() map[string]any {
+		return performAuthenticatedToolCall(t, handler, bearerToken, "query", map[string]any{
+			"base": "Project Tracker",
+			"sql": []string{
+				"SELECT name FROM projects ORDER BY id",
+				"SELECT name FROM tasks ORDER BY id",
+			},
+		})
+	}, func(response map[string]any) bool {
+		batchResult := response["result"].(map[string]any)["structuredContent"].(map[string]any)
+		results := batchResult["results"].([]any)
+		return len(results[0].(map[string]any)["rows"].([]any)) == 1 &&
+			len(results[1].(map[string]any)["rows"].([]any)) == 1
 	})
 	batchText := firstToolText(t, batchResponse)
 	if !strings.Contains(batchText, "query_1_rows\n") || !strings.Contains(batchText, "query_2_rows\n") {
@@ -231,6 +253,26 @@ func firstToolText(t *testing.T, response map[string]any) string {
 	block := content[0].(map[string]any)
 	text, _ := block["text"].(string)
 	return text
+}
+
+func waitForToolResult(t *testing.T, call func() map[string]any, done func(map[string]any) bool) map[string]any {
+	t.Helper()
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		response := call()
+		if done(response) {
+			return response
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	response := call()
+	if done(response) {
+		return response
+	}
+	t.Fatalf("timed out waiting for tool result readiness: %#v", response)
+	return nil
 }
 
 func TestAuthenticatedQueryReportsTruncationWhenServerAppliesDefaultLimit(t *testing.T) {
@@ -346,11 +388,22 @@ func TestAuthenticatedQueryReportsTruncationWhenServerAppliesDefaultLimit(t *tes
 
 	handler := oauth.NewMiddleware(store).RequireBearer(mcp.NewHandler("better-airtable-mcp", "0.1.0", tools.NewCatalog(cfg, runtime)))
 
-	queryResponse := performAuthenticatedToolCall(t, handler, bearerToken, "query", map[string]any{
-		"base": "Project Tracker",
-		"sql": []string{
-			"SELECT id, name FROM projects ORDER BY id",
-		},
+	queryResponse := waitForToolResult(t, func() map[string]any {
+		return performAuthenticatedToolCall(t, handler, bearerToken, "query", map[string]any{
+			"base": "Project Tracker",
+			"sql": []string{
+				"SELECT id, name FROM projects ORDER BY id",
+			},
+		})
+	}, func(response map[string]any) bool {
+		queryResult := response["result"].(map[string]any)["structuredContent"].(map[string]any)
+		results := queryResult["results"].([]any)
+		if len(results) != 1 {
+			return false
+		}
+		firstResult := results[0].(map[string]any)
+		truncated, ok := firstResult["truncated"].(bool)
+		return ok && truncated
 	})
 	queryResult := queryResponse["result"].(map[string]any)["structuredContent"].(map[string]any)
 	results := queryResult["results"].([]any)

@@ -55,6 +55,19 @@ func (h *Handler) ServeApprovalPage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	h.serveEmbeddedApp(w)
+}
+
+func (h *Handler) ServeDebugPage(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		httpx.MethodNotAllowed(w, http.MethodGet)
+		return
+	}
+
+	h.serveEmbeddedApp(w)
+}
+
+func (h *Handler) serveEmbeddedApp(w http.ResponseWriter) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
 	_, _ = w.Write(h.indexHTML)

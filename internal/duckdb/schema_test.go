@@ -32,6 +32,17 @@ func TestSanitizeIdentifiersHandlesCollisions(t *testing.T) {
 	}
 }
 
+func TestSanitizeFieldIdentifiersReservesImplicitColumns(t *testing.T) {
+	got := SanitizeFieldIdentifiers([]string{"ID", "Created Time", "id", "created_time"})
+	want := []string{"_airtable_id", "_airtable_created_time", "_airtable_id_2", "_airtable_created_time_2"}
+
+	for index := range want {
+		if got[index].Sanitized != want[index] {
+			t.Fatalf("SanitizeFieldIdentifiers()[%d] = %q, want %q", index, got[index].Sanitized, want[index])
+		}
+	}
+}
+
 func TestAirtableTypeToDuckDBType(t *testing.T) {
 	mapping, ok := AirtableTypeToDuckDBType("multipleRecordLinks")
 	if !ok {

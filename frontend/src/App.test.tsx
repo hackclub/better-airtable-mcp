@@ -102,4 +102,13 @@ describe("App", () => {
       }),
     );
   });
+
+  it("renders the MCP debugger shell on /debug", () => {
+    render(<App pathname="/debug" fetchImpl={vi.fn() as typeof fetch} />);
+
+    expect(screen.getByText("MCP Tool Debugger")).toBeInTheDocument();
+    expect(screen.getByLabelText("Bearer Token")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Connect with OAuth" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Initialize + Load Tools" })).toBeDisabled();
+  });
 });

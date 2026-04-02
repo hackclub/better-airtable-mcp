@@ -317,6 +317,101 @@ func TestManagerEnsureBaseReadyFallsBackToExistingSnapshotWhenRefreshFails(t *te
 	}
 }
 
+func TestManagerEnsureBaseSchemaSampledWaitsForFirstPageAcrossTables(t *testing.T) {
+	releaseTasks := make(chan struct{})
+	var taskCalls atomic.Int32
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v0/meta/bases":
+			writeManagerJSON(t, w, map[string]any{
+				"bases": []map[string]any{{"id": "appProjects", "name": "Project Tracker", "permissionLevel": "create"}},
+			})
+		case "/v0/meta/bases/appProjects/tables":
+			writeManagerJSON(t, w, map[string]any{
+				"tables": []map[string]any{
+					{
+						"id":   "tblProjects",
+						"name": "Projects",
+						"fields": []map[string]any{
+							{"id": "fldProjectName", "name": "Name", "type": "singleLineText"},
+						},
+					},
+					{
+						"id":   "tblTasks",
+						"name": "Tasks",
+						"fields": []map[string]any{
+							{"id": "fldTaskName", "name": "Name", "type": "singleLineText"},
+						},
+					},
+				},
+			})
+		case "/v0/appProjects/tblProjects":
+			writeManagerJSON(t, w, map[string]any{
+				"records": []map[string]any{
+					{"id": "recProject1", "createdTime": "2026-04-01T12:00:00Z", "fields": map[string]any{"Name": "Website Redesign"}},
+				},
+			})
+		case "/v0/appProjects/tblTasks":
+			taskCalls.Add(1)
+			<-releaseTasks
+			writeManagerJSON(t, w, map[string]any{
+				"records": []map[string]any{
+					{"id": "recTask1", "createdTime": "2026-04-01T13:00:00Z", "fields": map[string]any{"Name": "Design homepage"}},
+				},
+			})
+		default:
+			t.Fatalf("unexpected path %q", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	service := NewService(NewHTTPClient(server.URL, server.Client()), t.TempDir())
+	manager := NewManager(service, nil, staticTokenSource{}, time.Hour, time.Minute)
+
+	go func() {
+		time.Sleep(150 * time.Millisecond)
+		close(releaseTasks)
+	}()
+
+	started := time.Now()
+	base, err := manager.EnsureBaseSchemaSampled(context.Background(), "user_1", "Project Tracker")
+	if err != nil {
+		t.Fatalf("EnsureBaseSchemaSampled() returned error: %v", err)
+	}
+	if time.Since(started) < 100*time.Millisecond {
+		t.Fatal("expected EnsureBaseSchemaSampled() to wait for the first page from every table")
+	}
+	if taskCalls.Load() != 1 {
+		t.Fatalf("expected one first-page fetch for the second table, got %d", taskCalls.Load())
+	}
+
+	status, ok := manager.BaseStatus(base.ID)
+	if !ok {
+		t.Fatalf("expected BaseStatus() for %s", base.ID)
+	}
+	if status.TablesTotal != 2 || status.TablesStarted != 2 {
+		t.Fatalf("expected schema-sampled status after both first pages, got %#v", status)
+	}
+
+	schema, err := service.ListSchema(context.Background(), "token", base.ID)
+	if err != nil {
+		t.Fatalf("ListSchema() returned error: %v", err)
+	}
+	if len(schema.Tables) != 2 {
+		t.Fatalf("expected 2 tables after schema-sampled wait, got %#v", schema.Tables)
+	}
+	var foundTaskSample bool
+	for _, table := range schema.Tables {
+		if table.DuckDBTableName == "tasks" && len(table.SampleRows) == 1 {
+			foundTaskSample = table.SampleRows[0]["name"] == "Design homepage"
+		}
+	}
+	if !foundTaskSample {
+		t.Fatalf("expected schema samples to include the first tasks page, got %#v", schema.Tables)
+	}
+}
+
 func TestManagerContinuouslyResyncsWhileActive(t *testing.T) {
 	var generation atomic.Int32
 	var recordCalls atomic.Int32

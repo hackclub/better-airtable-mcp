@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
-	"time"
 
 	"github.com/hackclub/better-airtable-mcp/internal/mcp"
 )
@@ -62,10 +61,23 @@ func (t ListSchemaTool) Call(ctx context.Context, raw json.RawMessage) (mcp.Tool
 		return mcp.ToolCallResult{}, fmt.Errorf("missing authenticated user")
 	}
 
+	var baseID string
+	var syncPayload map[string]any
+	var syncStatus *formattedSyncStatus
 	if t.runtime.SyncManager != nil {
-		if _, err := t.runtime.SyncManager.EnsureBaseReady(ctx, userID, input.Base); err != nil {
+		base, err := t.runtime.SyncManager.EnsureBaseSchemaSampled(ctx, userID, input.Base)
+		if err != nil {
 			return mcp.ToolCallResult{}, err
 		}
+		baseID = base.ID
+		if status, found := t.runtime.SyncManager.BaseStatus(base.ID); found {
+			syncPayload = syncStatusPayload(status)
+			formatted := formattedSyncStatusFromOperation(status)
+			syncStatus = &formatted
+		}
+	}
+	if baseID == "" {
+		baseID = input.Base
 	}
 
 	accessToken, err := t.runtime.AirtableAccessToken(ctx, userID)
@@ -73,7 +85,7 @@ func (t ListSchemaTool) Call(ctx context.Context, raw json.RawMessage) (mcp.Tool
 		return mcp.ToolCallResult{}, err
 	}
 
-	schema, err := t.runtime.Syncer.ListSchema(ctx, accessToken, input.Base)
+	schema, err := t.runtime.Syncer.ListSchema(ctx, accessToken, baseID)
 	if err != nil {
 		return mcp.ToolCallResult{}, err
 	}
@@ -90,24 +102,34 @@ func (t ListSchemaTool) Call(ctx context.Context, raw json.RawMessage) (mcp.Tool
 				"airtable_type":      field.AirtableType,
 			})
 		}
+		totalRecordCount := any(table.TotalRecordCount)
+		if !table.TableComplete {
+			totalRecordCount = nil
+		}
 		tables = append(tables, map[string]any{
-			"airtable_table_id":  table.AirtableTableID,
-			"duckdb_table_name":  table.DuckDBTableName,
-			"original_name":      table.OriginalName,
-			"fields":             fields,
-			"sample_rows":        table.SampleRows,
-			"total_record_count": table.TotalRecordCount,
+			"airtable_table_id":    table.AirtableTableID,
+			"duckdb_table_name":    table.DuckDBTableName,
+			"original_name":        table.OriginalName,
+			"fields":               fields,
+			"sample_rows":          table.SampleRows,
+			"visible_record_count": table.VisibleRecordCount,
+			"total_record_count":   totalRecordCount,
+			"table_complete":       table.TableComplete,
+			"sync_status":          table.SyncStatus,
 		})
 	}
 
 	payload := map[string]any{
 		"base_id":        schema.BaseID,
 		"base_name":      schema.BaseName,
-		"last_synced_at": schema.LastSyncedAt.Format(time.RFC3339),
+		"last_synced_at": formatTimeOrBlank(schema.LastSyncedAt),
 		"tables":         tables,
 	}
+	if syncPayload != nil {
+		payload["sync"] = syncPayload
+	}
 	return textOnlyResult(
-		formatSchemaCSV(schema.BaseID, schema.BaseName, schema.LastSyncedAt.Format(time.RFC3339), tables),
+		formatSchemaCSV(schema.BaseID, schema.BaseName, tables, syncStatus),
 		payload,
 	), nil
 }

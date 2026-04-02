@@ -87,6 +87,29 @@ func TestServeApprovalPageReturns404ForUnknownOperation(t *testing.T) {
 	}
 }
 
+func TestServeDebugPageServesEmbeddedSPAWithoutApprovalLookup(t *testing.T) {
+	handler := NewHandler(nil)
+
+	request := httptest.NewRequest(http.MethodGet, "/debug", nil)
+	recorder := httptest.NewRecorder()
+
+	handler.ServeDebugPage(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected HTTP 200, got %d", recorder.Code)
+	}
+	if got := recorder.Header().Get("Content-Type"); !strings.Contains(got, "text/html") {
+		t.Fatalf("expected text/html content type, got %q", got)
+	}
+	if got := recorder.Header().Get("Cache-Control"); got != "no-store" {
+		t.Fatalf("expected Cache-Control=no-store, got %q", got)
+	}
+	body := recorder.Body.String()
+	if !strings.Contains(body, "<div id=\"root\"></div>") {
+		t.Fatalf("expected embedded SPA root element, got %q", body)
+	}
+}
+
 func TestServeAssetsServesEmbeddedBundleAsset(t *testing.T) {
 	handler := NewHandler(stubOperationService{
 		getOperation: func(context.Context, string) (OperationView, error) {

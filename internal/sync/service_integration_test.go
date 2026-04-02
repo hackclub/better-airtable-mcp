@@ -224,6 +224,77 @@ func TestServiceQueryAutoSyncsUnsyncedBase(t *testing.T) {
 	}
 }
 
+func TestServiceSyncReservesImplicitDuckDBColumnsForFieldNames(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v0/meta/bases":
+			writeJSON(t, w, map[string]any{
+				"bases": []map[string]any{
+					{"id": "appProjects", "name": "Project Tracker", "permissionLevel": "create"},
+				},
+			})
+		case "/v0/meta/bases/appProjects/tables":
+			writeJSON(t, w, map[string]any{
+				"tables": []map[string]any{
+					{
+						"id":   "tblApprovedProjects",
+						"name": "Approved Projects",
+						"fields": []map[string]any{
+							{"id": "fldProjectID", "name": "ID", "type": "singleLineText"},
+							{"id": "fldCreatedTime", "name": "Created Time", "type": "createdTime"},
+							{"id": "fldTitle", "name": "Title", "type": "singleLineText"},
+						},
+					},
+				},
+			})
+		case "/v0/appProjects/tblApprovedProjects":
+			writeJSON(t, w, map[string]any{
+				"records": []map[string]any{
+					{
+						"id":          "recApproved1",
+						"createdTime": "2026-04-01T12:00:00Z",
+						"fields": map[string]any{
+							"ID":           "legacy-123",
+							"Created Time": "2026-04-01T12:00:00Z",
+							"Title":        "Safe to sync",
+						},
+					},
+				},
+			})
+		default:
+			t.Fatalf("unexpected path %q", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	service := NewService(NewHTTPClient(server.URL, server.Client()), t.TempDir())
+	ctx := context.Background()
+
+	if _, err := service.SyncBase(ctx, "test-token", "Project Tracker"); err != nil {
+		t.Fatalf("SyncBase() returned error: %v", err)
+	}
+
+	queryResult, err := service.QueryBase(ctx, "test-token", "Project Tracker", `
+		SELECT id, _airtable_id, _airtable_created_time, title
+		FROM approved_projects
+	`)
+	if err != nil {
+		t.Fatalf("QueryBase() returned error: %v", err)
+	}
+	if queryResult.RowCount != 1 {
+		t.Fatalf("expected 1 query row, got %d", queryResult.RowCount)
+	}
+	if queryResult.Rows[0][0] != "recApproved1" {
+		t.Fatalf("expected record id in implicit id column, got %#v", queryResult.Rows[0])
+	}
+	if queryResult.Rows[0][1] != "legacy-123" {
+		t.Fatalf("expected Airtable ID field in _airtable_id column, got %#v", queryResult.Rows[0])
+	}
+	if queryResult.Rows[0][3] != "Safe to sync" {
+		t.Fatalf("expected title field to survive sync, got %#v", queryResult.Rows[0])
+	}
+}
+
 func TestServiceSyncBaseFullRefreshReplacesPriorSnapshot(t *testing.T) {
 	var generation atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
