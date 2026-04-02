@@ -10,6 +10,7 @@ import (
 	"github.com/hackclub/better-airtable-mcp/internal/config"
 	"github.com/hackclub/better-airtable-mcp/internal/cryptoutil"
 	"github.com/hackclub/better-airtable-mcp/internal/db"
+	"github.com/hackclub/better-airtable-mcp/internal/health"
 	"github.com/hackclub/better-airtable-mcp/internal/landing"
 	"github.com/hackclub/better-airtable-mcp/internal/mcp"
 	"github.com/hackclub/better-airtable-mcp/internal/oauth"
@@ -50,6 +51,7 @@ func main() {
 
 	mux := http.NewServeMux()
 
+	mux.Handle("/healthz", health.NewHandler(store))
 	mux.Handle("/", landing.NewHandler("README.md"))
 
 	syncService := syncer.NewService(syncer.NewHTTPClient("", nil), cfg.DuckDBDataDir)
@@ -83,6 +85,8 @@ func main() {
 
 	go toolRuntime.Approval.RunExpiryLoop(context.Background(), time.Minute)
 	go tokenManager.RunRefreshLoop(context.Background(), time.Minute)
+	go oauthHandler.RunCleanupLoop(context.Background(), time.Minute)
+	go mcpHandler.RunSessionExpiryLoop(context.Background(), time.Minute)
 
 	approvalHandler := approval.NewHandler(toolRuntime.Approval)
 	mux.HandleFunc("/approve/", approvalHandler.ServeApprovalPage)

@@ -80,6 +80,7 @@ func (h *Handler) handleGet(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	ownerID := currentSessionOwnerID(r.Context())
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		httpx.WriteError(w, http.StatusInternalServerError, "response writer does not support streaming")
@@ -103,6 +104,7 @@ func (h *Handler) handleGet(w http.ResponseWriter, r *http.Request) {
 		case <-r.Context().Done():
 			return
 		case <-ticker.C:
+			_, _ = h.sessions.Touch(sessionID, ownerID)
 			h.writeSSEEvent(w, "ping", "{}")
 			flusher.Flush()
 		}
@@ -274,4 +276,8 @@ func currentSessionOwnerID(ctx context.Context) string {
 
 func (h *Handler) writeSSEEvent(w http.ResponseWriter, eventName, data string) {
 	_, _ = fmt.Fprintf(w, "event: %s\ndata: %s\n\n", eventName, data)
+}
+
+func (h *Handler) RunSessionExpiryLoop(ctx context.Context, interval time.Duration) {
+	h.sessions.RunExpiryLoop(ctx, interval)
 }

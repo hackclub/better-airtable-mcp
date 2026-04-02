@@ -190,6 +190,71 @@ func TestHandlerPassesSessionIDToToolContext(t *testing.T) {
 	}
 }
 
+func TestSessionManagerPruneExpiredRemovesIdleSessions(t *testing.T) {
+	now := time.Date(2026, 4, 1, 18, 0, 0, 0, time.UTC)
+	manager := NewSessionManager()
+	manager.now = func() time.Time { return now }
+	manager.idleTTL = 30 * time.Minute
+	manager.sessions["stale"] = Session{
+		ID:         "stale",
+		CreatedAt:  now.Add(-time.Hour),
+		LastSeenAt: now.Add(-31 * time.Minute),
+	}
+	manager.sessions["fresh"] = Session{
+		ID:         "fresh",
+		CreatedAt:  now.Add(-time.Hour),
+		LastSeenAt: now.Add(-29 * time.Minute),
+	}
+
+	removed := manager.PruneExpired()
+	if removed != 1 {
+		t.Fatalf("expected 1 expired session to be removed, got %d", removed)
+	}
+	if _, ok := manager.sessions["stale"]; ok {
+		t.Fatal("expected stale session to be removed")
+	}
+	if _, ok := manager.sessions["fresh"]; !ok {
+		t.Fatal("expected fresh session to remain")
+	}
+}
+
+func TestHandlerGetMCPHeartbeatTouchesSession(t *testing.T) {
+	handler := NewHandler("better-airtable-mcp", "0.1.0", nil)
+	handler.heartbeat = 10 * time.Millisecond
+	sessionID := initializeSession(t, handler)
+
+	sessionBefore, ok := handler.sessions.sessions[sessionID]
+	if !ok {
+		t.Fatalf("expected session %q to exist", sessionID)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 35*time.Millisecond)
+	defer cancel()
+	request := httptest.NewRequest(http.MethodGet, "/mcp", nil).WithContext(ctx)
+	request.Header.Set(SessionHeader, sessionID)
+	recorder := httptest.NewRecorder()
+
+	done := make(chan struct{})
+	go func() {
+		handler.ServeHTTP(recorder, request)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("expected GET /mcp handler to exit after context cancellation")
+	}
+
+	sessionAfter, ok := handler.sessions.sessions[sessionID]
+	if !ok {
+		t.Fatalf("expected session %q to still exist", sessionID)
+	}
+	if !sessionAfter.LastSeenAt.After(sessionBefore.LastSeenAt) {
+		t.Fatalf("expected heartbeat to refresh session last-seen time, before=%s after=%s", sessionBefore.LastSeenAt, sessionAfter.LastSeenAt)
+	}
+}
+
 func performRPCRequest(t *testing.T, handler http.Handler, sessionID string, body map[string]any) (*httptest.ResponseRecorder, map[string]any) {
 	t.Helper()
 

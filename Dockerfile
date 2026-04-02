@@ -16,11 +16,11 @@ RUN go mod download
 COPY . .
 COPY --from=frontend-build /src/internal/approval/dist ./internal/approval/dist
 
-RUN go build -o /out/better-airtable-mcp ./cmd/server
+RUN go build -ldflags="-s -w" -o /out/better-airtable-mcp ./cmd/server
 
 FROM debian:bookworm-slim
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends ca-certificates \
+  && apt-get install -y --no-install-recommends ca-certificates curl \
   && rm -rf /var/lib/apt/lists/*
 
 RUN useradd --uid 10001 --create-home appuser
@@ -33,5 +33,7 @@ USER appuser
 ENV PORT=8080
 ENV DUCKDB_DATA_DIR=/data/duckdb
 EXPOSE 8080
+HEALTHCHECK --interval=10s --timeout=5s --start-period=10s --retries=3 \
+  CMD curl -f http://localhost:8080/healthz || exit 1
 
 CMD ["/app/better-airtable-mcp"]

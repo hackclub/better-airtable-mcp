@@ -34,7 +34,7 @@ func NewQueryTool(defaultLimit, maxLimit int, runtime *Runtime) mcp.Tool {
 func (QueryTool) Definition() mcp.ToolDefinition {
 	return mcp.ToolDefinition{
 		Name:        "query",
-		Description: "Execute a read-only SQL query against a base's DuckDB cache.",
+		Description: "Execute a read-only DuckDB SQL query against a base's cache. If the SQL contains LIMIT anywhere, the server assumes you are intentionally controlling row count and does not inject its default top-level limit.",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -44,7 +44,7 @@ func (QueryTool) Definition() mcp.ToolDefinition {
 				},
 				"sql": map[string]any{
 					"type":        "string",
-					"description": "Exactly one top-level SELECT or WITH query.",
+					"description": "Exactly one top-level DuckDB SELECT or WITH query. If LIMIT appears anywhere in the SQL text, the server will not add its own top-level default limit.",
 				},
 				"limit": map[string]any{
 					"type":        "integer",

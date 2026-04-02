@@ -1,0 +1,18 @@
+root = "."
+tmp_dir = "tmp"
+
+[build]
+  bin = "./tmp/better-airtable-mcp"
+  cmd = "npm --prefix frontend run build && go build -o ./tmp/better-airtable-mcp ./cmd/server"
+  delay = 1000
+  exclude_dir = ["tmp", "data", "node_modules", "frontend/node_modules", ".git"]
+  exclude_regex = ["_test\\.go$"]
+  include_ext = ["go", "html", "css", "js", "ts", "tsx", "json", "toml", "md"]
+  kill_delay = "1s"
+  send_interrupt = true
+
+[log]
+  time = false
+
+[misc]
+  clean_on_exit = true

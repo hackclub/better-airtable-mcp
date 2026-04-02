@@ -22,6 +22,7 @@ data/
 tmp/
 
 # Go build and test artifacts
+/server
 bin/
 dist/
 !internal/approval/dist/

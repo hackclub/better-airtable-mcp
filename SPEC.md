@@ -226,7 +226,8 @@ Execute a read-only SQL query against a base's DuckDB cache.
 **Behavior:**
 - Validates that the SQL is exactly one top-level `SELECT` or `WITH` statement; rejects multi-statement SQL and anything containing write/DDL/admin statements
 - Opens a **read-only** DuckDB connection (enforced at the connection level)
-- Applies a default `LIMIT 100` if the query has no LIMIT clause; the agent can override up to 1000
+- Applies a default `LIMIT 100` only if the SQL text contains no `LIMIT` token anywhere
+- If the SQL text contains `LIMIT` anywhere, the server assumes the caller is intentionally controlling row count and does not inject its own top-level limit
 - Returns freshness metadata so the agent can inform the user how current the data is
 - If the base is not yet synced, triggers a sync and waits
 - DuckDB is hardened as if SQL is hostile: external file access disabled, extension install/load disabled, and arbitrary `ATTACH`, `COPY`, `INSTALL`, `LOAD`, and `PRAGMA` statements rejected

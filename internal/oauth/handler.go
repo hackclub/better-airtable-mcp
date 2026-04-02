@@ -24,6 +24,7 @@ type Handler struct {
 	store    *db.Store
 	cipher   *cryptoutil.Cipher
 	airtable *AirtableOAuthClient
+	now      func() time.Time
 
 	mu            sync.Mutex
 	authRequests  map[string]authorizationRequest
@@ -80,6 +81,7 @@ func NewHandler(cfg config.Config, store *db.Store, cipher *cryptoutil.Cipher, a
 		store:              store,
 		cipher:             cipher,
 		airtable:           airtable,
+		now:                time.Now,
 		authRequests:       make(map[string]authorizationRequest),
 		authCodes:          make(map[string]authorizationCode),
 		refreshGrants:      make(map[string]refreshGrant),
@@ -220,6 +222,7 @@ func (h *Handler) Authorize(w http.ResponseWriter, r *http.Request) {
 	}
 
 	h.mu.Lock()
+	h.pruneExpiredLocked(h.now().UTC())
 	h.authRequests[requestID] = authorizationRequest{
 		ClientID:            clientID,
 		RedirectURI:         redirectURI,
@@ -227,7 +230,7 @@ func (h *Handler) Authorize(w http.ResponseWriter, r *http.Request) {
 		CodeChallenge:       codeChallenge,
 		CodeChallengeMethod: codeChallengeMethod,
 		AirtableVerifier:    airtableVerifier,
-		ExpiresAt:           time.Now().Add(10 * time.Minute),
+		ExpiresAt:           h.now().Add(10 * time.Minute),
 	}
 	h.mu.Unlock()
 
@@ -295,12 +298,13 @@ func (h *Handler) AirtableCallback(w http.ResponseWriter, r *http.Request) {
 	}
 
 	h.mu.Lock()
+	h.pruneExpiredLocked(h.now().UTC())
 	h.authCodes[authCode] = authorizationCode{
 		ClientID:      request.ClientID,
 		RedirectURI:   request.RedirectURI,
 		UserID:        userID,
 		CodeChallenge: request.CodeChallenge,
-		ExpiresAt:     time.Now().Add(5 * time.Minute),
+		ExpiresAt:     h.now().Add(5 * time.Minute),
 	}
 	h.mu.Unlock()
 
@@ -431,7 +435,7 @@ func (h *Handler) createUserSession(ctx context.Context, token AirtableTokenResp
 		UserID:                 userID,
 		AccessTokenCiphertext:  accessCiphertext,
 		RefreshTokenCiphertext: refreshCiphertext,
-		ExpiresAt:              time.Now().Add(time.Duration(token.ExpiresIn) * time.Second),
+		ExpiresAt:              h.now().Add(time.Duration(token.ExpiresIn) * time.Second),
 		Scopes:                 token.Scope,
 	}); err != nil {
 		return "", err
@@ -461,23 +465,24 @@ func (h *Handler) issueMCPToken(ctx context.Context, userID, clientID string) (s
 		clientNamePtr = client.ClientName
 	}
 
-	expiresAt := time.Now().Add(h.mcpTokenTTL)
+	expiresAt := h.now().Add(h.mcpTokenTTL)
 	if err := h.store.PutMCPToken(ctx, db.MCPTokenRecord{
 		TokenHash:  hashToken(accessToken),
 		UserID:     userID,
 		ClientID:   clientIDPtr,
 		ClientName: clientNamePtr,
-		CreatedAt:  time.Now().UTC(),
+		CreatedAt:  h.now().UTC(),
 		ExpiresAt:  expiresAt.UTC(),
 	}); err != nil {
 		return "", "", time.Time{}, err
 	}
 
 	h.mu.Lock()
+	h.pruneExpiredLocked(h.now().UTC())
 	h.refreshGrants[refreshToken] = refreshGrant{
 		ClientID:  clientID,
 		UserID:    userID,
-		ExpiresAt: time.Now().Add(h.mcpRefreshTokenTTL),
+		ExpiresAt: h.now().Add(h.mcpRefreshTokenTTL),
 	}
 	h.mu.Unlock()
 
@@ -488,8 +493,10 @@ func (h *Handler) consumeAuthorizationRequest(id string) (authorizationRequest, 
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
+	now := h.now().UTC()
+	h.pruneExpiredLocked(now)
 	request, ok := h.authRequests[id]
-	if !ok || time.Now().After(request.ExpiresAt) {
+	if !ok || now.After(request.ExpiresAt) {
 		delete(h.authRequests, id)
 		return authorizationRequest{}, false
 	}
@@ -501,8 +508,10 @@ func (h *Handler) consumeAuthorizationCode(code string) (authorizationCode, bool
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
+	now := h.now().UTC()
+	h.pruneExpiredLocked(now)
 	authCode, ok := h.authCodes[code]
-	if !ok || time.Now().After(authCode.ExpiresAt) {
+	if !ok || now.After(authCode.ExpiresAt) {
 		delete(h.authCodes, code)
 		return authorizationCode{}, false
 	}
@@ -514,13 +523,60 @@ func (h *Handler) consumeRefreshGrant(refreshToken string) (refreshGrant, bool) 
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
+	now := h.now().UTC()
+	h.pruneExpiredLocked(now)
 	grant, ok := h.refreshGrants[refreshToken]
-	if !ok || time.Now().After(grant.ExpiresAt) {
+	if !ok || now.After(grant.ExpiresAt) {
 		delete(h.refreshGrants, refreshToken)
 		return refreshGrant{}, false
 	}
 	delete(h.refreshGrants, refreshToken)
 	return grant, true
+}
+
+func (h *Handler) RunCleanupLoop(ctx context.Context, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			h.PruneExpiredState()
+		}
+	}
+}
+
+func (h *Handler) PruneExpiredState() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.pruneExpiredLocked(h.now().UTC())
+}
+
+func (h *Handler) pruneExpiredLocked(now time.Time) int {
+	removed := 0
+
+	for id, request := range h.authRequests {
+		if !now.Before(request.ExpiresAt) {
+			delete(h.authRequests, id)
+			removed++
+		}
+	}
+	for code, authCode := range h.authCodes {
+		if !now.Before(authCode.ExpiresAt) {
+			delete(h.authCodes, code)
+			removed++
+		}
+	}
+	for token, grant := range h.refreshGrants {
+		if !now.Before(grant.ExpiresAt) {
+			delete(h.refreshGrants, token)
+			removed++
+		}
+	}
+
+	return removed
 }
 
 func contains(items []string, target string) bool {

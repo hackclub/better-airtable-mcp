@@ -19,6 +19,7 @@ services:
   app:
     build:
       context: .
+      dockerfile: Dockerfile.dev
     depends_on:
       postgres:
         condition: service_healthy
@@ -30,7 +31,14 @@ services:
     ports:
       - "8080:8080"
     volumes:
+      - .:/src
+      - go_modules:/root/go/pkg/mod
+      - go_build_cache:/root/.cache/go-build
+      - node_modules:/src/frontend/node_modules
       - ./data:/data
 
 volumes:
   postgres_data:
+  go_modules:
+  go_build_cache:
+  node_modules:
