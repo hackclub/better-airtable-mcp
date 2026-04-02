@@ -243,6 +243,348 @@ func TestAuthenticatedReadToolsOverMCP(t *testing.T) {
 	}
 }
 
+func TestAuthenticatedReadToolsRejectCachedBaseWithoutAirtableAccess(t *testing.T) {
+	port := mcpFreePort(t)
+	postgres := embeddedpostgres.NewDatabase(
+		embeddedpostgres.DefaultConfig().
+			Port(uint32(port)).
+			Database("better_airtable_mcp_cross_user_read_test").
+			Username("postgres").
+			Password("postgres").
+			BinariesPath(filepath.Join(t.TempDir(), "postgres-binaries")).
+			DataPath(filepath.Join(t.TempDir(), "postgres-data")).
+			RuntimePath(filepath.Join(t.TempDir(), "postgres-runtime")),
+	)
+	if err := postgres.Start(); err != nil {
+		t.Fatalf("embedded postgres start failed: %v", err)
+	}
+	defer postgres.Stop()
+
+	store, err := db.Open(context.Background(), fmt.Sprintf("postgres://postgres:postgres@127.0.0.1:%d/better_airtable_mcp_cross_user_read_test?sslmode=disable", port))
+	if err != nil {
+		t.Fatalf("db.Open() returned error: %v", err)
+	}
+	defer store.Close()
+	if err := store.Migrate(context.Background()); err != nil {
+		t.Fatalf("store.Migrate() returned error: %v", err)
+	}
+
+	fakeAirtable := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		authHeader := r.Header.Get("Authorization")
+		switch r.URL.Path {
+		case "/v0/meta/bases":
+			switch authHeader {
+			case "Bearer airtable-access-token-user-1":
+				writeMCPJSON(t, w, map[string]any{
+					"bases": []map[string]any{
+						{"id": "appProjects", "name": "Project Tracker", "permissionLevel": "create"},
+					},
+				})
+			case "Bearer airtable-access-token-user-2":
+				writeMCPJSON(t, w, map[string]any{"bases": []map[string]any{}})
+			default:
+				t.Fatalf("unexpected Authorization header %q on %s", authHeader, r.URL.Path)
+			}
+		case "/v0/meta/bases/appProjects/tables":
+			if authHeader != "Bearer airtable-access-token-user-1" {
+				t.Fatalf("unexpected schema request with Authorization %q", authHeader)
+			}
+			writeMCPJSON(t, w, map[string]any{
+				"tables": []map[string]any{
+					{
+						"id":   "tblProjects",
+						"name": "Projects",
+						"fields": []map[string]any{
+							{"id": "fldName", "name": "Name", "type": "singleLineText"},
+						},
+					},
+				},
+			})
+		case "/v0/appProjects/tblProjects":
+			if authHeader != "Bearer airtable-access-token-user-1" {
+				t.Fatalf("unexpected record request with Authorization %q", authHeader)
+			}
+			writeMCPJSON(t, w, map[string]any{
+				"records": []map[string]any{
+					{
+						"id":          "recProject1",
+						"createdTime": "2026-04-01T12:00:00Z",
+						"fields": map[string]any{
+							"Name": "Website Redesign",
+						},
+					},
+				},
+			})
+		default:
+			t.Fatalf("unexpected Airtable path %q", r.URL.Path)
+		}
+	}))
+	defer fakeAirtable.Close()
+
+	secret, err := cryptoutil.New([]byte(strings.Repeat("k", 32)))
+	if err != nil {
+		t.Fatalf("cryptoutil.New() returned error: %v", err)
+	}
+
+	for _, userID := range []string{"user_1", "user_2"} {
+		if err := store.UpsertUser(context.Background(), db.User{ID: userID}); err != nil {
+			t.Fatalf("store.UpsertUser(%q) returned error: %v", userID, err)
+		}
+	}
+
+	user1Token, err := secret.Encrypt([]byte("airtable-access-token-user-1"))
+	if err != nil {
+		t.Fatalf("secret.Encrypt(user1) returned error: %v", err)
+	}
+	if err := store.PutAirtableToken(context.Background(), db.AirtableTokenRecord{
+		UserID:                 "user_1",
+		AccessTokenCiphertext:  user1Token,
+		RefreshTokenCiphertext: user1Token,
+		ExpiresAt:              time.Now().Add(time.Hour),
+		Scopes:                 "data.records:read data.records:write schema.bases:read",
+	}); err != nil {
+		t.Fatalf("store.PutAirtableToken(user_1) returned error: %v", err)
+	}
+	user2Token, err := secret.Encrypt([]byte("airtable-access-token-user-2"))
+	if err != nil {
+		t.Fatalf("secret.Encrypt(user2) returned error: %v", err)
+	}
+	if err := store.PutAirtableToken(context.Background(), db.AirtableTokenRecord{
+		UserID:                 "user_2",
+		AccessTokenCiphertext:  user2Token,
+		RefreshTokenCiphertext: user2Token,
+		ExpiresAt:              time.Now().Add(time.Hour),
+		Scopes:                 "data.records:read data.records:write schema.bases:read",
+	}); err != nil {
+		t.Fatalf("store.PutAirtableToken(user_2) returned error: %v", err)
+	}
+
+	for bearerToken, userID := range map[string]string{
+		"mcp-access-token-user-1": "user_1",
+		"mcp-access-token-user-2": "user_2",
+	} {
+		if err := store.PutMCPToken(context.Background(), db.MCPTokenRecord{
+			TokenHash: oauth.HashToken(bearerToken),
+			UserID:    userID,
+			CreatedAt: time.Now().UTC(),
+			ExpiresAt: time.Now().Add(time.Hour).UTC(),
+		}); err != nil {
+			t.Fatalf("store.PutMCPToken(%q) returned error: %v", userID, err)
+		}
+	}
+
+	cfg := config.Config{
+		SyncInterval:      time.Minute,
+		QueryDefaultLimit: 100,
+		QueryMaxLimit:     1000,
+	}
+	runtime := &tools.Runtime{
+		Store:  store,
+		Cipher: secret,
+		Syncer: syncer.NewService(syncer.NewHTTPClient(fakeAirtable.URL, fakeAirtable.Client()), t.TempDir()),
+		Config: cfg,
+	}
+	runtime.SyncManager = syncer.NewManager(runtime.Syncer, store, runtime, cfg.SyncInterval, 10*time.Minute)
+
+	handler := oauth.NewMiddleware(store).RequireBearer(mcp.NewHandler("better-airtable-mcp", "0.1.0", tools.NewCatalog(cfg, runtime)))
+
+	warmResponse := performAuthenticatedToolCall(t, handler, "mcp-access-token-user-1", "list_schema", map[string]any{
+		"base": "appProjects",
+	})
+	if isError, _ := warmResponse["result"].(map[string]any)["isError"].(bool); isError {
+		t.Fatalf("expected authorized user to warm cache successfully, got %#v", warmResponse)
+	}
+
+	queryResponse := performAuthenticatedToolCall(t, handler, "mcp-access-token-user-2", "query", map[string]any{
+		"base": "appProjects",
+		"sql":  []string{"SELECT name FROM projects"},
+	})
+	queryResult := queryResponse["result"].(map[string]any)
+	if isError, _ := queryResult["isError"].(bool); !isError {
+		t.Fatalf("expected unauthorized query to fail, got %#v", queryResponse)
+	}
+	if text := firstToolText(t, queryResponse); !strings.Contains(text, `base "appProjects" was not found`) {
+		t.Fatalf("expected unauthorized query error to mention missing base, got %q", text)
+	}
+
+	schemaResponse := performAuthenticatedToolCall(t, handler, "mcp-access-token-user-2", "list_schema", map[string]any{
+		"base": "appProjects",
+	})
+	schemaResult := schemaResponse["result"].(map[string]any)
+	if isError, _ := schemaResult["isError"].(bool); !isError {
+		t.Fatalf("expected unauthorized list_schema to fail, got %#v", schemaResponse)
+	}
+	if text := firstToolText(t, schemaResponse); !strings.Contains(text, `base "appProjects" was not found`) {
+		t.Fatalf("expected unauthorized schema error to mention missing base, got %q", text)
+	}
+}
+
+func TestCheckOperationRejectsSyncStatusWithoutAirtableAccess(t *testing.T) {
+	port := mcpFreePort(t)
+	postgres := embeddedpostgres.NewDatabase(
+		embeddedpostgres.DefaultConfig().
+			Port(uint32(port)).
+			Database("better_airtable_mcp_sync_access_test").
+			Username("postgres").
+			Password("postgres").
+			BinariesPath(filepath.Join(t.TempDir(), "postgres-binaries")).
+			DataPath(filepath.Join(t.TempDir(), "postgres-data")).
+			RuntimePath(filepath.Join(t.TempDir(), "postgres-runtime")),
+	)
+	if err := postgres.Start(); err != nil {
+		t.Fatalf("embedded postgres start failed: %v", err)
+	}
+	defer postgres.Stop()
+
+	store, err := db.Open(context.Background(), fmt.Sprintf("postgres://postgres:postgres@127.0.0.1:%d/better_airtable_mcp_sync_access_test?sslmode=disable", port))
+	if err != nil {
+		t.Fatalf("db.Open() returned error: %v", err)
+	}
+	defer store.Close()
+	if err := store.Migrate(context.Background()); err != nil {
+		t.Fatalf("store.Migrate() returned error: %v", err)
+	}
+
+	fakeAirtable := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		authHeader := r.Header.Get("Authorization")
+		switch r.URL.Path {
+		case "/v0/meta/bases":
+			switch authHeader {
+			case "Bearer airtable-access-token-user-1":
+				writeMCPJSON(t, w, map[string]any{
+					"bases": []map[string]any{
+						{"id": "appProjects", "name": "Project Tracker", "permissionLevel": "create"},
+					},
+				})
+			case "Bearer airtable-access-token-user-2":
+				writeMCPJSON(t, w, map[string]any{"bases": []map[string]any{}})
+			default:
+				t.Fatalf("unexpected Authorization header %q on %s", authHeader, r.URL.Path)
+			}
+		case "/v0/meta/bases/appProjects/tables":
+			if authHeader != "Bearer airtable-access-token-user-1" {
+				t.Fatalf("unexpected schema request with Authorization %q", authHeader)
+			}
+			writeMCPJSON(t, w, map[string]any{
+				"tables": []map[string]any{
+					{
+						"id":   "tblProjects",
+						"name": "Projects",
+						"fields": []map[string]any{
+							{"id": "fldName", "name": "Name", "type": "singleLineText"},
+						},
+					},
+				},
+			})
+		case "/v0/appProjects/tblProjects":
+			if authHeader != "Bearer airtable-access-token-user-1" {
+				t.Fatalf("unexpected record request with Authorization %q", authHeader)
+			}
+			writeMCPJSON(t, w, map[string]any{
+				"records": []map[string]any{
+					{
+						"id":          "recProject1",
+						"createdTime": "2026-04-01T12:00:00Z",
+						"fields": map[string]any{
+							"Name": "Website Redesign",
+						},
+					},
+				},
+			})
+		default:
+			t.Fatalf("unexpected Airtable path %q", r.URL.Path)
+		}
+	}))
+	defer fakeAirtable.Close()
+
+	secret, err := cryptoutil.New([]byte(strings.Repeat("k", 32)))
+	if err != nil {
+		t.Fatalf("cryptoutil.New() returned error: %v", err)
+	}
+
+	for _, userID := range []string{"user_1", "user_2"} {
+		if err := store.UpsertUser(context.Background(), db.User{ID: userID}); err != nil {
+			t.Fatalf("store.UpsertUser(%q) returned error: %v", userID, err)
+		}
+	}
+
+	user1Token, err := secret.Encrypt([]byte("airtable-access-token-user-1"))
+	if err != nil {
+		t.Fatalf("secret.Encrypt(user1) returned error: %v", err)
+	}
+	if err := store.PutAirtableToken(context.Background(), db.AirtableTokenRecord{
+		UserID:                 "user_1",
+		AccessTokenCiphertext:  user1Token,
+		RefreshTokenCiphertext: user1Token,
+		ExpiresAt:              time.Now().Add(time.Hour),
+		Scopes:                 "data.records:read data.records:write schema.bases:read",
+	}); err != nil {
+		t.Fatalf("store.PutAirtableToken(user_1) returned error: %v", err)
+	}
+	user2Token, err := secret.Encrypt([]byte("airtable-access-token-user-2"))
+	if err != nil {
+		t.Fatalf("secret.Encrypt(user2) returned error: %v", err)
+	}
+	if err := store.PutAirtableToken(context.Background(), db.AirtableTokenRecord{
+		UserID:                 "user_2",
+		AccessTokenCiphertext:  user2Token,
+		RefreshTokenCiphertext: user2Token,
+		ExpiresAt:              time.Now().Add(time.Hour),
+		Scopes:                 "data.records:read data.records:write schema.bases:read",
+	}); err != nil {
+		t.Fatalf("store.PutAirtableToken(user_2) returned error: %v", err)
+	}
+
+	for bearerToken, userID := range map[string]string{
+		"mcp-access-token-user-1": "user_1",
+		"mcp-access-token-user-2": "user_2",
+	} {
+		if err := store.PutMCPToken(context.Background(), db.MCPTokenRecord{
+			TokenHash: oauth.HashToken(bearerToken),
+			UserID:    userID,
+			CreatedAt: time.Now().UTC(),
+			ExpiresAt: time.Now().Add(time.Hour).UTC(),
+		}); err != nil {
+			t.Fatalf("store.PutMCPToken(%q) returned error: %v", userID, err)
+		}
+	}
+
+	cfg := config.Config{
+		SyncInterval:      time.Minute,
+		QueryDefaultLimit: 100,
+		QueryMaxLimit:     1000,
+	}
+	runtime := &tools.Runtime{
+		Store:  store,
+		Cipher: secret,
+		Syncer: syncer.NewService(syncer.NewHTTPClient(fakeAirtable.URL, fakeAirtable.Client()), t.TempDir()),
+		Config: cfg,
+	}
+	runtime.SyncManager = syncer.NewManager(runtime.Syncer, store, runtime, cfg.SyncInterval, 10*time.Minute)
+
+	handler := oauth.NewMiddleware(store).RequireBearer(mcp.NewHandler("better-airtable-mcp", "0.1.0", tools.NewCatalog(cfg, runtime)))
+
+	syncResponse := performAuthenticatedToolCall(t, handler, "mcp-access-token-user-1", "sync", map[string]any{
+		"base": "appProjects",
+	})
+	syncResult := syncResponse["result"].(map[string]any)["structuredContent"].(map[string]any)
+	operationID := syncResult["operation_id"].(string)
+	if operationID != "sync_appProjects" {
+		t.Fatalf("expected sync operation id sync_appProjects, got %#v", syncResult)
+	}
+
+	checkResponse := performAuthenticatedToolCall(t, handler, "mcp-access-token-user-2", "check_operation", map[string]any{
+		"operation_id": operationID,
+	})
+	checkResult := checkResponse["result"].(map[string]any)
+	if isError, _ := checkResult["isError"].(bool); !isError {
+		t.Fatalf("expected unauthorized sync status lookup to fail, got %#v", checkResponse)
+	}
+	if text := firstToolText(t, checkResponse); !strings.Contains(text, "operation was not found") {
+		t.Fatalf("expected sync status lookup error to hide the operation, got %q", text)
+	}
+}
+
 func firstToolText(t *testing.T, response map[string]any) string {
 	t.Helper()
 	result := response["result"].(map[string]any)

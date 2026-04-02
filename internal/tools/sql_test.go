@@ -3,7 +3,7 @@ package tools
 import "testing"
 
 func TestNormalizeQueryAppliesDefaultLimit(t *testing.T) {
-	normalized, err := NormalizeQuery("SELECT id, name FROM projects", 0, 100, 1000)
+	normalized, err := NormalizeQuery("SELECT id, name FROM projects", 100, 1000)
 	if err != nil {
 		t.Fatalf("NormalizeQuery() returned error: %v", err)
 	}
@@ -23,7 +23,7 @@ func TestNormalizeQueryAppliesDefaultLimit(t *testing.T) {
 }
 
 func TestNormalizeQueryPreservesExistingLimit(t *testing.T) {
-	normalized, err := NormalizeQuery("SELECT * FROM projects LIMIT 5;", 25, 100, 1000)
+	normalized, err := NormalizeQuery("SELECT * FROM projects LIMIT 5;", 100, 1000)
 	if err != nil {
 		t.Fatalf("NormalizeQuery() returned error: %v", err)
 	}
@@ -34,8 +34,8 @@ func TestNormalizeQueryPreservesExistingLimit(t *testing.T) {
 	if normalized.ExecutionSQL != "SELECT * FROM projects LIMIT 5;" {
 		t.Fatalf("unexpected execution SQL %q", normalized.ExecutionSQL)
 	}
-	if normalized.EffectiveLimit != 25 {
-		t.Fatalf("expected effective limit 25, got %d", normalized.EffectiveLimit)
+	if normalized.EffectiveLimit != 100 {
+		t.Fatalf("expected effective limit 100, got %d", normalized.EffectiveLimit)
 	}
 	if normalized.ServerAppliedLimit {
 		t.Fatal("expected existing SQL LIMIT to prevent a server-applied limit")

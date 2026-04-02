@@ -69,3 +69,34 @@ func TestFormatSchemaCSVUsesSyncBaseAndPerTableSampleSections(t *testing.T) {
 		t.Fatalf("expected per-table sample sections instead of legacy schema sections, got %q", text)
 	}
 }
+
+func TestSchemaSampleRowsTruncatesLongValues(t *testing.T) {
+	longName := strings.Repeat("a", 120)
+	longJSONValue := map[string]any{
+		"note": strings.Repeat("b", 120),
+	}
+
+	rows := schemaSampleRows(map[string]any{
+		"sample_rows": []map[string]any{
+			{
+				"id":           "recProject1",
+				"created_time": "2026-04-01T12:00:00Z",
+				"name":         longName,
+				"metadata":     longJSONValue,
+			},
+		},
+	}, []string{"id", "created_time", "name", "metadata"})
+
+	if got := rows[0][2]; len([]rune(got)) != schemaSampleValueMaxChars {
+		t.Fatalf("expected truncated string length %d, got %d (%q)", schemaSampleValueMaxChars, len([]rune(got)), got)
+	}
+	if !strings.HasSuffix(rows[0][2], schemaSampleTruncationTag) {
+		t.Fatalf("expected truncated string marker, got %q", rows[0][2])
+	}
+	if got := rows[0][3]; len([]rune(got)) != schemaSampleValueMaxChars {
+		t.Fatalf("expected truncated JSON length %d, got %d (%q)", schemaSampleValueMaxChars, len([]rune(got)), got)
+	}
+	if !strings.HasSuffix(rows[0][3], schemaSampleTruncationTag) {
+		t.Fatalf("expected truncated JSON marker, got %q", rows[0][3])
+	}
+}

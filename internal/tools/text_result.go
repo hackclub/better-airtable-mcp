@@ -10,6 +10,11 @@ import (
 	"github.com/hackclub/better-airtable-mcp/internal/mcp"
 )
 
+const (
+	schemaSampleValueMaxChars = 100
+	schemaSampleTruncationTag = " [truncated]"
+)
+
 type formattedSyncStatus struct {
 	OperationID          string
 	Status               string
@@ -260,9 +265,23 @@ func schemaSampleRows(table map[string]any, headers []string) [][]string {
 	for _, sample := range samples {
 		row := make([]string, 0, len(headers))
 		for _, header := range headers {
-			row = append(row, csvCell(sample[header]))
+			row = append(row, truncateSchemaSampleValue(csvCell(sample[header])))
 		}
 		rows = append(rows, row)
 	}
 	return rows
+}
+
+func truncateSchemaSampleValue(value string) string {
+	runes := []rune(value)
+	if len(runes) <= schemaSampleValueMaxChars {
+		return value
+	}
+
+	suffix := []rune(schemaSampleTruncationTag)
+	if len(suffix) >= schemaSampleValueMaxChars {
+		return string(suffix[:schemaSampleValueMaxChars])
+	}
+
+	return string(runes[:schemaSampleValueMaxChars-len(suffix)]) + schemaSampleTruncationTag
 }

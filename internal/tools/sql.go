@@ -49,12 +49,12 @@ var blockedSQLKeywords = map[string]struct{}{
 	"VACUUM":   {},
 }
 
-func NormalizeQuery(sql string, requestedLimit, defaultLimit, maxLimit int) (NormalizedQuery, error) {
+func NormalizeQuery(sql string, defaultLimit, maxLimit int) (NormalizedQuery, error) {
 	if err := ValidateReadOnlySQL(sql); err != nil {
 		return NormalizedQuery{}, err
 	}
 
-	effectiveLimit, err := ResolveQueryLimit(requestedLimit, defaultLimit, maxLimit)
+	effectiveLimit, err := ResolveQueryLimit(defaultLimit, maxLimit)
 	if err != nil {
 		return NormalizedQuery{}, err
 	}
@@ -76,7 +76,7 @@ func NormalizeQuery(sql string, requestedLimit, defaultLimit, maxLimit int) (Nor
 	}, nil
 }
 
-func ResolveQueryLimit(requestedLimit, defaultLimit, maxLimit int) (int, error) {
+func ResolveQueryLimit(defaultLimit, maxLimit int) (int, error) {
 	switch {
 	case defaultLimit <= 0:
 		return 0, fmt.Errorf("default limit must be greater than zero")
@@ -84,14 +84,8 @@ func ResolveQueryLimit(requestedLimit, defaultLimit, maxLimit int) (int, error) 
 		return 0, fmt.Errorf("max limit must be greater than zero")
 	case defaultLimit > maxLimit:
 		return 0, fmt.Errorf("default limit must be less than or equal to max limit")
-	case requestedLimit < 0:
-		return 0, fmt.Errorf("limit must be greater than or equal to zero")
-	case requestedLimit == 0:
-		return defaultLimit, nil
-	case requestedLimit > maxLimit:
-		return 0, fmt.Errorf("limit must be less than or equal to %d", maxLimit)
 	default:
-		return requestedLimit, nil
+		return defaultLimit, nil
 	}
 }
 

@@ -3,11 +3,13 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
 
 	"github.com/hackclub/better-airtable-mcp/internal/mcp"
+	"github.com/jackc/pgx/v5"
 )
 
 type CheckOperationInput struct {
@@ -54,7 +56,39 @@ func (t CheckOperationTool) Call(ctx context.Context, raw json.RawMessage) (mcp.
 		return mcp.ToolCallResult{}, fmt.Errorf("operation_id must start with op_ or sync_")
 	}
 
+	userID, ok := authenticatedUserID(ctx)
+	if !ok {
+		return mcp.ToolCallResult{}, fmt.Errorf("missing authenticated user")
+	}
+
 	if strings.HasPrefix(input.OperationID, "sync_") && t.runtime != nil && t.runtime.SyncManager != nil {
+		baseID := strings.TrimPrefix(input.OperationID, "sync_")
+		if t.runtime.Syncer == nil {
+			return mcp.ErrorResult("operation tracking is not implemented yet", map[string]any{
+				"operation_id": input.OperationID,
+			}), nil
+		}
+		accessToken, err := t.runtime.AirtableAccessToken(ctx, userID)
+		if err != nil {
+			return mcp.ToolCallResult{}, err
+		}
+		bases, err := t.runtime.Syncer.SearchBases(ctx, accessToken, "")
+		if err != nil {
+			return mcp.ToolCallResult{}, err
+		}
+		allowed := false
+		for _, base := range bases {
+			if base.ID == baseID {
+				allowed = true
+				break
+			}
+		}
+		if !allowed {
+			return mcp.ErrorResult("operation was not found", map[string]any{
+				"operation_id": input.OperationID,
+			}), nil
+		}
+
 		status, found, err := t.runtime.SyncManager.CheckOperation(ctx, input.OperationID)
 		if err != nil {
 			return mcp.ToolCallResult{}, err
@@ -72,6 +106,26 @@ func (t CheckOperationTool) Call(ctx context.Context, raw json.RawMessage) (mcp.
 	}
 
 	if strings.HasPrefix(input.OperationID, "op_") && t.runtime != nil && t.runtime.Approval != nil {
+		if t.runtime.Store == nil {
+			return mcp.ErrorResult("operation tracking is not implemented yet", map[string]any{
+				"operation_id": input.OperationID,
+			}), nil
+		}
+		record, err := t.runtime.Store.GetPendingOperation(ctx, input.OperationID)
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return mcp.ErrorResult("operation was not found", map[string]any{
+					"operation_id": input.OperationID,
+				}), nil
+			}
+			return mcp.ToolCallResult{}, err
+		}
+		if record.UserID != userID {
+			return mcp.ErrorResult("operation was not found", map[string]any{
+				"operation_id": input.OperationID,
+			}), nil
+		}
+
 		operation, err := t.runtime.Approval.GetOperation(ctx, input.OperationID)
 		if err != nil {
 			return mcp.ToolCallResult{}, err

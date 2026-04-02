@@ -225,6 +225,8 @@ recTask1,2026-04-01T13:00:00Z,Design new homepage
 recTask2,2026-04-01T13:15:00Z,QA revised layout
 ```
 
+- In the text output only, each sample cell is capped at 100 characters; truncated values end with ` [truncated]`
+
 **Behavior:**
 - Resolves base by ID or name (via `list_bases` internally if name is given)
 - If the base has no local snapshot yet, initializes schema immediately, creates empty/queryable DuckDB tables, starts a background sync, and waits until the first page for every table has been ingested (or an empty first page proves that table currently has no records) before returning
@@ -250,8 +252,7 @@ Execute one or more read-only SQL queries against a base's DuckDB cache.
   "sql": [
     "string — exactly one SELECT or WITH query",
     "string — exactly one SELECT or WITH query"
-  ],
-  "limit": "number (optional, default 100, max 1000)"
+  ]
 }
 ```
 

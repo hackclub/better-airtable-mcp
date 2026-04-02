@@ -30,6 +30,9 @@ func TestQueryToolDefinitionRequiresSQLArray(t *testing.T) {
 	}
 
 	properties := definition.InputSchema["properties"].(map[string]any)
+	if _, exists := properties["limit"]; exists {
+		t.Fatalf("expected query tool schema to omit limit property, got %#v", properties["limit"])
+	}
 	sqlProperty := properties["sql"].(map[string]any)
 	if sqlType, _ := sqlProperty["type"].(string); sqlType != "array" {
 		t.Fatalf("expected sql type array, got %#v", sqlProperty["type"])

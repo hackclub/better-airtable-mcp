@@ -12,9 +12,8 @@ import (
 )
 
 type QueryInput struct {
-	Base  string   `json:"base"`
-	SQL   []string `json:"sql"`
-	Limit int      `json:"limit,omitempty"`
+	Base string   `json:"base"`
+	SQL  []string `json:"sql"`
 }
 
 func normalizeQueryBatch(queries []string) ([]string, error) {
@@ -82,11 +81,6 @@ func (QueryTool) Definition() mcp.ToolDefinition {
 						"minLength": 1,
 					},
 				},
-				"limit": map[string]any{
-					"type":        "integer",
-					"description": "Optional row limit override applied independently to each query that does not already include LIMIT.",
-					"minimum":     1,
-				},
 			},
 			"required":             []string{"base", "sql"},
 			"additionalProperties": false,
@@ -112,7 +106,7 @@ func (t QueryTool) Call(ctx context.Context, raw json.RawMessage) (mcp.ToolCallR
 
 	normalizedQueries := make([]normalizedQueryCall, 0, len(queries))
 	for index, query := range queries {
-		normalized, err := NormalizeQuery(query, input.Limit, t.defaultLimit, t.maxLimit)
+		normalized, err := NormalizeQuery(query, t.defaultLimit, t.maxLimit)
 		if err != nil {
 			return mcp.ToolCallResult{}, wrapQueryError(index, len(queries), err)
 		}

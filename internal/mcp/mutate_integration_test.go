@@ -297,6 +297,164 @@ func TestMutateApprovalFlowOverMCP(t *testing.T) {
 	}
 }
 
+func TestCheckOperationRejectsMutationStatusForDifferentUser(t *testing.T) {
+	port := mutateFreePort(t)
+	postgres := embeddedpostgres.NewDatabase(
+		embeddedpostgres.DefaultConfig().
+			Port(uint32(port)).
+			Database("better_airtable_mutate_cross_user_test").
+			Username("postgres").
+			Password("postgres").
+			BinariesPath(filepath.Join(t.TempDir(), "postgres-binaries")).
+			DataPath(filepath.Join(t.TempDir(), "postgres-data")).
+			RuntimePath(filepath.Join(t.TempDir(), "postgres-runtime")),
+	)
+	if err := postgres.Start(); err != nil {
+		t.Fatalf("embedded postgres start failed: %v", err)
+	}
+	defer postgres.Stop()
+
+	store, err := db.Open(context.Background(), fmt.Sprintf("postgres://postgres:postgres@127.0.0.1:%d/better_airtable_mutate_cross_user_test?sslmode=disable", port))
+	if err != nil {
+		t.Fatalf("db.Open() returned error: %v", err)
+	}
+	defer store.Close()
+	if err := store.Migrate(context.Background()); err != nil {
+		t.Fatalf("store.Migrate() returned error: %v", err)
+	}
+
+	fakeAirtable := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/v0/meta/bases":
+			writeMCPJSON(t, w, map[string]any{
+				"bases": []map[string]any{
+					{"id": "appProjects", "name": "Project Tracker", "permissionLevel": "create"},
+				},
+			})
+		case r.URL.Path == "/v0/meta/bases/appProjects/tables":
+			writeMCPJSON(t, w, map[string]any{
+				"tables": []map[string]any{
+					{
+						"id":   "tblProjects",
+						"name": "Projects",
+						"fields": []map[string]any{
+							{"id": "fldName", "name": "Name", "type": "singleLineText"},
+							{"id": "fldStatus", "name": "Status", "type": "singleSelect"},
+						},
+					},
+				},
+			})
+		case r.URL.Path == "/v0/appProjects/tblProjects" && r.Method == http.MethodGet:
+			writeMCPJSON(t, w, map[string]any{
+				"records": []map[string]any{
+					{
+						"id":          "recProject1",
+						"createdTime": "2026-04-01T12:00:00Z",
+						"fields": map[string]any{
+							"Name":   "Website Redesign",
+							"Status": "Planning",
+						},
+					},
+				},
+			})
+		default:
+			t.Fatalf("unexpected Airtable %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer fakeAirtable.Close()
+
+	secret, err := cryptoutil.New([]byte(strings.Repeat("k", 32)))
+	if err != nil {
+		t.Fatalf("cryptoutil.New() returned error: %v", err)
+	}
+	for _, userID := range []string{"user_1", "user_2"} {
+		if err := store.UpsertUser(context.Background(), db.User{ID: userID}); err != nil {
+			t.Fatalf("store.UpsertUser(%q) returned error: %v", userID, err)
+		}
+	}
+
+	encryptedToken, err := secret.Encrypt([]byte("airtable-access-token"))
+	if err != nil {
+		t.Fatalf("secret.Encrypt() returned error: %v", err)
+	}
+	if err := store.PutAirtableToken(context.Background(), db.AirtableTokenRecord{
+		UserID:                 "user_1",
+		AccessTokenCiphertext:  encryptedToken,
+		RefreshTokenCiphertext: encryptedToken,
+		ExpiresAt:              time.Now().Add(time.Hour),
+		Scopes:                 "data.records:read data.records:write schema.bases:read",
+	}); err != nil {
+		t.Fatalf("store.PutAirtableToken(user_1) returned error: %v", err)
+	}
+
+	for bearerToken, userID := range map[string]string{
+		"mcp-access-token-user-1": "user_1",
+		"mcp-access-token-user-2": "user_2",
+	} {
+		if err := store.PutMCPToken(context.Background(), db.MCPTokenRecord{
+			TokenHash: oauth.HashToken(bearerToken),
+			UserID:    userID,
+			CreatedAt: time.Now().UTC(),
+			ExpiresAt: time.Now().Add(time.Hour).UTC(),
+		}); err != nil {
+			t.Fatalf("store.PutMCPToken(%q) returned error: %v", userID, err)
+		}
+	}
+
+	cfg := config.Config{
+		BaseURL:           mustParseTestURL(t, "http://example.test"),
+		SyncInterval:      time.Minute,
+		SyncTTL:           10 * time.Minute,
+		ApprovalTTL:       10 * time.Minute,
+		QueryDefaultLimit: 100,
+		QueryMaxLimit:     1000,
+	}
+	syncService := syncer.NewService(syncer.NewHTTPClient(fakeAirtable.URL, fakeAirtable.Client()), t.TempDir())
+	runtime := &tools.Runtime{
+		Store:  store,
+		Cipher: secret,
+		Syncer: syncService,
+		Config: cfg,
+	}
+	runtime.SyncManager = syncer.NewManager(syncService, store, runtime, cfg.SyncInterval, cfg.SyncTTL)
+	runtime.Approval = approval.NewService(store, secret, syncService, runtime.SyncManager, runtime, syncer.NewHTTPClient(fakeAirtable.URL, fakeAirtable.Client()), cfg.BaseURLString(), cfg.ApprovalTTL)
+
+	handler := oauth.NewMiddleware(store).RequireBearer(mcp.NewHandler("better-airtable-mcp", "0.1.0", tools.NewCatalog(cfg, runtime)))
+
+	ensureBaseSyncedForMutationTest(t, runtime, "user_1", "Project Tracker")
+
+	mutateResponse := performAuthenticatedToolCall(t, handler, "mcp-access-token-user-1", "mutate", map[string]any{
+		"base": "Project Tracker",
+		"operations": []map[string]any{
+			{
+				"type":  "update_records",
+				"table": "projects",
+				"records": []map[string]any{
+					{
+						"id": "recProject1",
+						"fields": map[string]any{
+							"status": "Done",
+						},
+					},
+				},
+			},
+		},
+	})
+	mutateStructured := mutateResponse["result"].(map[string]any)["structuredContent"].(map[string]any)
+	operationID := mutateStructured["operation_id"].(string)
+
+	checkResponse := performAuthenticatedToolCall(t, handler, "mcp-access-token-user-2", "check_operation", map[string]any{
+		"operation_id": operationID,
+	})
+	checkResult := checkResponse["result"].(map[string]any)
+	if isError, _ := checkResult["isError"].(bool); !isError {
+		t.Fatalf("expected cross-user mutation lookup to fail, got %#v", checkResponse)
+	}
+	if text := firstToolText(t, checkResponse); !strings.Contains(text, "operation was not found") {
+		t.Fatalf("expected cross-user mutation lookup to hide the operation, got %q", text)
+	}
+}
+
 func TestMutateCreateRecordsAcceptsOriginalAirtableFieldNamesOverMCP(t *testing.T) {
 	port := mutateFreePort(t)
 	postgres := embeddedpostgres.NewDatabase(
