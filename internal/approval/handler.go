@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/hackclub/better-airtable-mcp/internal/httpx"
+	"github.com/hackclub/better-airtable-mcp/internal/logx"
 )
 
 type operationService interface {
@@ -50,6 +51,7 @@ func (h *Handler) ServeApprovalPage(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+	logx.SetRoute(r.Context(), "/approve/:operation")
 	if _, err := h.service.GetOperation(r.Context(), operationID); err != nil {
 		httpx.WriteError(w, http.StatusNotFound, "operation was not found")
 		return
@@ -89,6 +91,7 @@ func (h *Handler) ServeOperationAPI(w http.ResponseWriter, r *http.Request) {
 	operationID := parts[0]
 	switch {
 	case len(parts) == 1 && r.Method == http.MethodGet:
+		logx.SetRoute(r.Context(), "/api/operations/:operation")
 		operation, err := h.service.GetOperation(r.Context(), operationID)
 		if err != nil {
 			httpx.WriteError(w, http.StatusNotFound, "operation was not found")
@@ -96,6 +99,7 @@ func (h *Handler) ServeOperationAPI(w http.ResponseWriter, r *http.Request) {
 		}
 		httpx.WriteJSON(w, http.StatusOK, operation)
 	case len(parts) == 2 && r.Method == http.MethodPost && parts[1] == "approve":
+		logx.SetRoute(r.Context(), "/api/operations/:operation/:action")
 		operation, err := h.service.Approve(r.Context(), operationID)
 		if err != nil {
 			httpx.WriteError(w, http.StatusBadRequest, err.Error())
@@ -103,6 +107,7 @@ func (h *Handler) ServeOperationAPI(w http.ResponseWriter, r *http.Request) {
 		}
 		httpx.WriteJSON(w, http.StatusOK, operation)
 	case len(parts) == 2 && r.Method == http.MethodPost && parts[1] == "reject":
+		logx.SetRoute(r.Context(), "/api/operations/:operation/:action")
 		operation, err := h.service.Reject(r.Context(), operationID)
 		if err != nil {
 			httpx.WriteError(w, http.StatusBadRequest, err.Error())

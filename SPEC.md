@@ -902,7 +902,21 @@ CREATE TABLE oauth_clients (
 - The encryption key is supplied via environment variable and never written to disk
 - MCP bearer tokens are never stored in plaintext; only a hash is stored
 - Server logs must never include Airtable tokens or decrypted mutation payloads
+- Server logs must never include OAuth authorization codes, OAuth state values, PKCE verifiers, client secrets, raw request bodies, raw query strings, Airtable request bodies, raw approval URLs, or raw approval `op_...` identifiers
+- Structured logging for mutation requests must log only IDs, counts, hashes, statuses, and sanitized previews; it must never log decrypted field values or approval payload contents
 - Approval previews are decrypted only for the specific HTTP request serving the approval page
+
+### 6.2 Observability and Logging
+
+- The server emits structured JSON logs to stdout
+- The server uses one fixed production-debuggable verbosity; it does not expose multiple runtime log levels
+- Every HTTP request log includes a request ID, route template, method, status, duration, bytes written, and cancellation state
+- Logs for MCP, OAuth, sync, Airtable, and approval flows must include stable event names plus safe correlation fields when available, including request IDs, user IDs, token hashes, client IDs, MCP session IDs, base IDs, table IDs, and sync operation IDs
+- Approval operation IDs must be logged only as hashes
+- MCP tool-call logs must include sanitized argument summaries rather than raw tool payloads
+- SQL logging must use sanitized previews plus hashes rather than raw literal-bearing SQL text
+- Airtable HTTP logging must record retries, failures, and slow calls without logging tokens or request bodies
+- Approval logging must record prepare, approve, reject, batch execution, completion, and expiry events without logging approval URLs or mutation field values
 
 ---
 
@@ -952,6 +966,12 @@ CREATE TABLE oauth_clients (
 |---|---|---|
 | GET | `/` | Render the README as the landing page |
 
+### 7.7 Health
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/healthz` | Health check endpoint for database-backed readiness |
+
 ---
 
 ## 8. Project Structure
@@ -962,48 +982,69 @@ better-airtable-mcp/
 │   └── server/
 │       └── main.go              # Entrypoint
 ├── internal/
-│   ├── mcp/
-│   │   ├── handler.go           # Streamable HTTP handler, JSON-RPC dispatch
-│   │   ├── session.go           # Session management (Mcp-Session-Id)
-│   │   └── tools.go             # Tool definitions and dispatch
-│   ├── tools/
-│   │   ├── query.go             # query tool implementation
-│   │   ├── list_schema.go       # list_schema tool implementation
-│   │   ├── mutate.go            # mutate tool implementation
-│   │   ├── sync.go              # sync tool implementation
-│   │   ├── search_bases.go      # list_bases tool implementation
-│   │   └── check_operation.go   # check_operation tool implementation
-│   ├── sync/
-│   │   ├── worker.go            # Per-base sync worker goroutine
-│   │   ├── manager.go           # Manages worker lifecycle and TTLs
-│   │   ├── airtable.go          # Airtable API client (list records, schema)
-│   │   └── duckdb.go            # DuckDB write operations (schema creation, inserts)
-│   ├── duckdb/
-│   │   ├── pool.go              # Read-only connection pool per base
-│   │   ├── schema.go            # Table name sanitization, type mapping
-│   │   └── metadata.go          # _metadata and _sync_info table operations
 │   ├── approval/
-│   │   ├── handler.go           # HTTP handlers for approval API
-│   │   ├── executor.go          # Executes approved mutations against Airtable
-│   │   └── expiry.go            # Background goroutine to expire stale operations
-│   ├── oauth/
-│   │   ├── provider.go          # MCP-facing OAuth provider (authorize, token, register)
-│   │   ├── airtable.go          # Airtable OAuth client (auth, callback, refresh)
-│   │   ├── middleware.go         # Bearer token validation middleware
-│   │   └── wellknown.go         # .well-known endpoint handlers
+│   │   ├── assets.go            # Embedded approval/debug frontend assets
+│   │   ├── handler.go           # Approval page and approval API handlers
+│   │   └── service.go           # Approval lifecycle, execution, and expiry
+│   ├── config/
+│   │   └── config.go            # Environment-driven server configuration
+│   ├── cryptoutil/
+│   │   └── cryptoutil.go        # Application-layer encryption helpers
 │   ├── db/
-│   │   ├── postgres.go          # Postgres connection and migrations
-│   │   └── queries.go           # SQL queries (consider sqlc)
-│   └── config/
-│       └── config.go            # Configuration (env vars, defaults)
+│   │   └── postgres.go          # Postgres connection, migrations, and store methods
+│   ├── duckdb/
+│   │   ├── schema.go            # Table name sanitization and type mapping
+│   │   └── store.go             # DuckDB snapshot storage operations
+│   ├── health/
+│   │   └── handler.go           # Health check endpoint
+│   ├── httpx/
+│   │   └── json.go              # Shared JSON HTTP helpers
+│   ├── landing/
+│   │   └── handler.go           # README-backed landing page handler
+│   ├── logx/
+│   │   ├── http.go              # Request logging middleware and route templates
+│   │   ├── logx.go              # Structured logger and context helpers
+│   │   └── sanitize.go          # Privacy-safe log sanitizers and summarizers
+│   ├── mcp/
+│   │   ├── handler.go           # Streamable HTTP handler and JSON-RPC dispatch
+│   │   ├── session.go           # MCP session management and expiry
+│   │   └── tools.go             # Tool catalog exposure and invocation plumbing
+│   ├── oauth/
+│   │   ├── airtable.go          # Airtable OAuth client and token exchange
+│   │   ├── handler.go           # MCP-facing OAuth endpoints and callback handling
+│   │   ├── middleware.go        # Bearer token validation middleware
+│   │   ├── ratelimit.go         # OAuth endpoint rate limiting
+│   │   └── token_manager.go     # Airtable token refresh and cached token access
+│   ├── sync/
+│   │   ├── airtable.go          # Airtable API client for sync reads and mutations
+│   │   ├── manager.go           # Per-base sync worker lifecycle and coordination
+│   │   └── service.go           # Snapshot sync execution and DuckDB writes
+│   └── tools/
+│       ├── auth.go              # Tool auth gating and capability checks
+│       ├── catalog.go           # MCP tool catalog definitions
+│       ├── check_operation.go   # check_operation tool
+│       ├── common.go            # Shared tool helpers and logging
+│       ├── instructions.go      # Tool instruction text
+│       ├── list_schema.go       # list_schema tool
+│       ├── mutate.go            # mutate tool
+│       ├── query.go             # query tool
+│       ├── runtime.go           # Shared runtime dependencies for tools
+│       ├── search_bases.go      # search_bases tool
+│       ├── sql.go               # SQL validation and sanitization helpers
+│       ├── sync.go              # sync tool
+│       └── text_result.go       # Text result rendering helpers
 ├── frontend/
 │   ├── src/
 │   │   ├── App.tsx              # Approval page SPA
+│   │   ├── McpDebugPage.tsx     # Embedded MCP debugging page
 │   │   ├── components/
-│   │   │   ├── RecordTable.tsx   # Table view for creates
-│   │   │   ├── DiffView.tsx      # Old → new diff for updates
-│   │   │   └── DeletePreview.tsx  # Records being deleted
-│   │   └── ...
+│   │   │   ├── RecordTable.tsx  # Table view for creates
+│   │   │   ├── DiffView.tsx     # Old -> new diff for updates
+│   │   │   └── DeletePreview.tsx # Records being deleted
+│   │   ├── formatters.tsx       # Shared approval/debug formatting helpers
+│   │   ├── main.tsx             # Vite entrypoint
+│   │   ├── styles.css           # Frontend styling
+│   │   └── types.ts             # Shared frontend types
 │   ├── package.json
 │   └── vite.config.ts
 ├── Dockerfile
@@ -1094,7 +1135,7 @@ All configuration via environment variables:
 | Airtable token expired, refresh succeeds | Transparent to user |
 | Airtable token expired, refresh fails | Return error; agent tells user to re-authenticate |
 | Initial sync fails mid-way | Keep the partial snapshot and mark sync status as failed; retry on next interval or manual sync |
-| Refresh fails mid-way after a base already has a complete snapshot | Retain the previous complete DuckDB state; discard staging DB; log error; retry on next interval |
+| Refresh fails mid-way after a base already has a complete snapshot | Retain the previous complete DuckDB state; discard staging DB; emit a structured sanitized log event; retry on next interval |
 | Query on a base with no local snapshot yet | Initialize schema immediately, start a background sync, and execute against the currently visible subset |
 | Query is not exactly one `SELECT` or `WITH` statement | Return validation error; do not execute |
 | Mutate with invalid field names | Return error with suggestions (closest matching field names) |

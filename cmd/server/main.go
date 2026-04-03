@@ -2,8 +2,9 @@ package main
 
 import (
 	"context"
-	"log"
+	"log/slog"
 	"net/http"
+	"os"
 	"time"
 
 	"github.com/hackclub/better-airtable-mcp/internal/approval"
@@ -12,6 +13,7 @@ import (
 	"github.com/hackclub/better-airtable-mcp/internal/db"
 	"github.com/hackclub/better-airtable-mcp/internal/health"
 	"github.com/hackclub/better-airtable-mcp/internal/landing"
+	"github.com/hackclub/better-airtable-mcp/internal/logx"
 	"github.com/hackclub/better-airtable-mcp/internal/mcp"
 	"github.com/hackclub/better-airtable-mcp/internal/oauth"
 	syncer "github.com/hackclub/better-airtable-mcp/internal/sync"
@@ -19,24 +21,50 @@ import (
 )
 
 func main() {
+	slog.SetDefault(logx.NewLogger(os.Stdout))
+
 	cfg, err := config.LoadFromEnv()
 	if err != nil {
-		log.Fatalf("load config: %v", err)
+		logx.Event(context.Background(), "server", "server.startup_failed",
+			"stage", "load_config",
+			"error_kind", logx.ErrorKind(err),
+			"error_message", logx.ErrorPreview(err),
+			"fatal", true,
+		)
+		os.Exit(1)
 	}
 
 	store, err := db.Open(context.Background(), cfg.DatabaseURL)
 	if err != nil {
-		log.Fatalf("open postgres: %v", err)
+		logx.Event(context.Background(), "server", "server.startup_failed",
+			"stage", "open_postgres",
+			"error_kind", logx.ErrorKind(err),
+			"error_message", logx.ErrorPreview(err),
+			"fatal", true,
+		)
+		os.Exit(1)
 	}
 	defer store.Close()
 
 	if err := store.Migrate(context.Background()); err != nil {
-		log.Fatalf("run postgres migrations: %v", err)
+		logx.Event(context.Background(), "server", "server.startup_failed",
+			"stage", "run_postgres_migrations",
+			"error_kind", logx.ErrorKind(err),
+			"error_message", logx.ErrorPreview(err),
+			"fatal", true,
+		)
+		os.Exit(1)
 	}
 
 	cipher, err := cryptoutil.New([]byte(cfg.AppEncryptionKey))
 	if err != nil {
-		log.Fatalf("create application cipher: %v", err)
+		logx.Event(context.Background(), "server", "server.startup_failed",
+			"stage", "create_cipher",
+			"error_kind", logx.ErrorKind(err),
+			"error_message", logx.ErrorPreview(err),
+			"fatal", true,
+		)
+		os.Exit(1)
 	}
 
 	airtableOAuth := oauth.NewAirtableOAuthClient(
@@ -51,8 +79,8 @@ func main() {
 
 	mux := http.NewServeMux()
 
-	mux.Handle("/healthz", health.NewHandler(store))
-	mux.Handle("/", landing.NewHandler("README.md"))
+	mux.Handle("/healthz", logx.Route("/healthz", health.NewHandler(store)))
+	mux.Handle("/", logx.Route("/", landing.NewHandler("README.md")))
 
 	syncService := syncer.NewService(syncer.NewHTTPClient("", nil), cfg.DuckDBDataDir)
 	toolRuntime := &tools.Runtime{
@@ -65,23 +93,31 @@ func main() {
 	toolRuntime.SyncManager = syncer.NewManager(syncService, store, tokenManager, cfg.SyncInterval, cfg.SyncTTL)
 	toolRuntime.Approval = approval.NewService(store, cipher, syncService, toolRuntime.SyncManager, tokenManager, syncer.NewHTTPClient("", nil), cfg.BaseURLString(), cfg.ApprovalTTL)
 	if err := toolRuntime.SyncManager.SweepStaleDuckDBFiles(context.Background()); err != nil {
-		log.Printf("sweep stale duckdb files: %v", err)
+		logx.Event(context.Background(), "server", "server.background_init_failed",
+			"stage", "sweep_stale_duckdb_files",
+			"error_kind", logx.ErrorKind(err),
+			"error_message", logx.ErrorPreview(err),
+		)
 	}
 	if err := toolRuntime.SyncManager.RestoreActiveWorkers(context.Background()); err != nil {
-		log.Printf("restore active sync workers: %v", err)
+		logx.Event(context.Background(), "server", "server.background_init_failed",
+			"stage", "restore_active_sync_workers",
+			"error_kind", logx.ErrorKind(err),
+			"error_message", logx.ErrorPreview(err),
+		)
 	}
 
 	mcpHandler := mcp.NewHandler("better-airtable-mcp", "0.1.0", tools.NewCatalog(cfg, toolRuntime))
 	middleware := oauth.NewMiddleware(store)
-	mux.Handle("/mcp", middleware.RequireBearer(mcpHandler))
+	mux.Handle("/mcp", logx.Route("/mcp", middleware.RequireBearer(mcpHandler)))
 
 	oauthHandler := oauth.NewHandler(cfg, store, cipher, airtableOAuth)
-	mux.HandleFunc("/.well-known/oauth-protected-resource", oauthHandler.ProtectedResource)
-	mux.HandleFunc("/.well-known/oauth-authorization-server", oauthHandler.AuthorizationServer)
-	mux.HandleFunc("/oauth/register", oauthHandler.Register)
-	mux.HandleFunc("/oauth/authorize", oauthHandler.Authorize)
-	mux.HandleFunc("/oauth/token", oauthHandler.Token)
-	mux.HandleFunc("/oauth/airtable/callback", oauthHandler.AirtableCallback)
+	mux.Handle("/.well-known/oauth-protected-resource", logx.Route("/.well-known/oauth-protected-resource", http.HandlerFunc(oauthHandler.ProtectedResource)))
+	mux.Handle("/.well-known/oauth-authorization-server", logx.Route("/.well-known/oauth-authorization-server", http.HandlerFunc(oauthHandler.AuthorizationServer)))
+	mux.Handle("/oauth/register", logx.Route("/oauth/register", http.HandlerFunc(oauthHandler.Register)))
+	mux.Handle("/oauth/authorize", logx.Route("/oauth/authorize", http.HandlerFunc(oauthHandler.Authorize)))
+	mux.Handle("/oauth/token", logx.Route("/oauth/token", http.HandlerFunc(oauthHandler.Token)))
+	mux.Handle("/oauth/airtable/callback", logx.Route("/oauth/airtable/callback", http.HandlerFunc(oauthHandler.AirtableCallback)))
 
 	go toolRuntime.Approval.RunExpiryLoop(context.Background(), time.Minute)
 	go tokenManager.RunRefreshLoop(context.Background(), time.Minute)
@@ -89,21 +125,29 @@ func main() {
 	go mcpHandler.RunSessionExpiryLoop(context.Background(), time.Minute)
 
 	approvalHandler := approval.NewHandler(toolRuntime.Approval)
-	mux.HandleFunc("/approve/", approvalHandler.ServeApprovalPage)
-	mux.HandleFunc("/debug", approvalHandler.ServeDebugPage)
-	mux.HandleFunc("/approval-ui/", approvalHandler.ServeAssets)
-	mux.HandleFunc("/api/operations/", approvalHandler.ServeOperationAPI)
+	mux.Handle("/approve/", logx.Route("/approve/:operation", http.HandlerFunc(approvalHandler.ServeApprovalPage)))
+	mux.Handle("/debug", logx.Route("/debug", http.HandlerFunc(approvalHandler.ServeDebugPage)))
+	mux.Handle("/approval-ui/", logx.Route("/approval-ui/*", http.HandlerFunc(approvalHandler.ServeAssets)))
+	mux.Handle("/api/operations/", logx.Route("/api/operations/:operation", http.HandlerFunc(approvalHandler.ServeOperationAPI)))
 
 	server := &http.Server{
 		Addr:              cfg.ListenAddr(),
-		Handler:           mux,
+		Handler:           logx.HTTPMiddleware(mux),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,
 		IdleTimeout:       2 * time.Minute,
 	}
 
-	log.Printf("listening on %s", cfg.ListenAddr())
+	logx.Event(context.Background(), "server", "server.listening",
+		"listen_addr", cfg.ListenAddr(),
+		"mcp_url", cfg.MCPURL(),
+	)
 	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		log.Fatalf("server failed: %v", err)
+		logx.Event(context.Background(), "server", "server.serve_failed",
+			"error_kind", logx.ErrorKind(err),
+			"error_message", logx.ErrorPreview(err),
+			"fatal", true,
+		)
+		os.Exit(1)
 	}
 }

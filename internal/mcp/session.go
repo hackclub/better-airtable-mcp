@@ -6,6 +6,8 @@ import (
 	"encoding/hex"
 	"sync"
 	"time"
+
+	"github.com/hackclub/better-airtable-mcp/internal/logx"
 )
 
 const SessionHeader = "Mcp-Session-Id"
@@ -101,7 +103,12 @@ func (m *SessionManager) RunExpiryLoop(ctx context.Context, interval time.Durati
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			m.PruneExpired()
+			removed := m.PruneExpired()
+			if removed > 0 {
+				logx.Event(ctx, "mcp_session_manager", "mcp.session.pruned",
+					"removed_sessions", removed,
+				)
+			}
 		}
 	}
 }

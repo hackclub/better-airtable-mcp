@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/hackclub/better-airtable-mcp/internal/logx"
 	"github.com/hackclub/better-airtable-mcp/internal/mcp"
 	"github.com/jackc/pgx/v5"
 )
@@ -58,7 +59,9 @@ func (t CheckOperationTool) Call(ctx context.Context, raw json.RawMessage) (mcp.
 
 	userID, ok := authenticatedUserID(ctx)
 	if !ok {
-		return mcp.ToolCallResult{}, fmt.Errorf("missing authenticated user")
+		err := fmt.Errorf("missing authenticated user")
+		logToolFailed(ctx, "check_operation", err)
+		return mcp.ToolCallResult{}, err
 	}
 
 	if strings.HasPrefix(input.OperationID, "sync_") && t.runtime != nil && t.runtime.SyncManager != nil {
@@ -70,10 +73,12 @@ func (t CheckOperationTool) Call(ctx context.Context, raw json.RawMessage) (mcp.
 		}
 		accessToken, err := t.runtime.AirtableAccessToken(ctx, userID)
 		if err != nil {
+			logToolFailed(ctx, "check_operation", err, "user_id", userID, "sync_operation_id", input.OperationID)
 			return mcp.ToolCallResult{}, err
 		}
 		bases, err := t.runtime.Syncer.SearchBases(ctx, accessToken, "")
 		if err != nil {
+			logToolFailed(ctx, "check_operation", err, "user_id", userID, "sync_operation_id", input.OperationID)
 			return mcp.ToolCallResult{}, err
 		}
 		allowed := false
@@ -91,6 +96,7 @@ func (t CheckOperationTool) Call(ctx context.Context, raw json.RawMessage) (mcp.
 
 		status, found, err := t.runtime.SyncManager.CheckOperation(ctx, input.OperationID)
 		if err != nil {
+			logToolFailed(ctx, "check_operation", err, "user_id", userID, "sync_operation_id", input.OperationID)
 			return mcp.ToolCallResult{}, err
 		}
 		if found {
@@ -99,6 +105,11 @@ func (t CheckOperationTool) Call(ctx context.Context, raw json.RawMessage) (mcp.
 			if status.CompletedAt != nil {
 				payload["completed_at"] = status.CompletedAt.Format(time.RFC3339)
 			}
+			logToolCompleted(ctx, "check_operation",
+				"user_id", userID,
+				"sync_operation_id", input.OperationID,
+				"status", status.Status,
+			)
 			return textOnlyResult(formatSingleRowCSV([]string{
 				"operation_id", "type", "status", "read_snapshot", "sync_started_at", "completed_at", "last_synced_at", "tables_total", "tables_started", "tables_completed", "pages_fetched", "records_visible", "records_synced_this_run", "error",
 			}, payload), payload), nil
@@ -118,6 +129,7 @@ func (t CheckOperationTool) Call(ctx context.Context, raw json.RawMessage) (mcp.
 					"operation_id": input.OperationID,
 				}), nil
 			}
+			logToolFailed(ctx, "check_operation", err, "user_id", userID, "approval_operation_id_hash", logx.ApprovalOperationIDHash(input.OperationID))
 			return mcp.ToolCallResult{}, err
 		}
 		if record.UserID != userID {
@@ -128,6 +140,7 @@ func (t CheckOperationTool) Call(ctx context.Context, raw json.RawMessage) (mcp.
 
 		operation, err := t.runtime.Approval.GetOperation(ctx, input.OperationID)
 		if err != nil {
+			logToolFailed(ctx, "check_operation", err, "user_id", userID, "approval_operation_id_hash", logx.ApprovalOperationIDHash(input.OperationID))
 			return mcp.ToolCallResult{}, err
 		}
 		payload := map[string]any{
@@ -146,6 +159,11 @@ func (t CheckOperationTool) Call(ctx context.Context, raw json.RawMessage) (mcp.
 		if operation.Error != "" {
 			payload["error"] = operation.Error
 		}
+		logToolCompleted(ctx, "check_operation",
+			"user_id", userID,
+			"approval_operation_id_hash", logx.ApprovalOperationIDHash(input.OperationID),
+			"status", operation.Status,
+		)
 		return textOnlyResult(formatSingleRowCSV([]string{
 			"operation_id", "type", "status", "approval_url", "summary", "assistant_instruction", "result", "error",
 		}, payload), payload), nil

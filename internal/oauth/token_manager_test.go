@@ -1,10 +1,12 @@
 package oauth
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -18,6 +20,7 @@ import (
 
 	"github.com/hackclub/better-airtable-mcp/internal/cryptoutil"
 	"github.com/hackclub/better-airtable-mcp/internal/db"
+	"github.com/hackclub/better-airtable-mcp/internal/logx"
 )
 
 func TestTokenManagerRefreshesExpiringTokenOnDemand(t *testing.T) {
@@ -125,6 +128,45 @@ func TestTokenManagerMarksInvalidGrantAsReauthorizationRequired(t *testing.T) {
 	}
 	if calls.Load() != 1 {
 		t.Fatalf("expected invalid_grant path to avoid repeated refresh attempts, got %d calls", calls.Load())
+	}
+}
+
+func TestTokenManagerLogsReauthorizationWithoutTokenLeakage(t *testing.T) {
+	store, cleanup := openOAuthTestStore(t)
+	defer cleanup()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		writeOAuthJSON(t, w, map[string]any{
+			"error":             "invalid_grant",
+			"error_description": "refresh token revoked",
+		})
+	}))
+	defer server.Close()
+
+	var output bytes.Buffer
+	previous := slog.Default()
+	slog.SetDefault(logx.NewLogger(&output))
+	t.Cleanup(func() {
+		slog.SetDefault(previous)
+	})
+
+	cipher := mustNewCipher(t)
+	putEncryptedToken(t, store, cipher, "user_1", "old-access-token", "old-refresh-token", time.Now().Add(-time.Minute))
+
+	manager := NewTokenManager(store, cipher, NewAirtableOAuthClient("client-id", "client-secret", "https://example.test/callback", server.Client(), "", server.URL))
+	if _, err := manager.AirtableAccessToken(context.Background(), "user_1"); err == nil {
+		t.Fatal("expected AirtableAccessToken() to require reauthorization")
+	}
+
+	logText := output.String()
+	if !strings.Contains(logText, `"event":"oauth.airtable_token.reauth_required_marked"`) {
+		t.Fatalf("expected reauth marker log, got %s", logText)
+	}
+	for _, forbidden := range []string{"old-access-token", "old-refresh-token"} {
+		if strings.Contains(logText, forbidden) {
+			t.Fatalf("expected logs to exclude %q, got %s", forbidden, logText)
+		}
 	}
 }
 

@@ -12,6 +12,7 @@ import (
 
 	"github.com/hackclub/better-airtable-mcp/internal/db"
 	"github.com/hackclub/better-airtable-mcp/internal/duckdb"
+	"github.com/hackclub/better-airtable-mcp/internal/logx"
 )
 
 type TokenSource interface {
@@ -320,6 +321,11 @@ func (m *Manager) activateBase(ctx context.Context, userID, baseRef string) (Bas
 	if m.store != nil {
 		_ = m.store.TouchSyncState(ctx, base.ID, activeUntil.UTC(), userID)
 	}
+	logx.Event(ctx, "sync_manager", "sync.base_activated",
+		"user_id", userID,
+		"base_id", base.ID,
+		"active_until", activeUntil.UTC().Format(time.RFC3339),
+	)
 	return base, worker, nil
 }
 
@@ -341,6 +347,9 @@ func (m *Manager) getOrCreateWorker(base Base) *workerState {
 	}
 	worker.seedFromSnapshot()
 	m.workers[base.ID] = worker
+	logx.Event(context.Background(), "sync_manager", "sync.worker_created",
+		"base_id", base.ID,
+	)
 	go worker.run()
 	return worker
 }
@@ -364,6 +373,10 @@ func (m *Manager) restoreWorker(state db.SyncState) {
 	}
 
 	worker.restoreFromState(state)
+	logx.Event(context.Background(), "sync_manager", "sync.worker_restored",
+		"base_id", state.BaseID,
+		"active_until", timeValue(state.ActiveUntil),
+	)
 }
 
 func (m *Manager) removeWorker(baseID string) {
@@ -460,6 +473,9 @@ func (w *workerState) nextAction(now time.Time) (shouldSync bool, waitFor time.D
 
 func (w *workerState) cleanupExpired() {
 	_ = os.Remove(w.manager.service.basePath(w.baseID))
+	logx.Event(context.Background(), "sync_manager", "sync.worker_expired",
+		"base_id", w.baseID,
+	)
 	w.manager.removeWorker(w.baseID)
 }
 
@@ -504,8 +520,11 @@ func (w *workerState) touch(userID string, activeUntil time.Time) {
 }
 
 func (w *workerState) handleProgress(progress SyncProgress) {
+	var checkpoint string
+	var attrs []any
 	w.mu.Lock()
-	defer w.mu.Unlock()
+	previousTablesStarted := w.tablesStarted
+	previousTablesCompleted := w.tablesCompleted
 
 	w.baseName = progress.BaseName
 	w.readable = true
@@ -531,8 +550,31 @@ func (w *workerState) handleProgress(progress SyncProgress) {
 		if !progress.LastSyncedAt.IsZero() {
 			w.lastResult.LastSyncedAt = progress.LastSyncedAt.UTC()
 		}
+		checkpoint = "sync_completed"
 	} else if progress.Status == "syncing" && !w.readSnapshotComplete {
 		w.needsInitialRefresh = false
+	}
+	if checkpoint == "" && progress.TablesCompleted > previousTablesCompleted {
+		checkpoint = "table_completed"
+	} else if checkpoint == "" && progress.TablesStarted > previousTablesStarted {
+		checkpoint = "table_started"
+	}
+	if checkpoint != "" {
+		attrs = []any{
+			"base_id", progress.BaseID,
+			"checkpoint", checkpoint,
+			"status", progress.Status,
+			"read_snapshot", progress.ReadSnapshot,
+			"tables_total", progress.TablesTotal,
+			"tables_started", progress.TablesStarted,
+			"tables_completed", progress.TablesCompleted,
+			"pages_fetched", progress.PagesFetched,
+			"records_synced_this_run", progress.RecordsSyncedThisRun,
+		}
+	}
+	w.mu.Unlock()
+	if checkpoint != "" {
+		logx.Event(context.Background(), "sync_manager", "sync.progress_checkpoint", attrs...)
 	}
 }
 
@@ -755,13 +797,29 @@ func (w *workerState) snapshotStatus() SyncOperationStatus {
 }
 
 func (m *Manager) syncOnce(ctx context.Context, userID, baseID, baseName string, progress func(SyncProgress)) (SyncResult, error) {
+	logx.Event(ctx, "sync_manager", "sync.run_started",
+		"user_id", userID,
+		"base_id", baseID,
+	)
 	accessToken, err := m.tokens.AirtableAccessToken(ctx, userID)
 	if err != nil {
+		logx.Event(ctx, "sync_manager", "sync.run_failed",
+			"user_id", userID,
+			"base_id", baseID,
+			"error_kind", logx.ErrorKind(err),
+			"error_message", logx.ErrorPreview(err),
+		)
 		return SyncResult{}, err
 	}
 
 	result, err := m.service.runSync(ctx, accessToken, Base{ID: baseID, Name: baseName}, progress)
 	if err != nil {
+		logx.Event(ctx, "sync_manager", "sync.run_failed",
+			"user_id", userID,
+			"base_id", baseID,
+			"error_kind", logx.ErrorKind(err),
+			"error_message", logx.ErrorPreview(err),
+		)
 		return SyncResult{}, err
 	}
 
@@ -783,6 +841,20 @@ func (m *Manager) syncOnce(ctx context.Context, userID, baseID, baseName string,
 			SyncTokenUserID:    &syncTokenUserID,
 		})
 	}
+	logx.Event(ctx, "sync_manager", "sync.run_completed",
+		"user_id", userID,
+		"base_id", result.BaseID,
+		"tables_synced", result.TablesSynced,
+		"records_synced", result.RecordsSynced,
+		"sync_duration_ms", result.SyncDuration.Milliseconds(),
+	)
 
 	return result, nil
+}
+
+func timeValue(value *time.Time) string {
+	if value == nil {
+		return ""
+	}
+	return value.UTC().Format(time.RFC3339)
 }

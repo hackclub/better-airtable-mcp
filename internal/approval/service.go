@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -13,6 +14,7 @@ import (
 	"github.com/hackclub/better-airtable-mcp/internal/cryptoutil"
 	"github.com/hackclub/better-airtable-mcp/internal/db"
 	"github.com/hackclub/better-airtable-mcp/internal/duckdb"
+	"github.com/hackclub/better-airtable-mcp/internal/logx"
 	syncer "github.com/hackclub/better-airtable-mcp/internal/sync"
 )
 
@@ -166,24 +168,51 @@ func (s *Service) PrepareMutation(ctx context.Context, userID string, request Mu
 		return PreparedMutation{}, fmt.Errorf("approval service is not configured")
 	}
 
+	logx.Event(ctx, "approval", "approval.prepare_started",
+		"user_id", userID,
+		"base_ref_hash", logx.HashString(strings.TrimSpace(request.Base)),
+		"operation_count", len(request.Operations),
+	)
+	fail := func(err error) (PreparedMutation, error) {
+		if err != nil {
+			attrs := []any{
+				"user_id", userID,
+				"base_ref_hash", logx.HashString(strings.TrimSpace(request.Base)),
+				"operation_count", len(request.Operations),
+				"error_kind", logx.ErrorKind(err),
+				"error_message", logx.ErrorPreview(err),
+			}
+			var notReady RecordsNotSyncedError
+			if errors.As(err, &notReady) {
+				attrs = append(attrs,
+					"base_id", notReady.BaseID,
+					"table_hash", logx.HashString(notReady.Table),
+					"record_count", len(notReady.RecordIDs),
+				)
+			}
+			logx.Event(ctx, "approval", "approval.prepare_failed", attrs...)
+		}
+		return PreparedMutation{}, err
+	}
+
 	accessToken, err := s.tokens.AirtableAccessToken(ctx, userID)
 	if err != nil {
-		return PreparedMutation{}, err
+		return fail(err)
 	}
 
 	var base syncer.Base
 	if s.syncManager != nil {
 		base, err = s.syncManager.EnsureBaseReadable(ctx, userID, request.Base)
 		if err != nil {
-			return PreparedMutation{}, err
+			return fail(err)
 		}
 	} else {
-		return PreparedMutation{}, fmt.Errorf("sync manager is not configured")
+		return fail(fmt.Errorf("sync manager is not configured"))
 	}
 
 	schema, err := s.syncer.ListSchema(ctx, accessToken, base.ID)
 	if err != nil {
-		return PreparedMutation{}, err
+		return fail(err)
 	}
 	syncStatus, _ := s.syncManager.BaseStatus(base.ID)
 
@@ -200,7 +229,7 @@ func (s *Service) PrepareMutation(ctx context.Context, userID string, request Mu
 	for _, operation := range request.Operations {
 		table, tableNames, ok := resolveTableSchema(schema.Tables, operation.Table)
 		if !ok {
-			return PreparedMutation{}, fmt.Errorf("unknown table %q; available tables: %s", operation.Table, strings.Join(suggestions(operation.Table, tableNames), ", "))
+			return fail(fmt.Errorf("unknown table %q; available tables: %s", operation.Table, strings.Join(suggestions(operation.Table, tableNames), ", ")))
 		}
 
 		fieldNames := collectFieldAliases(table.Fields)
@@ -224,7 +253,7 @@ func (s *Service) PrepareMutation(ctx context.Context, userID string, request Mu
 		if len(recordIDs) > 0 {
 			rows, err := s.syncer.ReadTableRowsByIDs(ctx, base.ID, table.DuckDBTableName, recordIDs)
 			if err != nil {
-				return PreparedMutation{}, err
+				return fail(err)
 			}
 			for _, row := range rows {
 				id, _ := row["id"].(string)
@@ -238,15 +267,15 @@ func (s *Service) PrepareMutation(ctx context.Context, userID string, request Mu
 			}
 			if len(missingRecordIDs) > 0 {
 				if !table.TableComplete {
-					return PreparedMutation{}, RecordsNotSyncedError{
+					return fail(RecordsNotSyncedError{
 						BaseID:    base.ID,
 						BaseName:  base.Name,
 						Table:     table.DuckDBTableName,
 						RecordIDs: missingRecordIDs,
 						Sync:      syncStatus,
-					}
+					})
 				}
-				return PreparedMutation{}, fmt.Errorf("record %q was not found in table %q", missingRecordIDs[0], table.DuckDBTableName)
+				return fail(fmt.Errorf("record %q was not found in table %q", missingRecordIDs[0], table.DuckDBTableName))
 			}
 			if currentValues[table.DuckDBTableName] == nil {
 				currentValues[table.DuckDBTableName] = map[string]map[string]any{}
@@ -267,11 +296,11 @@ func (s *Service) PrepareMutation(ctx context.Context, userID string, request Mu
 			for fieldName, value := range record.Fields {
 				field, ok := resolveFieldSchema(table.Fields, fieldName)
 				if !ok {
-					return PreparedMutation{}, fmt.Errorf("unknown field %q on table %q; available fields: %s", fieldName, table.DuckDBTableName, strings.Join(suggestions(fieldName, fieldNames), ", "))
+					return fail(fmt.Errorf("unknown field %q on table %q; available fields: %s", fieldName, table.DuckDBTableName, strings.Join(suggestions(fieldName, fieldNames), ", ")))
 				}
 				fieldKey := resolvedFieldIdentity(field)
 				if priorName, exists := resolvedFieldKeys[fieldKey]; exists {
-					return PreparedMutation{}, fmt.Errorf("field %q duplicates %q on table %q; use one reference per Airtable field", fieldName, priorName, table.DuckDBTableName)
+					return fail(fmt.Errorf("field %q duplicates %q on table %q; use one reference per Airtable field", fieldName, priorName, table.DuckDBTableName))
 				}
 				resolvedFieldKeys[fieldKey] = fieldName
 				resolvedRecord.AirtableFields[field.OriginalName] = value
@@ -286,16 +315,16 @@ func (s *Service) PrepareMutation(ctx context.Context, userID string, request Mu
 	payload.Summary = summarizeOperations(payload.Operations)
 	payloadCiphertext, err := s.encryptJSON(payload)
 	if err != nil {
-		return PreparedMutation{}, err
+		return fail(err)
 	}
 	currentValuesCiphertext, err := s.encryptJSON(currentValues)
 	if err != nil {
-		return PreparedMutation{}, err
+		return fail(err)
 	}
 
 	operationID, err := newOperationID()
 	if err != nil {
-		return PreparedMutation{}, err
+		return fail(err)
 	}
 	expiresAt := s.now().Add(s.ttl).UTC()
 	createdAt := s.now().UTC()
@@ -311,16 +340,24 @@ func (s *Service) PrepareMutation(ctx context.Context, userID string, request Mu
 		CreatedAt:               createdAt,
 		ExpiresAt:               expiresAt,
 	}); err != nil {
-		return PreparedMutation{}, err
+		return fail(err)
 	}
 
-	return PreparedMutation{
+	prepared := PreparedMutation{
 		OperationID: operationID,
 		Status:      "pending_approval",
 		ApprovalURL: s.approvalURL(operationID),
 		ExpiresAt:   expiresAt,
 		Summary:     payload.Summary,
-	}, nil
+	}
+	logx.Event(ctx, "approval", "approval.prepare_completed",
+		"user_id", userID,
+		"approval_operation_id_hash", logx.ApprovalOperationIDHash(operationID),
+		"base_id", payload.BaseID,
+		"operation_count", len(payload.Operations),
+		"status", prepared.Status,
+	)
+	return prepared, nil
 }
 
 func (s *Service) GetOperation(ctx context.Context, operationID string) (OperationView, error) {
@@ -396,6 +433,13 @@ func (s *Service) GetOperation(ctx context.Context, operationID string) (Operati
 		view.Operations = append(view.Operations, preview)
 	}
 
+	logx.Event(ctx, "approval", "approval.view_loaded",
+		"approval_operation_id_hash", logx.ApprovalOperationIDHash(operationID),
+		"base_id", payload.BaseID,
+		"status", view.Status,
+		"has_result", view.Result != nil,
+		"has_error", view.Error != "",
+	)
 	return view, nil
 }
 
@@ -414,6 +458,10 @@ func (s *Service) Approve(ctx context.Context, operationID string) (OperationVie
 		return s.GetOperation(ctx, operationID)
 	}
 
+	logx.Event(ctx, "approval", "approval.approved",
+		"approval_operation_id_hash", logx.ApprovalOperationIDHash(operationID),
+		"status", operation.Status,
+	)
 	if err := s.store.UpdatePendingOperationStatus(ctx, operation.ID, "executing", nil, nil, nil); err != nil {
 		return OperationView{}, err
 	}
@@ -423,7 +471,7 @@ func (s *Service) Approve(ctx context.Context, operationID string) (OperationVie
 		return OperationView{}, err
 	}
 
-	result, status, errText := s.execute(ctx, operation.UserID, payload)
+	result, status, errText := s.execute(ctx, operation.UserID, operation.ID, payload)
 	resultCiphertext, err := s.encryptJSON(result)
 	if err != nil {
 		return OperationView{}, err
@@ -437,6 +485,24 @@ func (s *Service) Approve(ctx context.Context, operationID string) (OperationVie
 	if err := s.store.UpdatePendingOperationStatus(ctx, operation.ID, status, resultCiphertext, errorPtr, &resolvedAt); err != nil {
 		return OperationView{}, err
 	}
+	attrs := []any{
+		"approval_operation_id_hash", logx.ApprovalOperationIDHash(operation.ID),
+		"base_id", payload.BaseID,
+		"status", status,
+		"completed_batches", result.CompletedBatches,
+		"created_record_count", len(result.CreatedRecordIDs),
+		"updated_record_count", len(result.UpdatedRecordIDs),
+		"deleted_record_count", len(result.DeletedRecordIDs),
+		"failed_batch", valueOrZero(result.FailedBatch),
+		"has_error", errText != "",
+	}
+	if errText != "" {
+		attrs = append(attrs,
+			"error_kind", logx.ErrorKind(errors.New(errText)),
+			"error_message", logx.Truncate(logx.RedactString(errText), logx.MaxErrorPreviewLength),
+		)
+	}
+	logx.Event(ctx, "approval", "approval.execute_completed", attrs...)
 
 	if s.syncManager != nil {
 		_ = s.syncManager.TriggerSync(ctx, operation.UserID, payload.BaseID)
@@ -464,6 +530,9 @@ func (s *Service) Reject(ctx context.Context, operationID string) (OperationView
 	if err := s.store.UpdatePendingOperationStatus(ctx, operationID, "rejected", nil, nil, &resolvedAt); err != nil {
 		return OperationView{}, err
 	}
+	logx.Event(ctx, "approval", "approval.rejected",
+		"approval_operation_id_hash", logx.ApprovalOperationIDHash(operationID),
+	)
 	return s.GetOperation(ctx, operationID)
 }
 
@@ -476,15 +545,39 @@ func (s *Service) RunExpiryLoop(ctx context.Context, interval time.Duration) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			_, _ = s.store.ExpirePendingOperations(ctx, s.now().UTC())
+			expired, err := s.store.ExpirePendingOperations(ctx, s.now().UTC())
+			if err != nil {
+				logx.Event(ctx, "approval", "approval.expiry_loop_failed",
+					"error_kind", logx.ErrorKind(err),
+					"error_message", logx.ErrorPreview(err),
+				)
+				continue
+			}
+			if expired > 0 {
+				logx.Event(ctx, "approval", "approval.expiry_loop",
+					"expired_operations", expired,
+				)
+			}
 		}
 	}
 }
 
-func (s *Service) execute(ctx context.Context, userID string, payload pendingPayload) (ExecutionResult, string, string) {
+func (s *Service) execute(ctx context.Context, userID, operationID string, payload pendingPayload) (ExecutionResult, string, string) {
 	result := ExecutionResult{}
+	logx.Event(ctx, "approval", "approval.execute_started",
+		"approval_operation_id_hash", logx.ApprovalOperationIDHash(operationID),
+		"user_id", userID,
+		"base_id", payload.BaseID,
+		"operation_count", len(payload.Operations),
+	)
 	accessToken, err := s.tokens.AirtableAccessToken(ctx, userID)
 	if err != nil {
+		logx.Event(ctx, "approval", "approval.execute_failed",
+			"approval_operation_id_hash", logx.ApprovalOperationIDHash(operationID),
+			"base_id", payload.BaseID,
+			"error_kind", logx.ErrorKind(err),
+			"error_message", logx.ErrorPreview(err),
+		)
 		return result, "failed", err.Error()
 	}
 
@@ -506,6 +599,17 @@ func (s *Service) execute(ctx context.Context, userID string, payload pendingPay
 				}
 				created, err := s.writer.CreateRecords(ctx, accessToken, payload.BaseID, operation.AirtableTableID, records)
 				if err != nil {
+					logx.Event(ctx, "approval", "approval.execute_batch",
+						"approval_operation_id_hash", logx.ApprovalOperationIDHash(operationID),
+						"base_id", payload.BaseID,
+						"table_id", operation.AirtableTableID,
+						"mutation_type", operation.Type,
+						"batch_index", globalBatch,
+						"batch_size", len(batch),
+						"outcome", "failed",
+						"error_kind", logx.ErrorKind(err),
+						"error_message", logx.ErrorPreview(err),
+					)
 					result.FailedBatch = intPtr(globalBatch)
 					if result.CompletedBatches == 0 {
 						return result, "failed", err.Error()
@@ -522,6 +626,17 @@ func (s *Service) execute(ctx context.Context, userID string, payload pendingPay
 				}
 				updated, err := s.writer.UpdateRecords(ctx, accessToken, payload.BaseID, operation.AirtableTableID, records)
 				if err != nil {
+					logx.Event(ctx, "approval", "approval.execute_batch",
+						"approval_operation_id_hash", logx.ApprovalOperationIDHash(operationID),
+						"base_id", payload.BaseID,
+						"table_id", operation.AirtableTableID,
+						"mutation_type", operation.Type,
+						"batch_index", globalBatch,
+						"batch_size", len(batch),
+						"outcome", "failed",
+						"error_kind", logx.ErrorKind(err),
+						"error_message", logx.ErrorPreview(err),
+					)
 					result.FailedBatch = intPtr(globalBatch)
 					if result.CompletedBatches == 0 {
 						return result, "failed", err.Error()
@@ -538,6 +653,17 @@ func (s *Service) execute(ctx context.Context, userID string, payload pendingPay
 				}
 				deleted, err := s.writer.DeleteRecords(ctx, accessToken, payload.BaseID, operation.AirtableTableID, recordIDs)
 				if err != nil {
+					logx.Event(ctx, "approval", "approval.execute_batch",
+						"approval_operation_id_hash", logx.ApprovalOperationIDHash(operationID),
+						"base_id", payload.BaseID,
+						"table_id", operation.AirtableTableID,
+						"mutation_type", operation.Type,
+						"batch_index", globalBatch,
+						"batch_size", len(batch),
+						"outcome", "failed",
+						"error_kind", logx.ErrorKind(err),
+						"error_message", logx.ErrorPreview(err),
+					)
 					result.FailedBatch = intPtr(globalBatch)
 					if result.CompletedBatches == 0 {
 						return result, "failed", err.Error()
@@ -550,6 +676,16 @@ func (s *Service) execute(ctx context.Context, userID string, payload pendingPay
 			}
 
 			result.CompletedBatches++
+			logx.Event(ctx, "approval", "approval.execute_batch",
+				"approval_operation_id_hash", logx.ApprovalOperationIDHash(operationID),
+				"base_id", payload.BaseID,
+				"table_id", operation.AirtableTableID,
+				"mutation_type", operation.Type,
+				"batch_index", globalBatch,
+				"batch_size", len(batch),
+				"completed_batches", result.CompletedBatches,
+				"outcome", "completed",
+			)
 		}
 	}
 
@@ -562,7 +698,13 @@ func (s *Service) approvalURL(operationID string) string {
 
 func (s *Service) expireOperation(ctx context.Context, operationID string) error {
 	resolvedAt := s.now().UTC()
-	return s.store.UpdatePendingOperationStatus(ctx, operationID, "expired", nil, nil, &resolvedAt)
+	if err := s.store.UpdatePendingOperationStatus(ctx, operationID, "expired", nil, nil, &resolvedAt); err != nil {
+		return err
+	}
+	logx.Event(ctx, "approval", "approval.expired",
+		"approval_operation_id_hash", logx.ApprovalOperationIDHash(operationID),
+	)
+	return nil
 }
 
 func (s *Service) encryptJSON(value any) ([]byte, error) {
@@ -801,6 +943,13 @@ func newOperationID() (string, error) {
 		return "", fmt.Errorf("generate operation id: %w", err)
 	}
 	return "op_" + hex.EncodeToString(random), nil
+}
+
+func valueOrZero(value *int) int {
+	if value == nil {
+		return 0
+	}
+	return *value
 }
 
 func intPtr(value int) *int {

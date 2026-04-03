@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/hackclub/better-airtable-mcp/internal/duckdb"
+	"github.com/hackclub/better-airtable-mcp/internal/logx"
 )
 
 type Service struct {
@@ -271,10 +272,24 @@ func (s *Service) runSync(ctx context.Context, accessToken string, base Base, pr
 	activePath := s.basePath(base.ID)
 	useStaging := s.shouldUseStaging(base.ID)
 	targetPath := activePath
+	logx.Event(ctx, "sync_service", "sync.run_mode_selected",
+		"base_id", base.ID,
+		"staging_snapshot", useStaging,
+		"table_count", len(plans),
+	)
+	fail := func(err error) (SyncResult, error) {
+		logx.Event(ctx, "sync_service", "sync.run_storage_failed",
+			"base_id", base.ID,
+			"staging_snapshot", useStaging,
+			"error_kind", logx.ErrorKind(err),
+			"error_message", logx.ErrorPreview(err),
+		)
+		return SyncResult{}, err
+	}
 	if useStaging {
 		targetPath = s.stagingPath(base.ID)
 		if err := os.Remove(targetPath); err != nil && !os.IsNotExist(err) {
-			return SyncResult{}, fmt.Errorf("remove stale staging db: %w", err)
+			return fail(fmt.Errorf("remove stale staging db: %w", err))
 		}
 	}
 
@@ -298,12 +313,12 @@ func (s *Service) runSync(ctx context.Context, accessToken string, base Base, pr
 		unlockDuck = s.lockDuckWrite(base.ID)
 		if err := duckdb.InitializeSnapshot(ctx, targetPath, init); err != nil {
 			unlockDuck()
-			return SyncResult{}, err
+			return fail(err)
 		}
 		unlockDuck()
 	} else {
 		if err := duckdb.InitializeSnapshot(ctx, targetPath, init); err != nil {
-			return SyncResult{}, err
+			return fail(err)
 		}
 	}
 
@@ -395,7 +410,7 @@ func (s *Service) runSync(ctx context.Context, accessToken string, base Base, pr
 				} else {
 					_ = os.Remove(targetPath)
 				}
-				return SyncResult{}, result.Err
+				return fail(result.Err)
 			}
 
 			runtime := &runtimes[result.TableIndex]
@@ -452,7 +467,7 @@ func (s *Service) runSync(ctx context.Context, accessToken string, base Base, pr
 				} else {
 					_ = os.Remove(targetPath)
 				}
-				return SyncResult{}, err
+				return fail(err)
 			}
 
 			if progress != nil {
@@ -487,19 +502,19 @@ func (s *Service) runSync(ctx context.Context, accessToken string, base Base, pr
 		err = duckdb.FinalizeSnapshot(ctx, targetPath, finalInfo)
 		unlockDuck()
 		if err != nil {
-			return SyncResult{}, err
+			return fail(err)
 		}
 	} else {
 		if err := duckdb.FinalizeSnapshot(ctx, targetPath, finalInfo); err != nil {
 			_ = os.Remove(targetPath)
-			return SyncResult{}, err
+			return fail(err)
 		}
 		unlockDuck = s.lockDuckWrite(base.ID)
 		err = swapDatabaseFiles(targetPath, activePath)
 		unlockDuck()
 		if err != nil {
 			_ = os.Remove(targetPath)
-			return SyncResult{}, err
+			return fail(err)
 		}
 	}
 
@@ -512,14 +527,22 @@ func (s *Service) runSync(ctx context.Context, accessToken string, base Base, pr
 		progress(currentInfo)
 	}
 
-	return SyncResult{
+	result := SyncResult{
 		BaseID:        base.ID,
 		BaseName:      base.Name,
 		LastSyncedAt:  completedAt,
 		TablesSynced:  len(plans),
 		RecordsSynced: int(currentInfo.RecordsSyncedThisRun),
 		SyncDuration:  completedAt.Sub(startedAt),
-	}, nil
+	}
+	logx.Event(ctx, "sync_service", "sync.run_storage_completed",
+		"base_id", base.ID,
+		"staging_snapshot", useStaging,
+		"tables_synced", result.TablesSynced,
+		"records_synced", result.RecordsSynced,
+		"sync_duration_ms", result.SyncDuration.Milliseconds(),
+	)
+	return result, nil
 }
 
 func buildSyncPlans(tables []Table) ([]syncTablePlan, error) {

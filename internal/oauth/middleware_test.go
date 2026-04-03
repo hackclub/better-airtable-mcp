@@ -1,17 +1,21 @@
 package oauth
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	embeddedpostgres "github.com/fergusstrange/embedded-postgres"
 
 	"github.com/hackclub/better-airtable-mcp/internal/db"
+	"github.com/hackclub/better-airtable-mcp/internal/logx"
 )
 
 func TestMiddlewareRateLimitsByBearerToken(t *testing.T) {
@@ -65,6 +69,64 @@ func TestMiddlewareRateLimitsByBearerToken(t *testing.T) {
 	}
 	if retryAfter := secondRecorder.Header().Get("Retry-After"); retryAfter != "1" {
 		t.Fatalf("expected Retry-After=1, got %q", retryAfter)
+	}
+}
+
+func TestMiddlewareLogsRateLimitWithoutTokenLeakage(t *testing.T) {
+	store, cleanup := openMiddlewareTestStore(t)
+	defer cleanup()
+
+	if err := store.UpsertUser(context.Background(), db.User{ID: "user_1"}); err != nil {
+		t.Fatalf("UpsertUser() returned error: %v", err)
+	}
+
+	bearerToken := "mcp-super-secret-token"
+	if err := store.PutMCPToken(context.Background(), db.MCPTokenRecord{
+		TokenHash:  HashToken(bearerToken),
+		UserID:     "user_1",
+		ClientID:   ptr("client_123"),
+		ClientName: ptr("Claude"),
+		CreatedAt:  time.Now().UTC(),
+		ExpiresAt:  time.Now().Add(time.Hour).UTC(),
+	}); err != nil {
+		t.Fatalf("PutMCPToken() returned error: %v", err)
+	}
+
+	var output bytes.Buffer
+	previous := slog.Default()
+	slog.SetDefault(logx.NewLogger(&output))
+	t.Cleanup(func() {
+		slog.SetDefault(previous)
+	})
+
+	middleware := NewMiddlewareWithRateLimit(store, 1, 1)
+	handler := logx.HTTPMiddleware(logx.Route("/mcp", middleware.RequireBearer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))))
+
+	first := httptest.NewRequest(http.MethodPost, "/mcp", nil)
+	first.Header.Set("Authorization", "Bearer "+bearerToken)
+	firstRecorder := httptest.NewRecorder()
+	handler.ServeHTTP(firstRecorder, first)
+
+	second := httptest.NewRequest(http.MethodPost, "/mcp", nil)
+	second.Header.Set("Authorization", "Bearer "+bearerToken)
+	secondRecorder := httptest.NewRecorder()
+	handler.ServeHTTP(secondRecorder, second)
+
+	if secondRecorder.Code != http.StatusTooManyRequests {
+		t.Fatalf("expected second request to be rate limited, got %d", secondRecorder.Code)
+	}
+
+	logText := output.String()
+	if !strings.Contains(logText, `"event":"oauth.rate_limited"`) {
+		t.Fatalf("expected oauth.rate_limited log, got %s", logText)
+	}
+	if !strings.Contains(logText, HashToken(bearerToken)) {
+		t.Fatalf("expected token hash in log output, got %s", logText)
+	}
+	if strings.Contains(logText, bearerToken) {
+		t.Fatalf("expected raw bearer token to stay out of logs, got %s", logText)
 	}
 }
 

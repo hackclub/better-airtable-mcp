@@ -55,16 +55,20 @@ func (t ListBasesTool) Call(ctx context.Context, raw json.RawMessage) (mcp.ToolC
 
 	userID, ok := authenticatedUserID(ctx)
 	if !ok {
-		return mcp.ToolCallResult{}, fmt.Errorf("missing authenticated user")
+		err := fmt.Errorf("missing authenticated user")
+		logToolFailed(ctx, "list_bases", err)
+		return mcp.ToolCallResult{}, err
 	}
 
 	accessToken, err := t.runtime.AirtableAccessToken(ctx, userID)
 	if err != nil {
+		logToolFailed(ctx, "list_bases", err, "user_id", userID)
 		return mcp.ToolCallResult{}, err
 	}
 
 	bases, err := t.runtime.Syncer.SearchBases(ctx, accessToken, input.Query)
 	if err != nil {
+		logToolFailed(ctx, "list_bases", err, "user_id", userID)
 		return mcp.ToolCallResult{}, err
 	}
 
@@ -88,5 +92,9 @@ func (t ListBasesTool) Call(ctx context.Context, raw json.RawMessage) (mcp.ToolC
 	payload := map[string]any{
 		"bases": items,
 	}
+	logToolCompleted(ctx, "list_bases",
+		"user_id", userID,
+		"base_count", len(items),
+	)
 	return textOnlyResult(formatListBasesCSV(items), payload), nil
 }

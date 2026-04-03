@@ -59,17 +59,21 @@ func (t SyncTool) Call(ctx context.Context, raw json.RawMessage) (mcp.ToolCallRe
 
 	userID, ok := authenticatedUserID(ctx)
 	if !ok {
-		return mcp.ToolCallResult{}, fmt.Errorf("missing authenticated user")
+		err := fmt.Errorf("missing authenticated user")
+		logToolFailed(ctx, "sync", err)
+		return mcp.ToolCallResult{}, err
 	}
 
 	if t.runtime.SyncManager == nil {
 		accessToken, err := t.runtime.AirtableAccessToken(ctx, userID)
 		if err != nil {
+			logToolFailed(ctx, "sync", err, "user_id", userID)
 			return mcp.ToolCallResult{}, err
 		}
 
 		result, err := t.runtime.Syncer.SyncBase(ctx, accessToken, input.Base)
 		if err != nil {
+			logToolFailed(ctx, "sync", err, "user_id", userID, "base_id", result.BaseID)
 			return mcp.ToolCallResult{}, err
 		}
 
@@ -81,6 +85,12 @@ func (t SyncTool) Call(ctx context.Context, raw json.RawMessage) (mcp.ToolCallRe
 			"tables_synced":     result.TablesSynced,
 			"records_synced":    result.RecordsSynced,
 		}
+		logToolCompleted(ctx, "sync",
+			"user_id", userID,
+			"base_id", result.BaseID,
+			"status", "completed",
+			"records_synced", result.RecordsSynced,
+		)
 		return textOnlyResult(formatSingleRowCSV([]string{
 			"operation_id", "status", "estimated_seconds", "last_synced_at", "tables_synced", "records_synced",
 		}, payload), payload), nil
@@ -88,6 +98,7 @@ func (t SyncTool) Call(ctx context.Context, raw json.RawMessage) (mcp.ToolCallRe
 
 	status, err := t.runtime.SyncManager.RequestSync(ctx, userID, input.Base)
 	if err != nil {
+		logToolFailed(ctx, "sync", err, "user_id", userID)
 		return mcp.ToolCallResult{}, err
 	}
 
@@ -96,6 +107,12 @@ func (t SyncTool) Call(ctx context.Context, raw json.RawMessage) (mcp.ToolCallRe
 	if status.LastSyncedAt != nil {
 		payload["last_synced_at"] = status.LastSyncedAt.Format(time.RFC3339)
 	}
+	logToolCompleted(ctx, "sync",
+		"user_id", userID,
+		"base_id", status.BaseID,
+		"status", status.Status,
+		"read_snapshot", status.ReadSnapshot,
+	)
 
 	return textOnlyResult(formatSingleRowCSV([]string{
 		"operation_id", "status", "read_snapshot", "sync_started_at", "estimated_seconds", "last_synced_at", "tables_total", "tables_started", "tables_completed", "pages_fetched", "records_visible", "records_synced_this_run", "error",

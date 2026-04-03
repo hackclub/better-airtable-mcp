@@ -9,6 +9,7 @@ import (
 
 	"github.com/hackclub/better-airtable-mcp/internal/cryptoutil"
 	"github.com/hackclub/better-airtable-mcp/internal/db"
+	"github.com/hackclub/better-airtable-mcp/internal/logx"
 )
 
 const defaultRefreshBefore = 10 * time.Minute
@@ -75,8 +76,13 @@ func (m *TokenManager) RunRefreshLoop(ctx context.Context, interval time.Duratio
 			return
 		case <-ticker.C:
 			if err := m.refreshExpiringTokens(ctx); err != nil {
+				logx.Event(ctx, "oauth_token_manager", "oauth.airtable_token.refresh_loop_failed",
+					"error_kind", logx.ErrorKind(err),
+					"error_message", logx.ErrorPreview(err),
+				)
 				continue
 			}
+			logx.Event(ctx, "oauth_token_manager", "oauth.airtable_token.refresh_loop_completed")
 		}
 	}
 }
@@ -96,6 +102,9 @@ func (m *TokenManager) refreshAndGetAccess(ctx context.Context, userID string) (
 	m.mu.Lock()
 	if call, ok := m.inFlight[userID]; ok {
 		m.mu.Unlock()
+		logx.Event(ctx, "oauth_token_manager", "oauth.airtable_token.refresh_dedup_wait",
+			"user_id", userID,
+		)
 		select {
 		case <-ctx.Done():
 			return "", ctx.Err()
@@ -119,11 +128,24 @@ func (m *TokenManager) refreshAndGetAccess(ctx context.Context, userID string) (
 }
 
 func (m *TokenManager) refreshNow(ctx context.Context, userID string) (string, error) {
+	logx.Event(ctx, "oauth_token_manager", "oauth.airtable_token.refresh_started",
+		"user_id", userID,
+	)
 	record, err := m.store.GetAirtableToken(ctx, userID)
 	if err != nil {
+		logx.Event(ctx, "oauth_token_manager", "oauth.airtable_token.refresh_failed",
+			"user_id", userID,
+			"error_kind", logx.ErrorKind(err),
+			"error_message", logx.ErrorPreview(err),
+		)
 		return "", err
 	}
 	if record.ReauthRequiredAt != nil {
+		logx.Event(ctx, "oauth_token_manager", "oauth.airtable_token.refresh_failed",
+			"user_id", userID,
+			"error_kind", "auth",
+			"error_message", ReauthorizationRequiredError{}.Error(),
+		)
 		return "", ReauthorizationRequiredError{}
 	}
 	if m.now().Add(m.refreshBefore).Before(record.ExpiresAt) {
@@ -132,6 +154,11 @@ func (m *TokenManager) refreshNow(ctx context.Context, userID string) (string, e
 
 	refreshPlaintext, err := m.cipher.Decrypt(record.RefreshTokenCiphertext)
 	if err != nil {
+		logx.Event(ctx, "oauth_token_manager", "oauth.airtable_token.refresh_failed",
+			"user_id", userID,
+			"error_kind", logx.ErrorKind(err),
+			"error_message", logx.ErrorPreview(err),
+		)
 		return "", fmt.Errorf("decrypt airtable refresh token: %w", err)
 	}
 
@@ -140,14 +167,32 @@ func (m *TokenManager) refreshNow(ctx context.Context, userID string) (string, e
 		if IsOAuthError(err, "invalid_grant") {
 			requiredAt := m.now().UTC()
 			if markErr := m.store.MarkAirtableTokenReauthRequired(ctx, userID, requiredAt); markErr != nil {
+				logx.Event(ctx, "oauth_token_manager", "oauth.airtable_token.refresh_failed",
+					"user_id", userID,
+					"error_kind", logx.ErrorKind(markErr),
+					"error_message", logx.ErrorPreview(markErr),
+				)
 				return "", markErr
 			}
+			logx.Event(ctx, "oauth_token_manager", "oauth.airtable_token.reauth_required_marked",
+				"user_id", userID,
+			)
 			return "", ReauthorizationRequiredError{}
 		}
+		logx.Event(ctx, "oauth_token_manager", "oauth.airtable_token.refresh_failed",
+			"user_id", userID,
+			"error_kind", logx.ErrorKind(err),
+			"error_message", logx.ErrorPreview(err),
+		)
 		return "", err
 	}
 
 	if strings.TrimSpace(refreshed.AccessToken) == "" {
+		logx.Event(ctx, "oauth_token_manager", "oauth.airtable_token.refresh_failed",
+			"user_id", userID,
+			"error_kind", "external_api",
+			"error_message", "airtable refresh response did not include an access token",
+		)
 		return "", fmt.Errorf("airtable refresh response did not include an access token")
 	}
 
@@ -158,10 +203,20 @@ func (m *TokenManager) refreshNow(ctx context.Context, userID string) (string, e
 
 	accessCiphertext, err := m.cipher.Encrypt([]byte(refreshed.AccessToken))
 	if err != nil {
+		logx.Event(ctx, "oauth_token_manager", "oauth.airtable_token.refresh_failed",
+			"user_id", userID,
+			"error_kind", logx.ErrorKind(err),
+			"error_message", logx.ErrorPreview(err),
+		)
 		return "", fmt.Errorf("encrypt refreshed airtable access token: %w", err)
 	}
 	refreshCiphertext, err := m.cipher.Encrypt([]byte(newRefreshToken))
 	if err != nil {
+		logx.Event(ctx, "oauth_token_manager", "oauth.airtable_token.refresh_failed",
+			"user_id", userID,
+			"error_kind", logx.ErrorKind(err),
+			"error_message", logx.ErrorPreview(err),
+		)
 		return "", fmt.Errorf("encrypt refreshed airtable refresh token: %w", err)
 	}
 
@@ -181,8 +236,17 @@ func (m *TokenManager) refreshNow(ctx context.Context, userID string) (string, e
 		ExpiresAt:              m.now().Add(time.Duration(expiresIn) * time.Second).UTC(),
 		Scopes:                 scopes,
 	}); err != nil {
+		logx.Event(ctx, "oauth_token_manager", "oauth.airtable_token.refresh_failed",
+			"user_id", userID,
+			"error_kind", logx.ErrorKind(err),
+			"error_message", logx.ErrorPreview(err),
+		)
 		return "", err
 	}
+	logx.Event(ctx, "oauth_token_manager", "oauth.airtable_token.refresh_succeeded",
+		"user_id", userID,
+		"expires_in_seconds", expiresIn,
+	)
 
 	return refreshed.AccessToken, nil
 }

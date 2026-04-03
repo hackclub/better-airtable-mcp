@@ -58,7 +58,9 @@ func (t ListSchemaTool) Call(ctx context.Context, raw json.RawMessage) (mcp.Tool
 
 	userID, ok := authenticatedUserID(ctx)
 	if !ok {
-		return mcp.ToolCallResult{}, fmt.Errorf("missing authenticated user")
+		err := fmt.Errorf("missing authenticated user")
+		logToolFailed(ctx, "list_schema", err)
+		return mcp.ToolCallResult{}, err
 	}
 
 	var baseID string
@@ -67,6 +69,7 @@ func (t ListSchemaTool) Call(ctx context.Context, raw json.RawMessage) (mcp.Tool
 	if t.runtime.SyncManager != nil {
 		base, err := t.runtime.SyncManager.EnsureBaseSchemaSampled(ctx, userID, input.Base)
 		if err != nil {
+			logToolFailed(ctx, "list_schema", err, "user_id", userID)
 			return mcp.ToolCallResult{}, err
 		}
 		baseID = base.ID
@@ -82,11 +85,13 @@ func (t ListSchemaTool) Call(ctx context.Context, raw json.RawMessage) (mcp.Tool
 
 	accessToken, err := t.runtime.AirtableAccessToken(ctx, userID)
 	if err != nil {
+		logToolFailed(ctx, "list_schema", err, "user_id", userID, "base_id", baseID)
 		return mcp.ToolCallResult{}, err
 	}
 
 	schema, err := t.runtime.Syncer.ListSchema(ctx, accessToken, baseID)
 	if err != nil {
+		logToolFailed(ctx, "list_schema", err, "user_id", userID, "base_id", baseID)
 		return mcp.ToolCallResult{}, err
 	}
 
@@ -128,6 +133,11 @@ func (t ListSchemaTool) Call(ctx context.Context, raw json.RawMessage) (mcp.Tool
 	if syncPayload != nil {
 		payload["sync"] = syncPayload
 	}
+	logToolCompleted(ctx, "list_schema",
+		"user_id", userID,
+		"base_id", schema.BaseID,
+		"table_count", len(schema.Tables),
+	)
 	return textOnlyResult(
 		formatSchemaCSV(schema.BaseID, schema.BaseName, tables, syncStatus),
 		payload,

@@ -17,6 +17,7 @@ import (
 	"github.com/hackclub/better-airtable-mcp/internal/cryptoutil"
 	"github.com/hackclub/better-airtable-mcp/internal/db"
 	"github.com/hackclub/better-airtable-mcp/internal/httpx"
+	"github.com/hackclub/better-airtable-mcp/internal/logx"
 )
 
 type Handler struct {
@@ -131,16 +132,29 @@ func (h *Handler) Register(w http.ResponseWriter, r *http.Request) {
 
 	var request registerRequest
 	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+		logx.Event(r.Context(), "oauth_handler", "oauth.client_registration_failed",
+			"error_kind", "validation",
+			"error_message", "invalid JSON payload",
+		)
 		httpx.WriteError(w, http.StatusBadRequest, "invalid JSON payload")
 		return
 	}
 	if len(request.RedirectURIs) == 0 {
+		logx.Event(r.Context(), "oauth_handler", "oauth.client_registration_failed",
+			"error_kind", "validation",
+			"error_message", "redirect_uris must contain at least one URI",
+		)
 		httpx.WriteError(w, http.StatusBadRequest, "redirect_uris must contain at least one URI")
 		return
 	}
 
 	for _, redirectURI := range request.RedirectURIs {
 		if _, err := url.ParseRequestURI(redirectURI); err != nil {
+			logx.Event(r.Context(), "oauth_handler", "oauth.client_registration_failed",
+				"redirect_uri", logx.SanitizeRedirectURI(redirectURI),
+				"error_kind", "validation",
+				"error_message", "redirect_uris must contain valid absolute URIs",
+			)
 			httpx.WriteError(w, http.StatusBadRequest, "redirect_uris must contain valid absolute URIs")
 			return
 		}
@@ -148,6 +162,10 @@ func (h *Handler) Register(w http.ResponseWriter, r *http.Request) {
 
 	clientID, err := generateOpaqueToken(24)
 	if err != nil {
+		logx.Event(r.Context(), "oauth_handler", "oauth.client_registration_failed",
+			"error_kind", logx.ErrorKind(err),
+			"error_message", logx.ErrorPreview(err),
+		)
 		httpx.WriteError(w, http.StatusInternalServerError, "failed to generate client_id")
 		return
 	}
@@ -162,9 +180,18 @@ func (h *Handler) Register(w http.ResponseWriter, r *http.Request) {
 		RedirectURIs: request.RedirectURIs,
 		ClientName:   clientName,
 	}); err != nil {
+		logx.Event(r.Context(), "oauth_handler", "oauth.client_registration_failed",
+			"client_id", clientID,
+			"error_kind", logx.ErrorKind(err),
+			"error_message", logx.ErrorPreview(err),
+		)
 		httpx.WriteError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	logx.Event(r.Context(), "oauth_handler", "oauth.client_registered",
+		"client_id", clientID,
+		"redirect_uri_count", len(request.RedirectURIs),
+	)
 
 	httpx.WriteJSON(w, http.StatusCreated, map[string]any{
 		"client_id":                  clientID,
@@ -194,29 +221,61 @@ func (h *Handler) Authorize(w http.ResponseWriter, r *http.Request) {
 	state := query.Get("state")
 	codeChallenge := query.Get("code_challenge")
 	codeChallengeMethod := query.Get("code_challenge_method")
+	logx.Event(r.Context(), "oauth_handler", "oauth.authorize_requested",
+		"client_id", clientID,
+		"redirect_uri", logx.SanitizeRedirectURI(redirectURI),
+	)
 
 	if clientID == "" || redirectURI == "" || state == "" || codeChallenge == "" || codeChallengeMethod != "S256" {
+		logx.Event(r.Context(), "oauth_handler", "oauth.authorize_rejected",
+			"client_id", clientID,
+			"redirect_uri", logx.SanitizeRedirectURI(redirectURI),
+			"error_kind", "validation",
+			"error_message", "client_id, redirect_uri, state, code_challenge, and code_challenge_method=S256 are required",
+		)
 		httpx.WriteError(w, http.StatusBadRequest, "client_id, redirect_uri, state, code_challenge, and code_challenge_method=S256 are required")
 		return
 	}
 
 	client, err := h.store.GetOAuthClient(r.Context(), clientID)
 	if err != nil {
+		logx.Event(r.Context(), "oauth_handler", "oauth.authorize_rejected",
+			"client_id", clientID,
+			"redirect_uri", logx.SanitizeRedirectURI(redirectURI),
+			"error_kind", "auth",
+			"error_message", "unknown client_id",
+		)
 		httpx.WriteError(w, http.StatusBadRequest, "unknown client_id")
 		return
 	}
 	if !contains(client.RedirectURIs, redirectURI) {
+		logx.Event(r.Context(), "oauth_handler", "oauth.authorize_rejected",
+			"client_id", clientID,
+			"redirect_uri", logx.SanitizeRedirectURI(redirectURI),
+			"error_kind", "auth",
+			"error_message", "redirect_uri is not registered for this client",
+		)
 		httpx.WriteError(w, http.StatusBadRequest, "redirect_uri is not registered for this client")
 		return
 	}
 
 	airtableVerifier, err := generatePKCEVerifier()
 	if err != nil {
+		logx.Event(r.Context(), "oauth_handler", "oauth.authorize_rejected",
+			"client_id", clientID,
+			"error_kind", logx.ErrorKind(err),
+			"error_message", logx.ErrorPreview(err),
+		)
 		httpx.WriteError(w, http.StatusInternalServerError, "failed to create PKCE verifier")
 		return
 	}
 	requestID, err := generateOpaqueToken(24)
 	if err != nil {
+		logx.Event(r.Context(), "oauth_handler", "oauth.authorize_rejected",
+			"client_id", clientID,
+			"error_kind", logx.ErrorKind(err),
+			"error_message", logx.ErrorPreview(err),
+		)
 		httpx.WriteError(w, http.StatusInternalServerError, "failed to create authorization request")
 		return
 	}
@@ -234,6 +293,10 @@ func (h *Handler) Authorize(w http.ResponseWriter, r *http.Request) {
 	}
 	h.mu.Unlock()
 
+	logx.Event(r.Context(), "oauth_handler", "oauth.authorize_redirect_issued",
+		"client_id", clientID,
+		"redirect_uri", logx.SanitizeRedirectURI(redirectURI),
+	)
 	http.Redirect(w, r, h.airtable.AuthorizeURL(requestID, S256Challenge(airtableVerifier)), http.StatusFound)
 }
 
@@ -253,6 +316,11 @@ func (h *Handler) Token(w http.ResponseWriter, r *http.Request) {
 	case "refresh_token":
 		h.handleRefreshTokenGrant(w, r)
 	default:
+		logx.Event(r.Context(), "oauth_handler", "oauth.token_exchange_failed",
+			"grant_type", r.PostForm.Get("grant_type"),
+			"error_kind", "validation",
+			"error_message", "grant_type must be authorization_code or refresh_token",
+		)
 		httpx.WriteJSON(w, http.StatusBadRequest, map[string]string{
 			"error":             "unsupported_grant_type",
 			"error_description": "grant_type must be authorization_code or refresh_token",
@@ -268,31 +336,56 @@ func (h *Handler) AirtableCallback(w http.ResponseWriter, r *http.Request) {
 
 	requestID := r.URL.Query().Get("state")
 	code := r.URL.Query().Get("code")
+	logx.Event(r.Context(), "oauth_handler", "oauth.airtable_callback_received")
 	if requestID == "" || code == "" {
+		logx.Event(r.Context(), "oauth_handler", "oauth.airtable_callback_failed",
+			"error_kind", "validation",
+			"error_message", "state and code are required",
+		)
 		httpx.WriteError(w, http.StatusBadRequest, "state and code are required")
 		return
 	}
 
 	request, ok := h.consumeAuthorizationRequest(requestID)
 	if !ok {
+		logx.Event(r.Context(), "oauth_handler", "oauth.airtable_callback_failed",
+			"error_kind", "auth",
+			"error_message", "authorization request is missing or expired",
+		)
 		httpx.WriteError(w, http.StatusBadRequest, "authorization request is missing or expired")
 		return
 	}
 
 	airtableToken, err := h.airtable.Exchange(r.Context(), code, request.AirtableVerifier)
 	if err != nil {
+		logx.Event(r.Context(), "oauth_handler", "oauth.airtable_exchange_failed",
+			"client_id", request.ClientID,
+			"error_kind", logx.ErrorKind(err),
+			"error_message", logx.ErrorPreview(err),
+		)
 		httpx.WriteError(w, http.StatusBadGateway, err.Error())
 		return
 	}
 
 	userID, err := h.createUserSession(r.Context(), airtableToken)
 	if err != nil {
+		logx.Event(r.Context(), "oauth_handler", "oauth.user_session_create_failed",
+			"client_id", request.ClientID,
+			"error_kind", logx.ErrorKind(err),
+			"error_message", logx.ErrorPreview(err),
+		)
 		httpx.WriteError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 
 	authCode, err := generateOpaqueToken(32)
 	if err != nil {
+		logx.Event(r.Context(), "oauth_handler", "oauth.airtable_callback_failed",
+			"client_id", request.ClientID,
+			"user_id", userID,
+			"error_kind", logx.ErrorKind(err),
+			"error_message", logx.ErrorPreview(err),
+		)
 		httpx.WriteError(w, http.StatusInternalServerError, "failed to issue authorization code")
 		return
 	}
@@ -313,10 +406,22 @@ func (h *Handler) AirtableCallback(w http.ResponseWriter, r *http.Request) {
 		"state": request.OriginalState,
 	})
 	if err != nil {
+		logx.Event(r.Context(), "oauth_handler", "oauth.airtable_callback_failed",
+			"client_id", request.ClientID,
+			"user_id", userID,
+			"redirect_uri", logx.SanitizeRedirectURI(request.RedirectURI),
+			"error_kind", logx.ErrorKind(err),
+			"error_message", logx.ErrorPreview(err),
+		)
 		httpx.WriteError(w, http.StatusInternalServerError, "failed to finalize redirect")
 		return
 	}
 
+	logx.Event(r.Context(), "oauth_handler", "oauth.user_session_created",
+		"client_id", request.ClientID,
+		"user_id", userID,
+		"redirect_uri", logx.SanitizeRedirectURI(request.RedirectURI),
+	)
 	http.Redirect(w, r, redirectTarget, http.StatusFound)
 }
 
@@ -326,6 +431,13 @@ func (h *Handler) handleAuthorizationCodeGrant(w http.ResponseWriter, r *http.Re
 	redirectURI := r.PostForm.Get("redirect_uri")
 	codeVerifier := r.PostForm.Get("code_verifier")
 	if clientID == "" || code == "" || redirectURI == "" || codeVerifier == "" {
+		logx.Event(r.Context(), "oauth_handler", "oauth.token_exchange_failed",
+			"grant_type", "authorization_code",
+			"client_id", clientID,
+			"redirect_uri", logx.SanitizeRedirectURI(redirectURI),
+			"error_kind", "validation",
+			"error_message", "client_id, code, redirect_uri, and code_verifier are required",
+		)
 		httpx.WriteJSON(w, http.StatusBadRequest, map[string]string{
 			"error":             "invalid_request",
 			"error_description": "client_id, code, redirect_uri, and code_verifier are required",
@@ -335,6 +447,13 @@ func (h *Handler) handleAuthorizationCodeGrant(w http.ResponseWriter, r *http.Re
 
 	authCode, ok := h.consumeAuthorizationCode(code)
 	if !ok {
+		logx.Event(r.Context(), "oauth_handler", "oauth.token_exchange_failed",
+			"grant_type", "authorization_code",
+			"client_id", clientID,
+			"redirect_uri", logx.SanitizeRedirectURI(redirectURI),
+			"error_kind", "auth",
+			"error_message", "authorization code is invalid or expired",
+		)
 		httpx.WriteJSON(w, http.StatusBadRequest, map[string]string{
 			"error":             "invalid_grant",
 			"error_description": "authorization code is invalid or expired",
@@ -342,6 +461,13 @@ func (h *Handler) handleAuthorizationCodeGrant(w http.ResponseWriter, r *http.Re
 		return
 	}
 	if authCode.ClientID != clientID || authCode.RedirectURI != redirectURI {
+		logx.Event(r.Context(), "oauth_handler", "oauth.token_exchange_failed",
+			"grant_type", "authorization_code",
+			"client_id", clientID,
+			"redirect_uri", logx.SanitizeRedirectURI(redirectURI),
+			"error_kind", "auth",
+			"error_message", "authorization code does not match the client or redirect URI",
+		)
 		httpx.WriteJSON(w, http.StatusBadRequest, map[string]string{
 			"error":             "invalid_grant",
 			"error_description": "authorization code does not match the client or redirect URI",
@@ -349,6 +475,13 @@ func (h *Handler) handleAuthorizationCodeGrant(w http.ResponseWriter, r *http.Re
 		return
 	}
 	if S256Challenge(codeVerifier) != authCode.CodeChallenge {
+		logx.Event(r.Context(), "oauth_handler", "oauth.token_exchange_failed",
+			"grant_type", "authorization_code",
+			"client_id", clientID,
+			"redirect_uri", logx.SanitizeRedirectURI(redirectURI),
+			"error_kind", "auth",
+			"error_message", "code_verifier does not satisfy the original PKCE challenge",
+		)
 		httpx.WriteJSON(w, http.StatusBadRequest, map[string]string{
 			"error":             "invalid_grant",
 			"error_description": "code_verifier does not satisfy the original PKCE challenge",
@@ -358,10 +491,24 @@ func (h *Handler) handleAuthorizationCodeGrant(w http.ResponseWriter, r *http.Re
 
 	accessToken, refreshToken, expiresAt, err := h.issueMCPToken(r.Context(), authCode.UserID, authCode.ClientID)
 	if err != nil {
+		logx.Event(r.Context(), "oauth_handler", "oauth.token_exchange_failed",
+			"grant_type", "authorization_code",
+			"client_id", clientID,
+			"user_id", authCode.UserID,
+			"redirect_uri", logx.SanitizeRedirectURI(redirectURI),
+			"error_kind", logx.ErrorKind(err),
+			"error_message", logx.ErrorPreview(err),
+		)
 		httpx.WriteError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 
+	logx.Event(r.Context(), "oauth_handler", "oauth.token_exchange_succeeded",
+		"grant_type", "authorization_code",
+		"client_id", clientID,
+		"user_id", authCode.UserID,
+		"expires_in_seconds", int(time.Until(expiresAt).Seconds()),
+	)
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{
 		"access_token":  accessToken,
 		"refresh_token": refreshToken,
@@ -374,6 +521,12 @@ func (h *Handler) handleRefreshTokenGrant(w http.ResponseWriter, r *http.Request
 	refreshToken := r.PostForm.Get("refresh_token")
 	clientID := r.PostForm.Get("client_id")
 	if refreshToken == "" {
+		logx.Event(r.Context(), "oauth_handler", "oauth.token_exchange_failed",
+			"grant_type", "refresh_token",
+			"client_id", clientID,
+			"error_kind", "validation",
+			"error_message", "refresh_token is required",
+		)
 		httpx.WriteJSON(w, http.StatusBadRequest, map[string]string{
 			"error":             "invalid_request",
 			"error_description": "refresh_token is required",
@@ -383,6 +536,12 @@ func (h *Handler) handleRefreshTokenGrant(w http.ResponseWriter, r *http.Request
 
 	grant, ok := h.consumeRefreshGrant(refreshToken)
 	if !ok {
+		logx.Event(r.Context(), "oauth_handler", "oauth.token_exchange_failed",
+			"grant_type", "refresh_token",
+			"client_id", clientID,
+			"error_kind", "auth",
+			"error_message", "refresh_token is invalid or expired",
+		)
 		httpx.WriteJSON(w, http.StatusBadRequest, map[string]string{
 			"error":             "invalid_grant",
 			"error_description": "refresh_token is invalid or expired",
@@ -390,6 +549,13 @@ func (h *Handler) handleRefreshTokenGrant(w http.ResponseWriter, r *http.Request
 		return
 	}
 	if clientID != "" && grant.ClientID != clientID {
+		logx.Event(r.Context(), "oauth_handler", "oauth.token_exchange_failed",
+			"grant_type", "refresh_token",
+			"client_id", clientID,
+			"user_id", grant.UserID,
+			"error_kind", "auth",
+			"error_message", "refresh_token does not belong to the supplied client_id",
+		)
 		httpx.WriteJSON(w, http.StatusBadRequest, map[string]string{
 			"error":             "invalid_grant",
 			"error_description": "refresh_token does not belong to the supplied client_id",
@@ -399,10 +565,23 @@ func (h *Handler) handleRefreshTokenGrant(w http.ResponseWriter, r *http.Request
 
 	accessToken, newRefreshToken, expiresAt, err := h.issueMCPToken(r.Context(), grant.UserID, grant.ClientID)
 	if err != nil {
+		logx.Event(r.Context(), "oauth_handler", "oauth.token_exchange_failed",
+			"grant_type", "refresh_token",
+			"client_id", clientID,
+			"user_id", grant.UserID,
+			"error_kind", logx.ErrorKind(err),
+			"error_message", logx.ErrorPreview(err),
+		)
 		httpx.WriteError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 
+	logx.Event(r.Context(), "oauth_handler", "oauth.token_exchange_succeeded",
+		"grant_type", "refresh_token",
+		"client_id", grant.ClientID,
+		"user_id", grant.UserID,
+		"expires_in_seconds", int(time.Until(expiresAt).Seconds()),
+	)
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{
 		"access_token":  accessToken,
 		"refresh_token": newRefreshToken,
@@ -441,6 +620,9 @@ func (h *Handler) createUserSession(ctx context.Context, token AirtableTokenResp
 		return "", err
 	}
 
+	logx.Event(ctx, "oauth_handler", "oauth.user_session_stored",
+		"user_id", userID,
+	)
 	return userID, nil
 }
 
@@ -486,6 +668,11 @@ func (h *Handler) issueMCPToken(ctx context.Context, userID, clientID string) (s
 	}
 	h.mu.Unlock()
 
+	logx.Event(ctx, "oauth_handler", "oauth.token_issued",
+		"user_id", userID,
+		"client_id", clientID,
+		"expires_in_seconds", int(time.Until(expiresAt).Seconds()),
+	)
 	return accessToken, refreshToken, expiresAt.UTC(), nil
 }
 
@@ -543,7 +730,12 @@ func (h *Handler) RunCleanupLoop(ctx context.Context, interval time.Duration) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			h.PruneExpiredState()
+			removed := h.PruneExpiredState()
+			if removed > 0 {
+				logx.Event(ctx, "oauth_handler", "oauth.state_pruned",
+					"removed_entries", removed,
+				)
+			}
 		}
 	}
 }

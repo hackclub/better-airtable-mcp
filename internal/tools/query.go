@@ -134,7 +134,9 @@ func (t QueryTool) Call(ctx context.Context, raw json.RawMessage) (mcp.ToolCallR
 
 	userID, ok := authenticatedUserID(ctx)
 	if !ok {
-		return mcp.ToolCallResult{}, fmt.Errorf("missing authenticated user")
+		err := fmt.Errorf("missing authenticated user")
+		logToolFailed(ctx, "query", err)
+		return mcp.ToolCallResult{}, err
 	}
 
 	var baseID string
@@ -143,6 +145,7 @@ func (t QueryTool) Call(ctx context.Context, raw json.RawMessage) (mcp.ToolCallR
 	if t.runtime.SyncManager != nil {
 		base, err := t.runtime.SyncManager.EnsureBaseReadable(ctx, userID, input.Base)
 		if err != nil {
+			logToolFailed(ctx, "query", err, "user_id", userID)
 			return mcp.ToolCallResult{}, err
 		}
 		baseID = base.ID
@@ -158,6 +161,7 @@ func (t QueryTool) Call(ctx context.Context, raw json.RawMessage) (mcp.ToolCallR
 
 	accessToken, err := t.runtime.AirtableAccessToken(ctx, userID)
 	if err != nil {
+		logToolFailed(ctx, "query", err, "user_id", userID, "base_id", baseID)
 		return mcp.ToolCallResult{}, err
 	}
 
@@ -167,7 +171,9 @@ func (t QueryTool) Call(ctx context.Context, raw json.RawMessage) (mcp.ToolCallR
 	for index, query := range normalizedQueries {
 		result, err := t.runtime.Syncer.QueryBase(ctx, accessToken, baseID, query.Normalized.ExecutionSQL)
 		if err != nil {
-			return mcp.ToolCallResult{}, wrapQueryError(index, len(normalizedQueries), err)
+			wrapped := wrapQueryError(index, len(normalizedQueries), err)
+			logToolFailed(ctx, "query", wrapped, "user_id", userID, "base_id", baseID, "query_index", index)
+			return mcp.ToolCallResult{}, wrapped
 		}
 		result, truncated := applyQueryResultLimit(result, query.Normalized)
 
@@ -204,6 +210,11 @@ func (t QueryTool) Call(ctx context.Context, raw json.RawMessage) (mcp.ToolCallR
 	if syncPayload != nil {
 		payload["sync"] = syncPayload
 	}
+	logToolCompleted(ctx, "query",
+		"user_id", userID,
+		"base_id", baseID,
+		"query_count", len(normalizedQueries),
+	)
 	return textOnlyResult(formatBatchQueryCSV(formattedResults, syncStatus), payload), nil
 }
 

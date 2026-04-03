@@ -2,10 +2,12 @@ package tools
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"time"
 
+	"github.com/hackclub/better-airtable-mcp/internal/logx"
 	syncer "github.com/hackclub/better-airtable-mcp/internal/sync"
 )
 
@@ -72,4 +74,19 @@ func formattedSyncStatusFromOperation(status syncer.SyncOperationStatus) formatt
 		formatted.LastSyncedAt = status.LastSyncedAt.Format(time.RFC3339)
 	}
 	return formatted
+}
+
+func logToolCompleted(ctx context.Context, toolName string, attrs ...any) {
+	logx.Event(ctx, "tool", "tool.completed", append([]any{
+		"tool_name", toolName,
+	}, attrs...)...)
+}
+
+func logToolFailed(ctx context.Context, toolName string, err error, attrs ...any) {
+	logAttrs := append([]any{
+		"tool_name", toolName,
+		"error_kind", logx.ErrorKind(err),
+		"error_message", logx.ErrorPreview(err),
+	}, attrs...)
+	logx.Event(ctx, "tool", "tool.failed", logAttrs...)
 }

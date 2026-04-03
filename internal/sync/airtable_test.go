@@ -1,12 +1,17 @@
 package syncer
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/hackclub/better-airtable-mcp/internal/logx"
 )
 
 func TestHTTPClientRetriesRateLimitedRequests(t *testing.T) {
@@ -128,5 +133,48 @@ func TestHTTPClientUserRateLimitIsPerToken(t *testing.T) {
 
 	if len(delays) != 0 {
 		t.Fatalf("expected distinct tokens to avoid shared delay, got %v", delays)
+	}
+}
+
+func TestHTTPClientLogsRetryWithoutTokenLeakage(t *testing.T) {
+	var calls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if calls == 1 {
+			w.Header().Set("Retry-After", "0")
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte(`{"error":"rate limited"}`))
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]any{
+			"bases": []map[string]any{
+				{"id": "app123", "name": "Test Base", "permissionLevel": "create"},
+			},
+		})
+	}))
+	defer server.Close()
+
+	var output bytes.Buffer
+	previous := slog.Default()
+	slog.SetDefault(logx.NewLogger(&output))
+	t.Cleanup(func() {
+		slog.SetDefault(previous)
+	})
+
+	client := NewHTTPClient(server.URL, server.Client())
+	client.clock = func() time.Time {
+		return time.Unix(0, 0)
+	}
+
+	if _, err := client.ListBases(context.Background(), "token-secret-value"); err != nil {
+		t.Fatalf("ListBases() returned error: %v", err)
+	}
+
+	logText := output.String()
+	if !strings.Contains(logText, `"event":"airtable.request.retry"`) {
+		t.Fatalf("expected retry log event, got %s", logText)
+	}
+	if strings.Contains(logText, "token-secret-value") {
+		t.Fatalf("expected raw access token to stay out of logs, got %s", logText)
 	}
 }

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/hackclub/better-airtable-mcp/internal/approval"
+	"github.com/hackclub/better-airtable-mcp/internal/logx"
 	"github.com/hackclub/better-airtable-mcp/internal/mcp"
 )
 
@@ -155,7 +156,9 @@ func (t MutateTool) Call(ctx context.Context, raw json.RawMessage) (mcp.ToolCall
 
 	userID, ok := authenticatedUserID(ctx)
 	if !ok {
-		return mcp.ToolCallResult{}, fmt.Errorf("missing authenticated user")
+		err := fmt.Errorf("missing authenticated user")
+		logToolFailed(ctx, "mutate", err)
+		return mcp.ToolCallResult{}, err
 	}
 
 	prepared, err := t.runtime.Approval.PrepareMutation(ctx, userID, toApprovalRequest(ctx, input))
@@ -170,8 +173,15 @@ func (t MutateTool) Call(ctx context.Context, raw json.RawMessage) (mcp.ToolCall
 				"record_ids": notReady.RecordIDs,
 				"sync":       syncStatusPayload(notReady.Sync),
 			}
+			logToolCompleted(ctx, "mutate",
+				"user_id", userID,
+				"outcome", "records_not_synced_yet",
+				"base_id", notReady.BaseID,
+				"record_count", len(notReady.RecordIDs),
+			)
 			return mcp.ErrorResult(err.Error(), payload), nil
 		}
+		logToolFailed(ctx, "mutate", err, "user_id", userID)
 		return mcp.ToolCallResult{}, err
 	}
 
@@ -183,6 +193,11 @@ func (t MutateTool) Call(ctx context.Context, raw json.RawMessage) (mcp.ToolCall
 		"summary":               prepared.Summary,
 		"assistant_instruction": approvalURLAssistantInstruction,
 	}
+	logToolCompleted(ctx, "mutate",
+		"user_id", userID,
+		"approval_operation_id_hash", logx.ApprovalOperationIDHash(prepared.OperationID),
+		"status", prepared.Status,
+	)
 	return textOnlyResult(formatSingleRowCSV([]string{
 		"operation_id", "status", "approval_url", "expires_at", "summary", "assistant_instruction",
 	}, payload), payload), nil

@@ -14,6 +14,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/hackclub/better-airtable-mcp/internal/logx"
 )
 
 const defaultAPIBaseURL = "https://api.airtable.com"
@@ -259,6 +261,8 @@ func (c *HTTPClient) doJSON(ctx context.Context, accessToken, method, requestPat
 		}
 	}
 
+	baseID, _ := airtableBaseIDFromPath(requestPath)
+	tableID, _ := airtableTableIDFromPath(requestPath)
 	for attempt := 0; attempt < 2; attempt++ {
 		if err := c.waitForRateLimits(ctx, accessToken, requestPath); err != nil {
 			return err
@@ -285,14 +289,36 @@ func (c *HTTPClient) doJSON(ctx context.Context, accessToken, method, requestPat
 			request.Header.Set("Content-Type", "application/json")
 		}
 
+		startedAt := c.clock()
 		response, err := c.httpClient.Do(request)
 		if err != nil {
+			logx.Event(ctx, "airtable_client", "airtable.request.failed",
+				"method", method,
+				"base_id", baseID,
+				"table_id", tableID,
+				"endpoint_kind", airtableEndpointKind(requestPath),
+				"attempt", attempt+1,
+				"duration_ms", c.clock().Sub(startedAt).Milliseconds(),
+				"error_kind", logx.ErrorKind(err),
+				"error_message", logx.ErrorPreview(err),
+			)
 			return fmt.Errorf("perform airtable request: %w", err)
 		}
+		duration := c.clock().Sub(startedAt)
 
 		if response.StatusCode == http.StatusTooManyRequests && attempt == 0 {
 			retryDelay := retryAfterDelay(response.Header.Get("Retry-After"))
 			response.Body.Close()
+			logx.Event(ctx, "airtable_client", "airtable.request.retry",
+				"method", method,
+				"base_id", baseID,
+				"table_id", tableID,
+				"endpoint_kind", airtableEndpointKind(requestPath),
+				"attempt", attempt+1,
+				"status", response.StatusCode,
+				"duration_ms", duration.Milliseconds(),
+				"retry_delay_ms", retryDelay.Milliseconds(),
+			)
 			if err := c.sleep(ctx, retryDelay); err != nil {
 				return err
 			}
@@ -303,20 +329,75 @@ func (c *HTTPClient) doJSON(ctx context.Context, accessToken, method, requestPat
 
 		if response.StatusCode < 200 || response.StatusCode >= 300 {
 			body, _ := io.ReadAll(io.LimitReader(response.Body, 4096))
+			logx.Event(ctx, "airtable_client", "airtable.request.failed",
+				"method", method,
+				"base_id", baseID,
+				"table_id", tableID,
+				"endpoint_kind", airtableEndpointKind(requestPath),
+				"attempt", attempt+1,
+				"status", response.StatusCode,
+				"duration_ms", duration.Milliseconds(),
+				"error_kind", "external_api",
+				"error_message", logx.SanitizeExternalBody(string(body)),
+			)
 			return fmt.Errorf("airtable API %s %s returned %d: %s", method, request.URL.Path, response.StatusCode, strings.TrimSpace(string(body)))
 		}
 
 		if target == nil {
+			if duration >= logx.AirtableSlowRequestThreshold {
+				logx.Event(ctx, "airtable_client", "airtable.request.completed",
+					"method", method,
+					"base_id", baseID,
+					"table_id", tableID,
+					"endpoint_kind", airtableEndpointKind(requestPath),
+					"attempt", attempt+1,
+					"status", response.StatusCode,
+					"duration_ms", duration.Milliseconds(),
+					"slow", true,
+				)
+			}
 			return nil
 		}
 
 		if err := json.NewDecoder(response.Body).Decode(target); err != nil {
+			logx.Event(ctx, "airtable_client", "airtable.request.failed",
+				"method", method,
+				"base_id", baseID,
+				"table_id", tableID,
+				"endpoint_kind", airtableEndpointKind(requestPath),
+				"attempt", attempt+1,
+				"status", response.StatusCode,
+				"duration_ms", duration.Milliseconds(),
+				"error_kind", logx.ErrorKind(err),
+				"error_message", logx.ErrorPreview(err),
+			)
 			return fmt.Errorf("decode airtable response: %w", err)
+		}
+		if duration >= logx.AirtableSlowRequestThreshold {
+			logx.Event(ctx, "airtable_client", "airtable.request.completed",
+				"method", method,
+				"base_id", baseID,
+				"table_id", tableID,
+				"endpoint_kind", airtableEndpointKind(requestPath),
+				"attempt", attempt+1,
+				"status", response.StatusCode,
+				"duration_ms", duration.Milliseconds(),
+				"slow", true,
+			)
 		}
 
 		return nil
 	}
 
+	logx.Event(ctx, "airtable_client", "airtable.request.failed",
+		"method", method,
+		"base_id", baseID,
+		"table_id", tableID,
+		"endpoint_kind", airtableEndpointKind(requestPath),
+		"attempt", 2,
+		"error_kind", "rate_limit",
+		"error_message", "airtable API returned repeated rate limits",
+	)
 	return fmt.Errorf("airtable API %s %s returned repeated rate limits", method, requestPath)
 }
 
@@ -399,6 +480,27 @@ func airtableBaseIDFromPath(requestPath string) (string, bool) {
 	}
 
 	return "", false
+}
+
+func airtableTableIDFromPath(requestPath string) (string, bool) {
+	parts := strings.Split(strings.Trim(requestPath, "/"), "/")
+	if len(parts) >= 3 && parts[0] == "v0" && parts[1] != "meta" {
+		return parts[2], true
+	}
+	return "", false
+}
+
+func airtableEndpointKind(requestPath string) string {
+	if strings.HasPrefix(requestPath, "/v0/meta/bases/") && strings.HasSuffix(requestPath, "/tables") {
+		return "base_schema"
+	}
+	if requestPath == "/v0/meta/bases" {
+		return "list_bases"
+	}
+	if _, ok := airtableTableIDFromPath(requestPath); ok {
+		return "records"
+	}
+	return "unknown"
 }
 
 func retryAfterDelay(header string) time.Duration {
