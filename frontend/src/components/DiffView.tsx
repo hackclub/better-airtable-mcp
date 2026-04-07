@@ -1,18 +1,28 @@
-import { collectFieldNames, formatFieldValue } from "../formatters";
+import { formatFieldValue } from "../formatters";
 import type { OperationPreview, OperationPreviewRecord } from "../types";
 
 interface DiffViewProps {
   operation: OperationPreview;
 }
 
-function valuesEqual(left: unknown, right: unknown): boolean {
-  return JSON.stringify(left) === JSON.stringify(right);
-}
-
 function DiffRow({ record }: { record: OperationPreviewRecord }) {
   const currentFields = record.current_fields ?? {};
   const nextFields = record.fields ?? {};
-  const fieldNames = collectFieldNames(currentFields, nextFields);
+
+  // Only show fields that are part of the mutation request
+  const changedFieldNames = Object.keys(nextFields).sort();
+
+  // Unchanged fields: in current snapshot but not in the mutation request
+  const unchangedFieldNames = Object.keys(currentFields)
+    .filter((name) => !(name in nextFields))
+    .sort();
+
+  const truncatedNames = unchangedFieldNames.slice(0, 12);
+  const tooltipText =
+    truncatedNames.join(", ") +
+    (unchangedFieldNames.length > 12
+      ? `, and ${unchangedFieldNames.length - 12} more`
+      : "");
 
   return (
     <div className="record-card">
@@ -26,22 +36,24 @@ function DiffRow({ record }: { record: OperationPreviewRecord }) {
           </tr>
         </thead>
         <tbody>
-          {fieldNames.map((fieldName) => {
-            const currentValue = currentFields[fieldName];
-            const nextValue = nextFields[fieldName];
-            const changed = !valuesEqual(currentValue, nextValue);
-
-            return (
-              <tr
-                key={fieldName}
-                className={changed ? "field-changed" : "field-unchanged"}
-              >
-                <th>{fieldName}</th>
-                <td>{formatFieldValue(currentValue)}</td>
-                <td>{formatFieldValue(nextValue)}</td>
-              </tr>
-            );
-          })}
+          {changedFieldNames.map((fieldName) => (
+            <tr key={fieldName} className="field-changed">
+              <th>{fieldName}</th>
+              <td>{formatFieldValue(currentFields[fieldName])}</td>
+              <td>{formatFieldValue(nextFields[fieldName])}</td>
+            </tr>
+          ))}
+          {unchangedFieldNames.length > 0 && (
+            <tr className="field-unchanged-summary">
+              <td colSpan={3}>
+                <span className="unchanged-hint" title={tooltipText}>
+                  {unchangedFieldNames.length} other field
+                  {unchangedFieldNames.length === 1 ? "" : "s"}
+                </span>{" "}
+                will remain unchanged
+              </td>
+            </tr>
+          )}
         </tbody>
       </table>
     </div>
@@ -55,8 +67,7 @@ export function DiffView({ operation }: DiffViewProps) {
         <div>
           <h2>Update in {operation.original_table_name ?? operation.table}</h2>
           <p className="preview-subtitle">
-            Changed rows are highlighted. Unchanged fields remain visible for
-            context.
+            Only modified fields are shown. Other fields remain untouched.
           </p>
         </div>
       </div>

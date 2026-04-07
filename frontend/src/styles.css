@@ -213,6 +213,19 @@ th {
   opacity: 0.68;
 }
 
+.field-unchanged-summary td {
+  color: var(--muted);
+  font-size: 0.9rem;
+  font-style: italic;
+  padding-top: 12px;
+}
+
+.unchanged-hint {
+  text-decoration: underline dotted var(--muted);
+  text-underline-offset: 3px;
+  cursor: help;
+}
+
 .field-empty {
   color: var(--muted);
   font-style: italic;
