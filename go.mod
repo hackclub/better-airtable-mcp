@@ -5,7 +5,9 @@ go 1.25.0
 require (
 	github.com/duckdb/duckdb-go/v2 v2.5.5
 	github.com/fergusstrange/embedded-postgres v1.34.0
-	github.com/jackc/pgx/v5 v5.9.1
+	github.com/jackc/pgx/v5 v5.9.2
+	github.com/yuin/goldmark v1.7.13
+	golang.org/x/time v0.15.0
 )
 
 require (
@@ -28,7 +30,6 @@ require (
 	github.com/lib/pq v1.10.9 // indirect
 	github.com/pierrec/lz4/v4 v4.1.25 // indirect
 	github.com/xi2/xz v0.0.0-20171230120015-48954b6210f8 // indirect
-	github.com/yuin/goldmark v1.7.13 // indirect
 	github.com/zeebo/xxh3 v1.1.0 // indirect
 	golang.org/x/exp v0.0.0-20260112195511-716be5621a96 // indirect
 	golang.org/x/mod v0.32.0 // indirect
@@ -36,7 +37,6 @@ require (
 	golang.org/x/sys v0.40.0 // indirect
 	golang.org/x/telemetry v0.0.0-20260116145544-c6413dc483f5 // indirect
 	golang.org/x/text v0.33.0 // indirect
-	golang.org/x/time v0.15.0 // indirect
 	golang.org/x/tools v0.41.0 // indirect
 	golang.org/x/xerrors v0.0.0-20240903120638-7835f813f4da // indirect
 )
