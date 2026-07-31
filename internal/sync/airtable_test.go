@@ -382,3 +382,10 @@ func TestHTTPClientLogsRetryWithoutTokenLeakage(t *testing.T) {
 		t.Fatalf("expected raw access token to stay out of logs, got %s", logText)
 	}
 }
+
+func TestNewHTTPClientDefaultsToTimeoutBearingClient(t *testing.T) {
+	client := NewHTTPClient("", nil)
+	if client.httpClient.Timeout <= 0 {
+		t.Fatalf("expected default http client to carry a timeout, got %v", client.httpClient.Timeout)
+	}
+}

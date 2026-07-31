@@ -37,6 +37,11 @@ const (
 	// bounded by maxRetryBackoff * (maxRetryAttempts-1).
 	defaultMaxRetryAttempts = 6
 	defaultMaxRetryBackoff  = 90 * time.Second
+
+	// defaultHTTPTimeout bounds each Airtable request end-to-end (including
+	// body read) so a stalled connection surfaces as a retriable error
+	// instead of hanging a sync worker forever.
+	defaultHTTPTimeout = 30 * time.Second
 )
 
 type Client interface {
@@ -143,7 +148,14 @@ func NewHTTPClient(baseURL string, httpClient *http.Client) *HTTPClient {
 		baseURL = defaultAPIBaseURL
 	}
 	if httpClient == nil {
-		httpClient = http.DefaultClient
+		httpClient = &http.Client{
+			Timeout: defaultHTTPTimeout,
+			Transport: &http.Transport{
+				MaxIdleConns:        100,
+				MaxIdleConnsPerHost: 10,
+				IdleConnTimeout:     90 * time.Second,
+			},
+		}
 	}
 
 	return &HTTPClient{

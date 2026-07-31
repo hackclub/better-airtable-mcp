@@ -419,7 +419,9 @@ func (w *workerState) run() {
 		w.recordsSyncedThisRun = 0
 		w.mu.Unlock()
 
-		result, err := w.manager.syncOnce(context.Background(), userID, w.baseID, w.baseName, w.handleProgress)
+		runCtx, cancelRun := context.WithTimeout(context.Background(), syncRunTimeout)
+		result, err := w.manager.syncOnce(runCtx, userID, w.baseID, w.baseName, w.handleProgress)
+		cancelRun()
 		completedAt := w.manager.now().UTC()
 
 		w.mu.Lock()
@@ -509,6 +511,11 @@ func (w *workerState) nextAction(now time.Time) (shouldSync bool, waitFor time.D
 const (
 	failureBackoffBase = 2 * time.Second
 	failureBackoffMax  = 5 * time.Minute
+
+	// syncRunTimeout caps a single base sync run. Large bases legitimately
+	// take minutes at ~4 req/s, so the cap is generous — it exists to turn
+	// an indefinitely stalled run into a normal retriable failure.
+	syncRunTimeout = 15 * time.Minute
 )
 
 // failureBackoff returns how long to wait after the last failed run before the
