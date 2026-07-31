@@ -102,7 +102,12 @@ func (h *Handler) ServeOperationAPI(w http.ResponseWriter, r *http.Request) {
 		logx.SetRoute(r.Context(), "/api/operations/:operation/:action")
 		operation, err := h.service.Approve(r.Context(), operationID)
 		if err != nil {
-			httpx.WriteError(w, http.StatusBadRequest, err.Error())
+			logx.Event(r.Context(), "approval_handler", "approval.approve_failed",
+				"approval_operation_id_hash", logx.ApprovalOperationIDHash(operationID),
+				"error_kind", logx.ErrorKind(err),
+				"error_message", logx.ErrorPreview(err),
+			)
+			httpx.WriteError(w, http.StatusBadRequest, "could not process this request")
 			return
 		}
 		httpx.WriteJSON(w, http.StatusOK, operation)
@@ -110,7 +115,12 @@ func (h *Handler) ServeOperationAPI(w http.ResponseWriter, r *http.Request) {
 		logx.SetRoute(r.Context(), "/api/operations/:operation/:action")
 		operation, err := h.service.Reject(r.Context(), operationID)
 		if err != nil {
-			httpx.WriteError(w, http.StatusBadRequest, err.Error())
+			logx.Event(r.Context(), "approval_handler", "approval.reject_failed",
+				"approval_operation_id_hash", logx.ApprovalOperationIDHash(operationID),
+				"error_kind", logx.ErrorKind(err),
+				"error_message", logx.ErrorPreview(err),
+			)
+			httpx.WriteError(w, http.StatusBadRequest, "could not process this request")
 			return
 		}
 		httpx.WriteJSON(w, http.StatusOK, operation)

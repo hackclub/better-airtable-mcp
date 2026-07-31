@@ -2,6 +2,7 @@ package approval
 
 import (
 	"context"
+	"errors"
 	"io/fs"
 	"net/http"
 	"net/http/httptest"
@@ -167,3 +168,36 @@ func testOperationView() OperationView {
 		Operations:   []OperationPreview{},
 	}
 }
+
+func TestApproveFailureReturnsGenericErrorBody(t *testing.T) {
+	handler := NewHandler(stubOperationService{
+		getOperation: func(context.Context, string) (OperationView, error) {
+			return testOperationView(), nil
+		},
+		approve: func(context.Context, string) (OperationView, error) {
+			return OperationView{}, errInternalDetail
+		},
+		reject: func(context.Context, string) (OperationView, error) {
+			return OperationView{}, errInternalDetail
+		},
+	})
+
+	for _, action := range []string{"approve", "reject"} {
+		request := httptest.NewRequest(http.MethodPost, "/api/operations/op_123/"+action, nil)
+		recorder := httptest.NewRecorder()
+		handler.ServeOperationAPI(recorder, request)
+
+		if recorder.Code != http.StatusBadRequest {
+			t.Fatalf("%s status = %d, want %d", action, recorder.Code, http.StatusBadRequest)
+		}
+		body := recorder.Body.String()
+		if strings.Contains(body, "pq: duplicate key value violates constraint") {
+			t.Fatalf("%s response leaked the internal error: %q", action, body)
+		}
+		if !strings.Contains(body, "could not process this request") {
+			t.Fatalf("%s response missing generic message: %q", action, body)
+		}
+	}
+}
+
+var errInternalDetail = errors.New("pq: duplicate key value violates constraint \"pending_operations_pkey\"")

@@ -179,7 +179,7 @@ func (h *Handler) Register(w http.ResponseWriter, r *http.Request) {
 			"error_kind", logx.ErrorKind(err),
 			"error_message", logx.ErrorPreview(err),
 		)
-		httpx.WriteError(w, http.StatusInternalServerError, err.Error())
+		httpx.WriteError(w, http.StatusInternalServerError, "internal error")
 		return
 	}
 	logx.Event(r.Context(), "oauth_handler", "oauth.client_registered",
@@ -357,7 +357,7 @@ func (h *Handler) AirtableCallback(w http.ResponseWriter, r *http.Request) {
 			"error_kind", logx.ErrorKind(err),
 			"error_message", logx.ErrorPreview(err),
 		)
-		httpx.WriteError(w, http.StatusBadGateway, err.Error())
+		httpx.WriteError(w, http.StatusBadGateway, "upstream authorization error")
 		return
 	}
 
@@ -368,7 +368,7 @@ func (h *Handler) AirtableCallback(w http.ResponseWriter, r *http.Request) {
 			"error_kind", logx.ErrorKind(err),
 			"error_message", logx.ErrorPreview(err),
 		)
-		httpx.WriteError(w, http.StatusInternalServerError, err.Error())
+		httpx.WriteError(w, http.StatusInternalServerError, "internal error")
 		return
 	}
 
@@ -493,7 +493,7 @@ func (h *Handler) handleAuthorizationCodeGrant(w http.ResponseWriter, r *http.Re
 			"error_kind", logx.ErrorKind(err),
 			"error_message", logx.ErrorPreview(err),
 		)
-		httpx.WriteError(w, http.StatusInternalServerError, err.Error())
+		httpx.WriteError(w, http.StatusInternalServerError, "internal error")
 		return
 	}
 
@@ -536,7 +536,7 @@ func (h *Handler) handleRefreshTokenGrant(w http.ResponseWriter, r *http.Request
 			"error_kind", logx.ErrorKind(err),
 			"error_message", logx.ErrorPreview(err),
 		)
-		httpx.WriteError(w, http.StatusInternalServerError, err.Error())
+		httpx.WriteError(w, http.StatusInternalServerError, "internal error")
 		return
 	}
 	if !ok {
@@ -576,7 +576,7 @@ func (h *Handler) handleRefreshTokenGrant(w http.ResponseWriter, r *http.Request
 			"error_kind", logx.ErrorKind(err),
 			"error_message", logx.ErrorPreview(err),
 		)
-		httpx.WriteError(w, http.StatusInternalServerError, err.Error())
+		httpx.WriteError(w, http.StatusInternalServerError, "internal error")
 		return
 	}
 
