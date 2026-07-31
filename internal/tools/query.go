@@ -38,13 +38,30 @@ type normalizedQueryCall struct {
 }
 
 type formattedQueryResult struct {
-	SQL          string
-	Columns      []string
-	Rows         [][]any
-	RowCount     int
-	Truncated    bool
-	LastSyncedAt string
-	NextSyncAt   string
+	SQL            string
+	Columns        []string
+	Rows           [][]any
+	RowCount       int
+	Truncated      bool
+	LastSyncedAt   string
+	NextSyncAt     string
+	EffectiveLimit int
+}
+
+// queryResultPayload maps a per-statement result to the structured-content
+// shape. The CSV text and this payload are derived from the same slice so
+// each statement's rows are assembled exactly once.
+func queryResultPayload(result formattedQueryResult) map[string]any {
+	return map[string]any{
+		"sql":             result.SQL,
+		"columns":         result.Columns,
+		"rows":            result.Rows,
+		"row_count":       result.RowCount,
+		"truncated":       result.Truncated,
+		"last_synced_at":  result.LastSyncedAt,
+		"next_sync_at":    result.NextSyncAt,
+		"effective_limit": result.EffectiveLimit,
+	}
 }
 
 type QueryTool struct {
@@ -174,7 +191,6 @@ func (t QueryTool) Call(ctx context.Context, raw json.RawMessage) (mcp.ToolCallR
 		}
 	}
 
-	payloadResults := make([]map[string]any, 0, len(normalizedQueries))
 	formattedResults := make([]formattedQueryResult, 0, len(normalizedQueries))
 
 	for index, query := range normalizedQueries {
@@ -199,27 +215,22 @@ func (t QueryTool) Call(ctx context.Context, raw json.RawMessage) (mcp.ToolCallR
 			nextSyncAtText = t.runtime.NextSyncTime(result.LastSyncedAt, result.LastSyncDuration).Format(time.RFC3339)
 		}
 
-		payloadResults = append(payloadResults, map[string]any{
-			"sql":             query.Normalized.SQL,
-			"columns":         result.Columns,
-			"rows":            result.Rows,
-			"row_count":       result.RowCount,
-			"truncated":       truncated,
-			"last_synced_at":  lastSyncedAt,
-			"next_sync_at":    nextSyncAtText,
-			"effective_limit": query.Normalized.EffectiveLimit,
-		})
 		formattedResults = append(formattedResults, formattedQueryResult{
-			SQL:          query.Normalized.SQL,
-			Columns:      result.Columns,
-			Rows:         result.Rows,
-			RowCount:     result.RowCount,
-			Truncated:    truncated,
-			LastSyncedAt: lastSyncedAt,
-			NextSyncAt:   nextSyncAtText,
+			SQL:            query.Normalized.SQL,
+			Columns:        result.Columns,
+			Rows:           result.Rows,
+			RowCount:       result.RowCount,
+			Truncated:      truncated,
+			LastSyncedAt:   lastSyncedAt,
+			NextSyncAt:     nextSyncAtText,
+			EffectiveLimit: query.Normalized.EffectiveLimit,
 		})
 	}
 
+	payloadResults := make([]map[string]any, 0, len(formattedResults))
+	for _, result := range formattedResults {
+		payloadResults = append(payloadResults, queryResultPayload(result))
+	}
 	payload := map[string]any{
 		"results": payloadResults,
 	}

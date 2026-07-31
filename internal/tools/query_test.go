@@ -149,3 +149,33 @@ func TestApplyQueryResultLimitLeavesExplicitlyLimitedResultsUntouched(t *testing
 		t.Fatalf("expected rows to remain untouched, got %#v", trimmed)
 	}
 }
+
+func TestQueryResultPayloadCarriesAllFields(t *testing.T) {
+	payload := queryResultPayload(formattedQueryResult{
+		SQL:            "SELECT 1",
+		Columns:        []string{"a"},
+		Rows:           [][]any{{int64(1)}},
+		RowCount:       1,
+		Truncated:      true,
+		LastSyncedAt:   "2026-04-01T12:00:00Z",
+		NextSyncAt:     "2026-04-01T12:01:00Z",
+		EffectiveLimit: 100,
+	})
+
+	expectations := map[string]any{
+		"sql":             "SELECT 1",
+		"row_count":       1,
+		"truncated":       true,
+		"last_synced_at":  "2026-04-01T12:00:00Z",
+		"next_sync_at":    "2026-04-01T12:01:00Z",
+		"effective_limit": 100,
+	}
+	for key, want := range expectations {
+		if payload[key] != want {
+			t.Fatalf("payload[%q] = %#v, want %#v", key, payload[key], want)
+		}
+	}
+	if len(payload["rows"].([][]any)) != 1 {
+		t.Fatalf("payload rows missing: %#v", payload["rows"])
+	}
+}
