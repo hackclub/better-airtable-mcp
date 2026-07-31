@@ -383,4 +383,3 @@ func validateSchemaInput(input SchemaInput) error {
 
 	return nil
 }
-

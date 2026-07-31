@@ -278,5 +278,3 @@ func validateMutateInput(input MutateInput) error {
 
 	return nil
 }
-
-
