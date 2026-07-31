@@ -535,7 +535,14 @@ func (s *Service) Approve(ctx context.Context, operationID string) (OperationVie
 		return OperationView{}, err
 	}
 
-	result, status, errText := s.execute(ctx, operation.UserID, operation.ID, payload)
+	// This operation now owns the `executing` state. Run the Airtable writes
+	// and the terminal status write under a detached, bounded context so a
+	// client disconnect cannot abort the mutation mid-flight or strand the
+	// operation in `executing`.
+	execCtx, cancelExec := context.WithTimeout(context.WithoutCancel(ctx), executeCriticalTimeout)
+	defer cancelExec()
+
+	result, status, errText := s.execute(execCtx, operation.UserID, operation.ID, payload)
 	resultCiphertext, err := s.encryptJSON(result)
 	if err != nil {
 		return OperationView{}, err
@@ -546,7 +553,7 @@ func (s *Service) Approve(ctx context.Context, operationID string) (OperationVie
 	if errText != "" {
 		errorPtr = &errText
 	}
-	if err := s.store.UpdatePendingOperationStatus(ctx, operation.ID, status, resultCiphertext, errorPtr, &resolvedAt); err != nil {
+	if err := s.store.UpdatePendingOperationStatus(execCtx, operation.ID, status, resultCiphertext, errorPtr, &resolvedAt); err != nil {
 		return OperationView{}, err
 	}
 	attrs := []any{
@@ -620,6 +627,20 @@ func (s *Service) RunExpiryLoop(ctx context.Context, interval time.Duration) {
 			if expired > 0 {
 				logx.Event(ctx, "approval", "approval.expiry_loop",
 					"expired_operations", expired,
+				)
+			}
+
+			recovered, err := s.store.RecoverStaleExecutingOperations(ctx, s.now().UTC().Add(-staleExecutingWindow))
+			if err != nil {
+				logx.Event(ctx, "approval", "approval.executing_recovery_failed",
+					"error_kind", logx.ErrorKind(err),
+					"error_message", logx.ErrorPreview(err),
+				)
+				continue
+			}
+			if recovered > 0 {
+				logx.Event(ctx, "approval", "approval.executing_recovery",
+					"recovered_operations", recovered,
 				)
 			}
 		}

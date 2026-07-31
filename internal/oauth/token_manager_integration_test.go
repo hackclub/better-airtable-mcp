@@ -360,3 +360,49 @@ func writeOAuthJSON(t *testing.T, w http.ResponseWriter, payload any) {
 		t.Fatalf("json.NewEncoder().Encode() returned error: %v", err)
 	}
 }
+
+func TestTokenManagerPersistsRotatedTokenEvenWhenCallerCancels(t *testing.T) {
+	store, cleanup := openOAuthTestStore(t)
+	defer cleanup()
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Simulate the caller disconnecting while Airtable processes the
+		// refresh: the single-use token is consumed either way.
+		cancel()
+		writeOAuthJSON(t, w, map[string]any{
+			"access_token":  "rotated-access",
+			"refresh_token": "rotated-refresh",
+			"expires_in":    3600,
+			"scope":         defaultAirtableScopes,
+			"token_type":    "Bearer",
+		})
+	}))
+	defer server.Close()
+
+	cipher := mustNewCipher(t)
+	putEncryptedToken(t, store, cipher, "user_1", "old-access", "old-refresh", time.Now().Add(5*time.Minute))
+
+	manager := NewTokenManager(store, cipher, NewAirtableOAuthClient("client-id", "client-secret", "https://example.test/callback", server.Client(), "", server.URL))
+
+	token, err := manager.AirtableAccessToken(ctx, "user_1")
+	if err != nil {
+		t.Fatalf("AirtableAccessToken() returned error: %v", err)
+	}
+	if token != "rotated-access" {
+		t.Fatalf("expected rotated access token, got %q", token)
+	}
+
+	record, err := store.GetAirtableToken(context.Background(), "user_1")
+	if err != nil {
+		t.Fatalf("GetAirtableToken() returned error: %v", err)
+	}
+	persistedRefresh, err := cipher.Decrypt(record.RefreshTokenCiphertext)
+	if err != nil {
+		t.Fatalf("cipher.Decrypt() returned error: %v", err)
+	}
+	if string(persistedRefresh) != "rotated-refresh" {
+		t.Fatalf("expected rotated refresh token to be persisted despite cancellation, got %q", persistedRefresh)
+	}
+}

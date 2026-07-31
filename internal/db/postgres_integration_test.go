@@ -427,3 +427,81 @@ func freePort(t *testing.T) int {
 func ptr[T any](value T) *T {
 	return &value
 }
+
+func TestRecoverStaleExecutingOperations(t *testing.T) {
+	port := freePort(t)
+	postgres := embeddedpostgres.NewDatabase(
+		embeddedpostgres.DefaultConfig().
+			Port(uint32(port)).
+			Database("better_airtable_recover_test").
+			Username("postgres").
+			Password("postgres").
+			BinariesPath(filepath.Join(t.TempDir(), "postgres-binaries")).
+			DataPath(filepath.Join(t.TempDir(), "postgres-data")).
+			RuntimePath(filepath.Join(t.TempDir(), "postgres-runtime")),
+	)
+	if err := postgres.Start(); err != nil {
+		t.Fatalf("embedded postgres start failed: %v", err)
+	}
+	defer func() {
+		if err := postgres.Stop(); err != nil {
+			t.Fatalf("embedded postgres stop failed: %v", err)
+		}
+	}()
+
+	ctx := context.Background()
+	store, err := Open(ctx, fmt.Sprintf("postgres://postgres:postgres@127.0.0.1:%d/better_airtable_recover_test?sslmode=disable", port))
+	if err != nil {
+		t.Fatalf("Open() returned error: %v", err)
+	}
+	defer store.Close()
+	if err := store.Migrate(ctx); err != nil {
+		t.Fatalf("Migrate() returned error: %v", err)
+	}
+	if err := store.UpsertUser(ctx, User{ID: "user_1"}); err != nil {
+		t.Fatalf("UpsertUser() returned error: %v", err)
+	}
+
+	put := func(id string, expiresAt time.Time) {
+		t.Helper()
+		if err := store.PutPendingOperation(ctx, PendingOperation{
+			ID:                id,
+			UserID:            "user_1",
+			BaseID:            "app123",
+			Status:            "executing",
+			OperationType:     "record_mutation",
+			PayloadCiphertext: []byte("payload"),
+			CreatedAt:         time.Now().Add(-2 * time.Hour).UTC(),
+			ExpiresAt:         expiresAt,
+		}); err != nil {
+			t.Fatalf("PutPendingOperation(%s) returned error: %v", id, err)
+		}
+	}
+
+	put("op_stale", time.Now().Add(-time.Hour).UTC())
+	put("op_fresh", time.Now().Add(10*time.Minute).UTC())
+
+	recovered, err := store.RecoverStaleExecutingOperations(ctx, time.Now().Add(-15*time.Minute).UTC())
+	if err != nil {
+		t.Fatalf("RecoverStaleExecutingOperations() returned error: %v", err)
+	}
+	if recovered != 1 {
+		t.Fatalf("recovered = %d, want 1", recovered)
+	}
+
+	stale, err := store.GetPendingOperation(ctx, "op_stale")
+	if err != nil {
+		t.Fatalf("GetPendingOperation(op_stale) returned error: %v", err)
+	}
+	if stale.Status != "failed" || stale.Error == nil || *stale.Error == "" || stale.ResolvedAt == nil {
+		t.Fatalf("expected stale executing op to be failed with a note, got %#v", stale)
+	}
+
+	fresh, err := store.GetPendingOperation(ctx, "op_fresh")
+	if err != nil {
+		t.Fatalf("GetPendingOperation(op_fresh) returned error: %v", err)
+	}
+	if fresh.Status != "executing" {
+		t.Fatalf("expected fresh executing op to be untouched, got %#v", fresh)
+	}
+}

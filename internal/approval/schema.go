@@ -16,6 +16,18 @@ import (
 // whole prepare. On timeout the old description is simply left blank.
 const schemaMetaFetchTimeout = 4 * time.Second
 
+// executeCriticalTimeout bounds the detached execute-and-record critical
+// section of an approved operation. A batch of Airtable writes can take a
+// while, so the cap is generous — it exists so the detached context cannot
+// hang forever.
+const executeCriticalTimeout = 5 * time.Minute
+
+// staleExecutingWindow is how far past an operation's expires_at the expiry
+// loop waits before reaping an `executing` row as crashed. It must stay
+// comfortably larger than executeCriticalTimeout so an in-flight execution
+// is never reaped.
+const staleExecutingWindow = 15 * time.Minute
+
 const (
 	operationTypeRecord = "record_mutation"
 	operationTypeSchema = "schema_mutation"
@@ -402,7 +414,14 @@ func (s *Service) approveSchemaMutation(ctx context.Context, operation db.Pendin
 		return OperationView{}, err
 	}
 
-	result, status, errText := s.executeSchema(ctx, operation.UserID, operation.ID, payload)
+	// This operation now owns the `executing` state. Run the Airtable schema
+	// writes and the terminal status write under a detached, bounded context
+	// so a client disconnect cannot abort the mutation mid-flight or strand
+	// the operation in `executing`.
+	execCtx, cancelExec := context.WithTimeout(context.WithoutCancel(ctx), executeCriticalTimeout)
+	defer cancelExec()
+
+	result, status, errText := s.executeSchema(execCtx, operation.UserID, operation.ID, payload)
 	resultCiphertext, err := s.encryptJSON(result)
 	if err != nil {
 		return OperationView{}, err
@@ -413,7 +432,7 @@ func (s *Service) approveSchemaMutation(ctx context.Context, operation db.Pendin
 	if errText != "" {
 		errorPtr = &errText
 	}
-	if err := s.store.UpdatePendingOperationStatus(ctx, operation.ID, status, resultCiphertext, errorPtr, &resolvedAt); err != nil {
+	if err := s.store.UpdatePendingOperationStatus(execCtx, operation.ID, status, resultCiphertext, errorPtr, &resolvedAt); err != nil {
 		return OperationView{}, err
 	}
 

@@ -14,6 +14,12 @@ import (
 
 const defaultRefreshBefore = 10 * time.Minute
 
+// refreshCriticalTimeout bounds the detached refresh-and-persist critical
+// section. Airtable refresh tokens are single-use: once Refresh is called,
+// the rotated token must be persisted even if the requesting client
+// disconnects, or the user's whole auth chain dies.
+const refreshCriticalTimeout = 30 * time.Second
+
 type ReauthorizationRequiredError struct{}
 
 func (ReauthorizationRequiredError) Error() string {
@@ -162,11 +168,17 @@ func (m *TokenManager) refreshNow(ctx context.Context, userID string) (string, e
 		return "", fmt.Errorf("decrypt airtable refresh token: %w", err)
 	}
 
-	refreshed, err := m.airtable.Refresh(ctx, string(refreshPlaintext))
+	// From here on the operation must not be cancellable by the caller: the
+	// refresh consumes the single-use token, so the follow-up persistence
+	// (or reauth marking) has to complete even on client disconnect.
+	opCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), refreshCriticalTimeout)
+	defer cancel()
+
+	refreshed, err := m.airtable.Refresh(opCtx, string(refreshPlaintext))
 	if err != nil {
 		if IsOAuthError(err, "invalid_grant") {
 			requiredAt := m.now().UTC()
-			if markErr := m.store.MarkAirtableTokenReauthRequired(ctx, userID, requiredAt); markErr != nil {
+			if markErr := m.store.MarkAirtableTokenReauthRequired(opCtx, userID, requiredAt); markErr != nil {
 				logx.Event(ctx, "oauth_token_manager", "oauth.airtable_token.refresh_failed",
 					"user_id", userID,
 					"error_kind", logx.ErrorKind(markErr),
@@ -229,7 +241,7 @@ func (m *TokenManager) refreshNow(ctx context.Context, userID string) (string, e
 		scopes = record.Scopes
 	}
 
-	if err := m.store.PutAirtableToken(ctx, db.AirtableTokenRecord{
+	if err := m.store.PutAirtableToken(opCtx, db.AirtableTokenRecord{
 		UserID:                 userID,
 		AccessTokenCiphertext:  accessCiphertext,
 		RefreshTokenCiphertext: refreshCiphertext,

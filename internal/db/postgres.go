@@ -553,6 +553,24 @@ func (s *Store) TransitionPendingOperationStatus(ctx context.Context, id, fromSt
 	return commandTag.RowsAffected() == 1, nil
 }
 
+// RecoverStaleExecutingOperations marks operations stuck in 'executing' past
+// the cutoff as 'failed' with a recovery note. A row only enters 'executing'
+// before its expires_at (approval rejects expired operations), and execution
+// itself is time-bounded — so a row whose expires_at is older than the cutoff
+// belongs to a process that died mid-flight. Returns the number recovered.
+func (s *Store) RecoverStaleExecutingOperations(ctx context.Context, cutoff time.Time) (int64, error) {
+	note := "operation interrupted before completion; recovered by sweep"
+	commandTag, err := s.pool.Exec(ctx, `
+		UPDATE pending_operations
+		SET status = 'failed', error = $2, resolved_at = NOW()
+		WHERE status = 'executing' AND expires_at < $1
+	`, cutoff, note)
+	if err != nil {
+		return 0, fmt.Errorf("recover stale executing operations: %w", err)
+	}
+	return commandTag.RowsAffected(), nil
+}
+
 func (s *Store) ExpirePendingOperations(ctx context.Context, now time.Time) (int64, error) {
 	commandTag, err := s.pool.Exec(ctx, `
 		UPDATE pending_operations
