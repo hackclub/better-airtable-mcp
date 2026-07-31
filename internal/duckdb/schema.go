@@ -98,23 +98,29 @@ func SanitizeFieldIdentifiers(names []string) []SanitizedName {
 
 func sanitizeIdentifiers(names []string, reserved map[string]string) []SanitizedName {
 	results := make([]SanitizedName, 0, len(names))
-	seen := make(map[string]int, len(names))
+	used := make(map[string]struct{}, len(names))
 
 	for _, name := range names {
 		base := SanitizeIdentifier(name)
-		sanitized := base
 		if replacement, ok := reserved[base]; ok {
-			sanitized = replacement
+			base = replacement
 		}
 
-		seen[sanitized]++
-		if seen[sanitized] > 1 {
-			sanitized = fmt.Sprintf("%s_%d", strings.TrimRight(sanitized, "_"), seen[sanitized])
+		// Bump the suffix until the candidate is free of every name already
+		// emitted — including previously *generated* suffixed names, so an
+		// input whose base equals an earlier "<name>_2" cannot collide.
+		candidate := base
+		for i := 2; ; i++ {
+			if _, taken := used[candidate]; !taken {
+				break
+			}
+			candidate = fmt.Sprintf("%s_%d", strings.TrimRight(base, "_"), i)
 		}
 
+		used[candidate] = struct{}{}
 		results = append(results, SanitizedName{
 			Original:  name,
-			Sanitized: sanitized,
+			Sanitized: candidate,
 		})
 	}
 

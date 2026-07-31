@@ -63,3 +63,32 @@ func TestAirtableTypeToDuckDBType(t *testing.T) {
 		t.Fatal("expected button fields to be omitted")
 	}
 }
+
+func TestSanitizeIdentifiersAvoidsGeneratedNameCollision(t *testing.T) {
+	results := SanitizeIdentifiers([]string{"a b", "a-b", "a_b_2"})
+	want := []string{"a_b", "a_b_2", "a_b_2_2"}
+	for i, result := range results {
+		if result.Sanitized != want[i] {
+			t.Fatalf("results[%d].Sanitized = %q, want %q (all: %#v)", i, result.Sanitized, want[i], results)
+		}
+	}
+}
+
+func TestSanitizeIdentifiersAlwaysUnique(t *testing.T) {
+	testCases := [][]string{
+		{"x", "x", "x_2", "x_2"},
+		{"a b", "a-b", "a_b_2", "a_b"},
+		{"id", "ID", "_airtable_id", "id_2"},
+		{"t", "t_", "t__", "t_2"},
+	}
+	for _, names := range testCases {
+		results := SanitizeIdentifiers(names)
+		unique := make(map[string]struct{}, len(results))
+		for _, result := range results {
+			unique[result.Sanitized] = struct{}{}
+		}
+		if len(unique) != len(names) {
+			t.Fatalf("SanitizeIdentifiers(%q) produced duplicates: %#v", names, results)
+		}
+	}
+}
