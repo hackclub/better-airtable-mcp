@@ -141,7 +141,9 @@ func TestManagerRemovesDuckDBFileAfterTTLExpiry(t *testing.T) {
 	defer server.Close()
 
 	service := NewService(NewHTTPClient(server.URL, server.Client()), t.TempDir())
-	manager := NewManager(service, nil, staticTokenSource{}, time.Hour, 400*time.Millisecond)
+	// The TTL must comfortably outlast EnsureBaseReady on a slow CI runner,
+	// or the file is reaped before the existence assertion below.
+	manager := NewManager(service, nil, staticTokenSource{}, time.Hour, 2*time.Second)
 
 	base, err := manager.EnsureBaseReady(context.Background(), "user_1", "Project Tracker")
 	if err != nil {
@@ -153,7 +155,7 @@ func TestManagerRemovesDuckDBFileAfterTTLExpiry(t *testing.T) {
 		t.Fatalf("expected DuckDB file to exist: %v", err)
 	}
 
-	deadline := time.Now().Add(3 * time.Second)
+	deadline := time.Now().Add(6 * time.Second)
 	for time.Now().Before(deadline) {
 		if _, err := os.Stat(dbPath); os.IsNotExist(err) {
 			return
