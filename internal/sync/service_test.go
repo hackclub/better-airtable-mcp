@@ -1,7 +1,10 @@
 package syncer
 
 import (
+	"context"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestBuildSyncPlansDisambiguatesDuplicateFieldNames(t *testing.T) {
@@ -73,5 +76,68 @@ func TestBuildSyncPlansKeepsSanitizedIndexAlignedAcrossOmittedFields(t *testing.
 		if got := field.DuckDBColumnName; got != want[field.AirtableFieldID] {
 			t.Fatalf("field %s: want column %q, got %q", field.AirtableFieldID, want[field.AirtableFieldID], got)
 		}
+	}
+}
+
+type countingBasesClient struct {
+	listBasesCalls atomic.Int32
+	bases          []Base
+}
+
+func (c *countingBasesClient) ListBases(ctx context.Context, accessToken string) ([]Base, error) {
+	c.listBasesCalls.Add(1)
+	return c.bases, nil
+}
+
+func (c *countingBasesClient) GetBaseSchema(ctx context.Context, accessToken, baseID string) ([]Table, error) {
+	return nil, nil
+}
+
+func (c *countingBasesClient) ListRecordsPage(ctx context.Context, accessToken, baseID, tableID string, options ListRecordsPageOptions) (ListRecordsPageResult, error) {
+	return ListRecordsPageResult{}, nil
+}
+
+func (c *countingBasesClient) ListRecords(ctx context.Context, accessToken, baseID, tableID string) ([]Record, error) {
+	return nil, nil
+}
+
+func TestResolveBaseCachesBaseListPerToken(t *testing.T) {
+	client := &countingBasesClient{bases: []Base{
+		{ID: "appProjects", Name: "Project Tracker", PermissionLevel: "create"},
+		{ID: "appOther", Name: "Other Base", PermissionLevel: "read"},
+	}}
+	service := NewService(client, t.TempDir())
+
+	current := time.Now()
+	service.now = func() time.Time { return current }
+
+	for _, ref := range []string{"appProjects", "Project Tracker", "project"} {
+		base, err := service.resolveBase(context.Background(), "token-a", ref)
+		if err != nil {
+			t.Fatalf("resolveBase(%q) returned error: %v", ref, err)
+		}
+		if base.ID != "appProjects" {
+			t.Fatalf("resolveBase(%q) = %#v, want appProjects", ref, base)
+		}
+	}
+	if got := client.listBasesCalls.Load(); got != 1 {
+		t.Fatalf("expected one ListBases call within the cache TTL, got %d", got)
+	}
+
+	// A different token must not share the cache entry.
+	if _, err := service.resolveBase(context.Background(), "token-b", "appProjects"); err != nil {
+		t.Fatalf("resolveBase() with second token returned error: %v", err)
+	}
+	if got := client.listBasesCalls.Load(); got != 2 {
+		t.Fatalf("expected a fresh ListBases call for a new token, got %d", got)
+	}
+
+	// Past the TTL the list is re-fetched.
+	current = current.Add(baseListCacheTTL + time.Second)
+	if _, err := service.resolveBase(context.Background(), "token-a", "appProjects"); err != nil {
+		t.Fatalf("resolveBase() after TTL returned error: %v", err)
+	}
+	if got := client.listBasesCalls.Load(); got != 3 {
+		t.Fatalf("expected a refreshed ListBases call after the TTL, got %d", got)
 	}
 }

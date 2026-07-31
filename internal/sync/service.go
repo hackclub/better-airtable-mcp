@@ -3,6 +3,7 @@ package syncer
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -18,9 +19,22 @@ type Service struct {
 	client  Client
 	dataDir string
 
-	mu        sync.Mutex
-	syncLocks map[string]*sync.Mutex
-	duckLocks map[string]*sync.RWMutex
+	mu         sync.Mutex
+	syncLocks  map[string]*sync.Mutex
+	duckLocks  map[string]*sync.RWMutex
+	basesCache map[string]basesCacheEntry
+	now        func() time.Time
+}
+
+// baseListCacheTTL bounds how long a fetched base list is reused for base
+// resolution. Short enough that access changes surface quickly, long enough
+// to cover a burst of closely-spaced requests without re-fetching the
+// paginated meta API each time.
+const baseListCacheTTL = 15 * time.Second
+
+type basesCacheEntry struct {
+	bases     []Base
+	fetchedAt time.Time
 }
 
 type SyncResult struct {
@@ -77,11 +91,44 @@ type syncTableRuntime struct {
 
 func NewService(client Client, dataDir string) *Service {
 	return &Service{
-		client:    client,
-		dataDir:   dataDir,
-		syncLocks: make(map[string]*sync.Mutex),
-		duckLocks: make(map[string]*sync.RWMutex),
+		client:     client,
+		dataDir:    dataDir,
+		syncLocks:  make(map[string]*sync.Mutex),
+		duckLocks:  make(map[string]*sync.RWMutex),
+		basesCache: make(map[string]basesCacheEntry),
+		now:        time.Now,
 	}
+}
+
+// listBasesCached returns the caller's base list, reusing a recent fetch for
+// the same access token. The cache key is a hash of the token (never the raw
+// token), entries are per-token so one user's bases can never serve another,
+// and stale entries are pruned on every access.
+func (s *Service) listBasesCached(ctx context.Context, accessToken string) ([]Base, error) {
+	key := fmt.Sprintf("%x", sha256.Sum256([]byte(accessToken)))
+
+	s.mu.Lock()
+	now := s.now()
+	for cacheKey, entry := range s.basesCache {
+		if now.Sub(entry.fetchedAt) > baseListCacheTTL {
+			delete(s.basesCache, cacheKey)
+		}
+	}
+	entry, ok := s.basesCache[key]
+	s.mu.Unlock()
+	if ok {
+		return entry.bases, nil
+	}
+
+	bases, err := s.client.ListBases(ctx, accessToken)
+	if err != nil {
+		return nil, err
+	}
+
+	s.mu.Lock()
+	s.basesCache[key] = basesCacheEntry{bases: bases, fetchedAt: s.now()}
+	s.mu.Unlock()
+	return bases, nil
 }
 
 func (s *Service) SearchBases(ctx context.Context, accessToken, query string) ([]Base, error) {
@@ -122,9 +169,16 @@ func (s *Service) ListSchema(ctx context.Context, accessToken, baseRef string) (
 		return duckdb.BaseSchema{}, err
 	}
 
-	unlock := s.lockDuckRead(base.ID)
+	return s.ListResolvedSchema(ctx, base.ID, base.Name)
+}
+
+// ListResolvedSchema reads the schema of an already-resolved, already-synced
+// base. Callers must have verified access and sync state first — no
+// resolution, authorization, or sync is performed here.
+func (s *Service) ListResolvedSchema(ctx context.Context, baseID, baseName string) (duckdb.BaseSchema, error) {
+	unlock := s.lockDuckRead(baseID)
 	defer unlock()
-	return duckdb.ReadSchema(ctx, s.basePath(base.ID), base.ID, base.Name)
+	return duckdb.ReadSchema(ctx, s.basePath(baseID), baseID, baseName)
 }
 
 func (s *Service) QueryBase(ctx context.Context, accessToken, baseRef, query string) (duckdb.QueryResult, error) {
@@ -133,9 +187,17 @@ func (s *Service) QueryBase(ctx context.Context, accessToken, baseRef, query str
 		return duckdb.QueryResult{}, err
 	}
 
-	unlock := s.lockDuckRead(base.ID)
+	return s.QueryResolvedBase(ctx, base.ID, query)
+}
+
+// QueryResolvedBase runs a read against an already-resolved, already-synced
+// base ID. Callers must have verified access and sync state first (e.g. via
+// the sync manager's EnsureBaseReadable) — no resolution, authorization, or
+// sync is performed here.
+func (s *Service) QueryResolvedBase(ctx context.Context, baseID, query string) (duckdb.QueryResult, error) {
+	unlock := s.lockDuckRead(baseID)
 	defer unlock()
-	return duckdb.Query(ctx, s.basePath(base.ID), query)
+	return duckdb.Query(ctx, s.basePath(baseID), query)
 }
 
 func (s *Service) ReadTableRowsByIDs(ctx context.Context, baseID, tableName string, ids []string) ([]map[string]any, error) {
@@ -167,7 +229,7 @@ func (s *Service) resolveBase(ctx context.Context, accessToken, baseRef string) 
 		return Base{}, fmt.Errorf("base reference is required")
 	}
 
-	bases, err := s.client.ListBases(ctx, accessToken)
+	bases, err := s.listBasesCached(ctx, accessToken)
 	if err != nil {
 		return Base{}, err
 	}

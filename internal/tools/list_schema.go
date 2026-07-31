@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/hackclub/better-airtable-mcp/internal/duckdb"
 	"github.com/hackclub/better-airtable-mcp/internal/mcp"
 )
 
@@ -63,7 +64,8 @@ func (t ListSchemaTool) Call(ctx context.Context, raw json.RawMessage) (mcp.Tool
 		return mcp.ToolCallResult{}, err
 	}
 
-	var baseID string
+	var baseID, baseName string
+	var baseResolved bool
 	var syncPayload map[string]any
 	var syncStatus *formattedSyncStatus
 	if t.runtime.SyncManager != nil {
@@ -73,6 +75,8 @@ func (t ListSchemaTool) Call(ctx context.Context, raw json.RawMessage) (mcp.Tool
 			return mcp.ToolCallResult{}, err
 		}
 		baseID = base.ID
+		baseName = base.Name
+		baseResolved = true
 		if status, found := t.runtime.SyncManager.BaseStatus(base.ID); found {
 			syncPayload = syncStatusPayload(status)
 			formatted := formattedSyncStatusFromOperation(status)
@@ -83,16 +87,27 @@ func (t ListSchemaTool) Call(ctx context.Context, raw json.RawMessage) (mcp.Tool
 		baseID = input.Base
 	}
 
-	accessToken, err := t.runtime.AirtableAccessToken(ctx, userID)
-	if err != nil {
-		logToolFailed(ctx, "list_schema", err, "user_id", userID, "base_id", baseID)
-		return mcp.ToolCallResult{}, err
-	}
-
-	schema, err := t.runtime.Syncer.ListSchema(ctx, accessToken, baseID)
-	if err != nil {
-		logToolFailed(ctx, "list_schema", err, "user_id", userID, "base_id", baseID)
-		return mcp.ToolCallResult{}, err
+	var schema duckdb.BaseSchema
+	var err error
+	if baseResolved {
+		// The base was resolved, authorized, and synced above — read the
+		// local schema directly instead of re-resolving it.
+		schema, err = t.runtime.Syncer.ListResolvedSchema(ctx, baseID, baseName)
+		if err != nil {
+			logToolFailed(ctx, "list_schema", err, "user_id", userID, "base_id", baseID)
+			return mcp.ToolCallResult{}, err
+		}
+	} else {
+		accessToken, err := t.runtime.AirtableAccessToken(ctx, userID)
+		if err != nil {
+			logToolFailed(ctx, "list_schema", err, "user_id", userID, "base_id", baseID)
+			return mcp.ToolCallResult{}, err
+		}
+		schema, err = t.runtime.Syncer.ListSchema(ctx, accessToken, baseID)
+		if err != nil {
+			logToolFailed(ctx, "list_schema", err, "user_id", userID, "base_id", baseID)
+			return mcp.ToolCallResult{}, err
+		}
 	}
 
 	tables := make([]map[string]any, 0, len(schema.Tables))

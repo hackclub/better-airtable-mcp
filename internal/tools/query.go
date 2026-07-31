@@ -140,6 +140,7 @@ func (t QueryTool) Call(ctx context.Context, raw json.RawMessage) (mcp.ToolCallR
 	}
 
 	var baseID string
+	var baseResolved bool
 	var syncPayload map[string]any
 	var syncStatus *formattedSyncStatus
 	if t.runtime.SyncManager != nil {
@@ -149,6 +150,7 @@ func (t QueryTool) Call(ctx context.Context, raw json.RawMessage) (mcp.ToolCallR
 			return mcp.ToolCallResult{}, err
 		}
 		baseID = base.ID
+		baseResolved = true
 		if status, found := t.runtime.SyncManager.BaseStatus(base.ID); found {
 			syncPayload = syncStatusPayload(status)
 			formatted := formattedSyncStatusFromOperation(status)
@@ -159,17 +161,31 @@ func (t QueryTool) Call(ctx context.Context, raw json.RawMessage) (mcp.ToolCallR
 		baseID = input.Base
 	}
 
-	accessToken, err := t.runtime.AirtableAccessToken(ctx, userID)
-	if err != nil {
-		logToolFailed(ctx, "query", err, "user_id", userID, "base_id", baseID)
-		return mcp.ToolCallResult{}, err
+	var accessToken string
+	if !baseResolved {
+		// Without a sync manager the statement loop resolves (and thereby
+		// authorizes) the base itself, which needs the Airtable token. When
+		// the sync manager already resolved the base, the loop reads the
+		// local DuckDB file directly and no token is required.
+		accessToken, err = t.runtime.AirtableAccessToken(ctx, userID)
+		if err != nil {
+			logToolFailed(ctx, "query", err, "user_id", userID, "base_id", baseID)
+			return mcp.ToolCallResult{}, err
+		}
 	}
 
 	payloadResults := make([]map[string]any, 0, len(normalizedQueries))
 	formattedResults := make([]formattedQueryResult, 0, len(normalizedQueries))
 
 	for index, query := range normalizedQueries {
-		result, err := t.runtime.Syncer.QueryBase(ctx, accessToken, baseID, query.Normalized.ExecutionSQL)
+		var result duckdb.QueryResult
+		if baseResolved {
+			// The base was resolved, authorized, and synced once for this
+			// request — do not re-resolve it per statement.
+			result, err = t.runtime.Syncer.QueryResolvedBase(ctx, baseID, query.Normalized.ExecutionSQL)
+		} else {
+			result, err = t.runtime.Syncer.QueryBase(ctx, accessToken, baseID, query.Normalized.ExecutionSQL)
+		}
 		if err != nil {
 			wrapped := wrapQueryError(index, len(normalizedQueries), err)
 			logToolFailed(ctx, "query", wrapped, "user_id", userID, "base_id", baseID, "query_index", index)
