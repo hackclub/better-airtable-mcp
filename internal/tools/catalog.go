@@ -1,3 +1,5 @@
+// Package tools implements the MCP tool surface: list_bases, list_schema,
+// query, sync, mutate, manage_schema, and check_operation.
 package tools
 
 import (

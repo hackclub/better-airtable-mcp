@@ -602,9 +602,10 @@ func (w *workerState) handleProgress(progress SyncProgress) {
 		startedAt := progress.SyncStartedAt.UTC()
 		w.lastStartedAt = startedAt
 	}
-	if progress.ReadSnapshot == "complete" {
+	switch progress.ReadSnapshot {
+	case "complete":
 		w.readSnapshotComplete = true
-	} else if progress.ReadSnapshot == "partial" {
+	case "partial":
 		w.readSnapshotComplete = false
 		w.recordsVisible = progress.RecordsSyncedThisRun
 	}

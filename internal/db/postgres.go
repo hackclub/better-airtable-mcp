@@ -1,3 +1,5 @@
+// Package db implements the Postgres-backed store for users, tokens,
+// sync state, and pending operations.
 package db
 
 import (

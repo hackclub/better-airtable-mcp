@@ -257,10 +257,7 @@ func (c *HTTPClient) ListRecordsPage(ctx context.Context, accessToken, baseID, t
 		return ListRecordsPageResult{}, err
 	}
 
-	return ListRecordsPageResult{
-		Records: payload.Records,
-		Offset:  payload.Offset,
-	}, nil
+	return ListRecordsPageResult(payload), nil
 }
 
 func (c *HTTPClient) CreateRecords(ctx context.Context, accessToken, baseID, tableID string, records []MutationRecord) ([]Record, error) {

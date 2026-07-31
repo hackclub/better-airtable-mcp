@@ -1,3 +1,4 @@
+// Package syncer runs the continuous Airtable-to-DuckDB sync workers.
 package syncer
 
 import (

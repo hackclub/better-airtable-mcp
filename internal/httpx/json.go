@@ -1,3 +1,4 @@
+// Package httpx provides small shared HTTP response helpers.
 package httpx
 
 import (

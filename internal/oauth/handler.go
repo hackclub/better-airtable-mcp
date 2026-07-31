@@ -1,3 +1,5 @@
+// Package oauth implements the OAuth provider for MCP clients, chained
+// to Airtable OAuth for upstream access tokens.
 package oauth
 
 import (

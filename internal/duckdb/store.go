@@ -1,3 +1,4 @@
+// Package duckdb manages the per-base DuckDB cache files that serve reads.
 package duckdb
 
 import (

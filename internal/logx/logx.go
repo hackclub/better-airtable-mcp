@@ -1,3 +1,4 @@
+// Package logx provides structured JSON logging with secret redaction.
 package logx
 
 import (

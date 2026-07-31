@@ -1,3 +1,4 @@
+// Package landing serves the public landing page.
 package landing
 
 import (

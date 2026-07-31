@@ -1,3 +1,5 @@
+// Package approval implements the human approval flow for mutations:
+// pending-operation storage, execution on approval, and the embedded review SPA.
 package approval
 
 import (
@@ -81,19 +83,19 @@ func (e RecordsNotSyncedError) Error() string {
 }
 
 type OperationView struct {
-	OperationID             string             `json:"operation_id"`
-	Status                  string             `json:"status"`
-	ApprovalURL             string             `json:"approval_url"`
-	BaseID                  string             `json:"base_id"`
-	BaseName                string             `json:"base_name"`
-	MCPSessionID            string             `json:"mcp_session_id,omitempty"`
-	MCPClientID             string             `json:"mcp_client_id,omitempty"`
-	MCPClientName           string             `json:"mcp_client_name,omitempty"`
-	Summary                 string             `json:"summary"`
-	CreatedAt               time.Time          `json:"created_at"`
-	ExpiresAt               time.Time          `json:"expires_at"`
-	ResolvedAt              *time.Time         `json:"resolved_at,omitempty"`
-	LastSyncedAt            time.Time          `json:"last_synced_at"`
+	OperationID             string                     `json:"operation_id"`
+	Status                  string                     `json:"status"`
+	ApprovalURL             string                     `json:"approval_url"`
+	BaseID                  string                     `json:"base_id"`
+	BaseName                string                     `json:"base_name"`
+	MCPSessionID            string                     `json:"mcp_session_id,omitempty"`
+	MCPClientID             string                     `json:"mcp_client_id,omitempty"`
+	MCPClientName           string                     `json:"mcp_client_name,omitempty"`
+	Summary                 string                     `json:"summary"`
+	CreatedAt               time.Time                  `json:"created_at"`
+	ExpiresAt               time.Time                  `json:"expires_at"`
+	ResolvedAt              *time.Time                 `json:"resolved_at,omitempty"`
+	LastSyncedAt            time.Time                  `json:"last_synced_at"`
 	OperationType           string                     `json:"operation_type,omitempty"`
 	Operations              []OperationPreview         `json:"operations"`
 	LinkedRecords           map[string]LinkedRecordRef `json:"linked_records,omitempty"`
@@ -148,11 +150,11 @@ type ExecutionResult struct {
 }
 
 type pendingPayload struct {
-	BaseID        string                    `json:"base_id"`
-	BaseName      string                    `json:"base_name"`
-	MCPSessionID  string                    `json:"mcp_session_id,omitempty"`
-	MCPClientID   string                    `json:"mcp_client_id,omitempty"`
-	MCPClientName string                    `json:"mcp_client_name,omitempty"`
+	BaseID        string                     `json:"base_id"`
+	BaseName      string                     `json:"base_name"`
+	MCPSessionID  string                     `json:"mcp_session_id,omitempty"`
+	MCPClientID   string                     `json:"mcp_client_id,omitempty"`
+	MCPClientName string                     `json:"mcp_client_name,omitempty"`
 	LastSyncedAt  time.Time                  `json:"last_synced_at"`
 	Summary       string                     `json:"summary"`
 	Operations    []pendingPayloadOperation  `json:"operations"`

@@ -1,0 +1,29 @@
+version: "2"
+linters:
+  enable:
+    - errcheck
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+  settings:
+    errcheck:
+      # Deferred/idiomatic Close calls whose errors are not actionable.
+      exclude-functions:
+        - (io.ReadCloser).Close
+        - (*database/sql.DB).Close
+        - (*database/sql.Rows).Close
+        - (*database/sql.Stmt).Close
+    staticcheck:
+      checks:
+        - all
+        # De Morgan rewrites of character-range checks hurt readability.
+        - -QF1001
+  exclusions:
+    rules:
+      - path: _test\.go
+        linters:
+          - errcheck
+run:
+  build-tags:
+    - integration

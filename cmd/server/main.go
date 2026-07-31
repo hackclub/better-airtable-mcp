@@ -1,3 +1,4 @@
+// Command server runs the better-airtable-mcp HTTP server.
 package main
 
 import (

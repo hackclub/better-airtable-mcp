@@ -1,3 +1,5 @@
+// Package mcp implements the MCP JSON-RPC endpoint: session lifecycle,
+// protocol negotiation, and dispatch to the registered tools.
 package mcp
 
 import (

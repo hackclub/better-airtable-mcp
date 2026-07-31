@@ -1,3 +1,4 @@
+// Package cryptoutil provides authenticated encryption for tokens at rest.
 package cryptoutil
 
 import (
