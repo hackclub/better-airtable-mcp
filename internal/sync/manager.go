@@ -64,6 +64,7 @@ type workerState struct {
 	syncTokenUserID      string
 	inProgress           bool
 	syncRequested        bool
+	rerunRequested       bool // a sync was requested while one was in progress; run once more after it completes
 	readable             bool
 	readSnapshotComplete bool
 	needsInitialRefresh  bool
@@ -228,7 +229,7 @@ func (m *Manager) TriggerSync(ctx context.Context, userID, baseID string) error 
 	if err != nil {
 		return err
 	}
-	worker.requestImmediateSync()
+	worker.requestFollowUpSync()
 	return nil
 }
 
@@ -426,6 +427,10 @@ func (w *workerState) run() {
 
 		w.mu.Lock()
 		w.inProgress = false
+		if w.rerunRequested {
+			w.rerunRequested = false
+			w.syncRequested = true
+		}
 		w.lastCompletedAt = &completedAt
 		if err != nil {
 			w.lastError = err.Error()
@@ -698,6 +703,22 @@ func (w *workerState) restoreFromState(state db.SyncState) {
 func (w *workerState) requestImmediateSync() {
 	w.mu.Lock()
 	if !w.inProgress {
+		w.syncRequested = true
+	}
+	w.mu.Unlock()
+	w.notify()
+}
+
+// requestFollowUpSync is requestImmediateSync for callers that just changed
+// data in Airtable. An in-flight sync started before the change, so it may
+// not capture it; instead of dropping the request, run once more after the
+// current sync completes. Multiple requests during one in-flight sync still
+// coalesce into a single follow-up run.
+func (w *workerState) requestFollowUpSync() {
+	w.mu.Lock()
+	if w.inProgress {
+		w.rerunRequested = true
+	} else {
 		w.syncRequested = true
 	}
 	w.mu.Unlock()

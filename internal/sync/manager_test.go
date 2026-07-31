@@ -484,3 +484,78 @@ func writeManagerJSON(t *testing.T, w http.ResponseWriter, payload any) {
 		t.Fatalf("json.NewEncoder().Encode() returned error: %v", err)
 	}
 }
+
+func TestTriggerSyncDuringInFlightSyncRunsFollowUpSync(t *testing.T) {
+	blockRecords := make(chan struct{})
+	releaseRecords := make(chan struct{})
+	var recordCalls atomic.Int32
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v0/meta/bases":
+			writeManagerJSON(t, w, map[string]any{
+				"bases": []map[string]any{{"id": "appProjects", "name": "Project Tracker", "permissionLevel": "create"}},
+			})
+		case "/v0/meta/bases/appProjects/tables":
+			writeManagerJSON(t, w, map[string]any{
+				"tables": []map[string]any{
+					{
+						"id":   "tblProjects",
+						"name": "Projects",
+						"fields": []map[string]any{
+							{"id": "fldName", "name": "Name", "type": "singleLineText"},
+						},
+					},
+				},
+			})
+		case "/v0/appProjects/tblProjects":
+			call := recordCalls.Add(1)
+			if call == 1 {
+				select {
+				case blockRecords <- struct{}{}:
+				default:
+				}
+				<-releaseRecords
+			}
+			writeManagerJSON(t, w, map[string]any{
+				"records": []map[string]any{
+					{"id": "rec1", "createdTime": "2026-04-01T12:00:00Z", "fields": map[string]any{"Name": "A"}},
+				},
+			})
+		default:
+			t.Fatalf("unexpected path %q", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	service := NewService(NewHTTPClient(server.URL, server.Client()), t.TempDir())
+	manager := NewManager(service, nil, staticTokenSource{}, time.Minute, time.Minute)
+
+	if _, err := manager.RequestSync(context.Background(), "user_1", "Project Tracker"); err != nil {
+		t.Fatalf("RequestSync() returned error: %v", err)
+	}
+
+	select {
+	case <-blockRecords:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for first sync to start record fetch")
+	}
+
+	// A mutation lands while the first sync is still fetching records.
+	if err := manager.TriggerSync(context.Background(), "user_1", "appProjects"); err != nil {
+		t.Fatalf("TriggerSync() returned error: %v", err)
+	}
+
+	close(releaseRecords)
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if recordCalls.Load() >= 2 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if got := recordCalls.Load(); got != 2 {
+		t.Fatalf("expected the post-mutation request to run a follow-up sync (2 record fetches), got %d", got)
+	}
+}
