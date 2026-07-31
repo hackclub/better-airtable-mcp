@@ -371,6 +371,11 @@ func (s *Service) runSync(ctx context.Context, accessToken string, base Base, pr
 		})
 	}
 
+	// In staging mode the run writes to a private file no reader opens, so
+	// one write connection is reused for the whole run instead of reopening
+	// the file per page. In active-file mode each write must open and close
+	// under the write lock so readers can interleave between pages.
+	var session *duckdb.WriteSession
 	var unlockDuck func()
 	if !useStaging {
 		unlockDuck = s.lockDuckWrite(base.ID)
@@ -380,7 +385,17 @@ func (s *Service) runSync(ctx context.Context, accessToken string, base Base, pr
 		}
 		unlockDuck()
 	} else {
-		if err := duckdb.InitializeSnapshot(ctx, targetPath, init); err != nil {
+		var err error
+		session, err = duckdb.OpenWriteSession(targetPath)
+		if err != nil {
+			return fail(err)
+		}
+		defer func() {
+			if session != nil {
+				_ = session.Close()
+			}
+		}()
+		if err := session.InitializeSnapshot(ctx, init); err != nil {
 			return fail(err)
 		}
 	}
@@ -513,12 +528,11 @@ func (s *Service) runSync(ctx context.Context, accessToken string, base Base, pr
 				RecordsSyncedThisRun: currentInfo.RecordsSyncedThisRun,
 			}
 
-			writePath := targetPath
-			if !useStaging {
+			if useStaging {
+				err = session.ApplyTablePage(ctx, runtime.Plan.Table, result.Records, tableState, syncInfo)
+			} else {
 				unlockDuck = s.lockDuckWrite(base.ID)
-			}
-			err = duckdb.ApplyTablePage(ctx, writePath, runtime.Plan.Table, result.Records, tableState, syncInfo)
-			if !useStaging {
+				err = duckdb.ApplyTablePage(ctx, targetPath, runtime.Plan.Table, result.Records, tableState, syncInfo)
 				unlockDuck()
 			}
 			if err != nil {
@@ -568,9 +582,17 @@ func (s *Service) runSync(ctx context.Context, accessToken string, base Base, pr
 			return fail(err)
 		}
 	} else {
-		if err := duckdb.FinalizeSnapshot(ctx, targetPath, finalInfo); err != nil {
+		if err := session.FinalizeSnapshot(ctx, finalInfo); err != nil {
 			_ = os.Remove(targetPath)
 			return fail(err)
+		}
+		// Release the write handle (and DuckDB's file lock) before the
+		// staging file is renamed over the active one.
+		closeErr := session.Close()
+		session = nil
+		if closeErr != nil {
+			_ = os.Remove(targetPath)
+			return fail(fmt.Errorf("close staging write session: %w", closeErr))
 		}
 		unlockDuck = s.lockDuckWrite(base.ID)
 		err = swapDatabaseFiles(targetPath, activePath)

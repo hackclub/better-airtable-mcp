@@ -181,3 +181,97 @@ func assertSettingValue(t *testing.T, db *sql.DB, settingName, expected string) 
 		t.Fatalf("expected DuckDB setting %q=%q, got %q", settingName, expected, value)
 	}
 }
+
+func TestWriteSessionReusesOneConnectionAcrossRun(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "staging.db")
+	ctx := context.Background()
+
+	table := TableSnapshot{
+		AirtableTableID: "tblProjects",
+		OriginalName:    "Projects",
+		DuckDBTableName: "projects",
+		Fields: []FieldSnapshot{
+			{
+				AirtableFieldID:   "fldName",
+				OriginalFieldName: "Name",
+				DuckDBColumnName:  "name",
+				AirtableFieldType: "singleLineText",
+				DuckDBType:        "VARCHAR",
+			},
+		},
+	}
+
+	session, err := OpenWriteSession(dbPath)
+	if err != nil {
+		t.Fatalf("OpenWriteSession() returned error: %v", err)
+	}
+
+	startedAt := time.Date(2026, 4, 1, 12, 0, 0, 0, time.UTC)
+	if err := session.InitializeSnapshot(ctx, SnapshotInit{
+		BaseID:        "app123",
+		BaseName:      "Test Base",
+		Tables:        []TableSnapshot{table},
+		SyncStartedAt: startedAt,
+	}); err != nil {
+		t.Fatalf("session.InitializeSnapshot() returned error: %v", err)
+	}
+
+	pages := [][]RecordSnapshot{
+		{
+			{ID: "rec1", CreatedTime: startedAt, Fields: map[string]any{"Name": "First"}},
+			{ID: "rec2", CreatedTime: startedAt, Fields: map[string]any{"Name": "Second"}},
+		},
+		{
+			{ID: "rec3", CreatedTime: startedAt, Fields: map[string]any{"Name": "Third"}},
+		},
+	}
+	var visible int64
+	for index, page := range pages {
+		visible += int64(len(page))
+		if err := session.ApplyTablePage(ctx, table, page, TableSyncState{
+			TableName:          "projects",
+			SyncStatus:         "syncing",
+			VisibleRecordCount: visible,
+			PagesFetched:       int64(index + 1),
+			HasMore:            index+1 < len(pages),
+		}, SyncInfo{
+			SyncStartedAt: startedAt,
+			TotalRecords:  visible,
+			TotalTables:   1,
+			Status:        "syncing",
+			TablesStarted: 1,
+			PagesFetched:  int64(index + 1),
+		}); err != nil {
+			t.Fatalf("session.ApplyTablePage(page %d) returned error: %v", index, err)
+		}
+	}
+
+	completedAt := startedAt.Add(time.Minute)
+	if err := session.FinalizeSnapshot(ctx, SyncInfo{
+		SyncStartedAt:   startedAt,
+		LastSyncedAt:    completedAt,
+		SyncDurationMS:  60000,
+		TotalRecords:    visible,
+		TotalTables:     1,
+		Status:          "completed",
+		TablesStarted:   1,
+		TablesCompleted: 1,
+		PagesFetched:    int64(len(pages)),
+	}); err != nil {
+		t.Fatalf("session.FinalizeSnapshot() returned error: %v", err)
+	}
+	if err := session.Close(); err != nil {
+		t.Fatalf("session.Close() returned error: %v", err)
+	}
+
+	result, err := Query(ctx, dbPath, `SELECT id, name FROM projects ORDER BY id`)
+	if err != nil {
+		t.Fatalf("Query() returned error: %v", err)
+	}
+	if result.RowCount != 3 {
+		t.Fatalf("expected 3 rows from the session-written snapshot, got %d", result.RowCount)
+	}
+	if !result.LastSyncedAt.Equal(completedAt) {
+		t.Fatalf("expected finalized last_synced_at %v, got %v", completedAt, result.LastSyncedAt)
+	}
+}

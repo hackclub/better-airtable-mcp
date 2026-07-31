@@ -196,6 +196,45 @@ func WriteSnapshot(ctx context.Context, path string, snapshot BaseSnapshot) erro
 	return nil
 }
 
+// WriteSession owns a single open READ_WRITE handle so a multi-page sync run
+// can reuse one connection instead of reopening the file per page. The handle
+// takes DuckDB's exclusive file lock for its whole lifetime, so a session is
+// only safe on a file no reader opens while it is held (e.g. a staging file).
+type WriteSession struct {
+	db *sql.DB
+}
+
+func OpenWriteSession(path string) (*WriteSession, error) {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return nil, fmt.Errorf("create duckdb data dir: %w", err)
+	}
+	db, err := openDatabase(path, "READ_WRITE")
+	if err != nil {
+		return nil, err
+	}
+	return &WriteSession{db: db}, nil
+}
+
+func (s *WriteSession) Close() error {
+	return s.db.Close()
+}
+
+func (s *WriteSession) InitializeSnapshot(ctx context.Context, init SnapshotInit) error {
+	return initializeSnapshot(ctx, s.db, init)
+}
+
+func (s *WriteSession) ApplyTablePage(ctx context.Context, table TableSnapshot, records []RecordSnapshot, tableState TableSyncState, info SyncInfo) error {
+	return applyTablePage(ctx, s.db, table, records, tableState, info)
+}
+
+func (s *WriteSession) UpdateSyncInfo(ctx context.Context, info SyncInfo) error {
+	return updateSyncInfo(ctx, s.db, info)
+}
+
+func (s *WriteSession) FinalizeSnapshot(ctx context.Context, info SyncInfo) error {
+	return updateSyncInfo(ctx, s.db, info)
+}
+
 func InitializeSnapshot(ctx context.Context, path string, init SnapshotInit) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return fmt.Errorf("create duckdb data dir: %w", err)
@@ -207,6 +246,10 @@ func InitializeSnapshot(ctx context.Context, path string, init SnapshotInit) err
 	}
 	defer db.Close()
 
+	return initializeSnapshot(ctx, db, init)
+}
+
+func initializeSnapshot(ctx context.Context, db *sql.DB, init SnapshotInit) error {
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin duckdb transaction: %w", err)
@@ -271,6 +314,10 @@ func ApplyTablePage(ctx context.Context, path string, table TableSnapshot, recor
 	}
 	defer db.Close()
 
+	return applyTablePage(ctx, db, table, records, tableState, info)
+}
+
+func applyTablePage(ctx context.Context, db *sql.DB, table TableSnapshot, records []RecordSnapshot, tableState TableSyncState, info SyncInfo) error {
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin duckdb transaction: %w", err)
@@ -307,6 +354,10 @@ func UpdateSyncFailure(ctx context.Context, path string, info SyncInfo) error {
 	}
 	defer db.Close()
 
+	return updateSyncInfo(ctx, db, info)
+}
+
+func updateSyncInfo(ctx context.Context, db *sql.DB, info SyncInfo) error {
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin duckdb transaction: %w", err)
