@@ -1,3 +1,20 @@
 [tools]
 go = "1.25.8"
 node = "25.6.1"
+
+[tasks.verify]
+description = "Run the full frontend + Go verification suite"
+run = [
+  "npm --prefix frontend ci",
+  "npm --prefix frontend test",
+  "npm --prefix frontend run typecheck",
+  "npm --prefix frontend run build",
+  "go vet ./...",
+  "go vet -tags=integration ./...",
+  "go build ./...",
+  "go test -short ./...",
+]
+
+[tasks."test:integration"]
+description = "Run the embedded-Postgres integration test lane (slow, downloads Postgres on first run)"
+run = ["go test -tags=integration ./..."]

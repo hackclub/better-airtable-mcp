@@ -69,7 +69,13 @@ source .env
 set +a
 ```
 
-Run the full test/build workflow and start the server locally:
+Run the full verification suite with one command:
+
+```bash
+mise run verify
+```
+
+Or run the full test/build workflow manually and start the server locally:
 
 ```bash
 mise exec -- npm --prefix frontend test
