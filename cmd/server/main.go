@@ -112,13 +112,19 @@ func main() {
 	middleware := oauth.NewMiddleware(store, cfg.BaseURLString()+"/.well-known/oauth-protected-resource")
 	mux.Handle("/mcp", logx.Route("/mcp", middleware.RequireBearer(mcpHandler)))
 
+	registerLimiter := oauth.NewRequestLimiter(1, 5) // client registration persists rows: strict
+	publicLimiter := oauth.NewRequestLimiter(10, 20) // other unauthenticated endpoints
+	wrapPublic := func(template string, limiter *oauth.RequestLimiter, handler http.HandlerFunc) http.Handler {
+		return logx.Route(template, oauth.PublicRateLimit(limiter, handler))
+	}
+
 	oauthHandler := oauth.NewHandler(cfg, store, cipher, airtableOAuth)
 	mux.Handle("/.well-known/oauth-protected-resource", logx.Route("/.well-known/oauth-protected-resource", http.HandlerFunc(oauthHandler.ProtectedResource)))
 	mux.Handle("/.well-known/oauth-authorization-server", logx.Route("/.well-known/oauth-authorization-server", http.HandlerFunc(oauthHandler.AuthorizationServer)))
-	mux.Handle("/oauth/register", logx.Route("/oauth/register", http.HandlerFunc(oauthHandler.Register)))
-	mux.Handle("/oauth/authorize", logx.Route("/oauth/authorize", http.HandlerFunc(oauthHandler.Authorize)))
-	mux.Handle("/oauth/token", logx.Route("/oauth/token", http.HandlerFunc(oauthHandler.Token)))
-	mux.Handle("/oauth/airtable/callback", logx.Route("/oauth/airtable/callback", http.HandlerFunc(oauthHandler.AirtableCallback)))
+	mux.Handle("/oauth/register", wrapPublic("/oauth/register", registerLimiter, oauthHandler.Register))
+	mux.Handle("/oauth/authorize", wrapPublic("/oauth/authorize", publicLimiter, oauthHandler.Authorize))
+	mux.Handle("/oauth/token", wrapPublic("/oauth/token", publicLimiter, oauthHandler.Token))
+	mux.Handle("/oauth/airtable/callback", wrapPublic("/oauth/airtable/callback", publicLimiter, oauthHandler.AirtableCallback))
 
 	go toolRuntime.Approval.RunExpiryLoop(context.Background(), time.Minute)
 	go tokenManager.RunRefreshLoop(context.Background(), time.Minute)
@@ -126,10 +132,10 @@ func main() {
 	go mcpHandler.RunSessionExpiryLoop(context.Background(), time.Minute)
 
 	approvalHandler := approval.NewHandler(toolRuntime.Approval)
-	mux.Handle("/approve/", logx.Route("/approve/:operation", http.HandlerFunc(approvalHandler.ServeApprovalPage)))
+	mux.Handle("/approve/", wrapPublic("/approve/:operation", publicLimiter, approvalHandler.ServeApprovalPage))
 	mux.Handle("/debug", logx.Route("/debug", http.HandlerFunc(approvalHandler.ServeDebugPage)))
 	mux.Handle("/approval-ui/", logx.Route("/approval-ui/*", http.HandlerFunc(approvalHandler.ServeAssets)))
-	mux.Handle("/api/operations/", logx.Route("/api/operations/:operation", http.HandlerFunc(approvalHandler.ServeOperationAPI)))
+	mux.Handle("/api/operations/", wrapPublic("/api/operations/:operation", publicLimiter, approvalHandler.ServeOperationAPI))
 
 	server := &http.Server{
 		Addr:              cfg.ListenAddr(),
