@@ -35,7 +35,7 @@ describe("McpDebugPage", () => {
         JSON.stringify({
           client_id: "client_debug",
         }),
-      headers: { get: () => null },
+      headers: new Headers(),
     } satisfies Partial<Response>);
 
     const storage = makeMemoryStorage();
@@ -89,7 +89,7 @@ describe("McpDebugPage", () => {
           JSON.stringify({
             client_id: "client_debug",
           }),
-        headers: { get: () => null },
+        headers: new Headers(),
       } satisfies Partial<Response>)
       .mockResolvedValueOnce({
         status: 200,
@@ -97,7 +97,7 @@ describe("McpDebugPage", () => {
           JSON.stringify({
             access_token: "oauth-token",
           }),
-        headers: { get: () => null },
+        headers: new Headers(),
       } satisfies Partial<Response>)
       .mockResolvedValueOnce({
         status: 200,
@@ -107,12 +107,12 @@ describe("McpDebugPage", () => {
             id: 1,
             result: { protocolVersion: "2025-11-25" },
           }),
-        headers: { get: (name: string) => (name === "Mcp-Session-Id" ? "session_debug" : null) },
+        headers: new Headers({ "Mcp-Session-Id": "session_debug" }),
       } satisfies Partial<Response>)
       .mockResolvedValueOnce({
         status: 202,
         text: async () => "",
-        headers: { get: () => "session_debug" },
+        headers: new Headers({ "Mcp-Session-Id": "session_debug" }),
       } satisfies Partial<Response>)
       .mockResolvedValueOnce({
         status: 200,
@@ -130,7 +130,7 @@ describe("McpDebugPage", () => {
               ],
             },
           }),
-        headers: { get: () => "session_debug" },
+        headers: new Headers({ "Mcp-Session-Id": "session_debug" }),
       } satisfies Partial<Response>)
       .mockResolvedValueOnce({
         status: 404,
@@ -138,7 +138,7 @@ describe("McpDebugPage", () => {
           JSON.stringify({
             error: "session was not found",
           }),
-        headers: { get: () => null },
+        headers: new Headers(),
       } satisfies Partial<Response>)
       .mockResolvedValueOnce({
         status: 200,
@@ -148,12 +148,12 @@ describe("McpDebugPage", () => {
             id: 1,
             result: { protocolVersion: "2025-11-25" },
           }),
-        headers: { get: (name: string) => (name === "Mcp-Session-Id" ? "session_retry" : null) },
+        headers: new Headers({ "Mcp-Session-Id": "session_retry" }),
       } satisfies Partial<Response>)
       .mockResolvedValueOnce({
         status: 202,
         text: async () => "",
-        headers: { get: () => "session_retry" },
+        headers: new Headers({ "Mcp-Session-Id": "session_retry" }),
       } satisfies Partial<Response>)
       .mockResolvedValueOnce({
         status: 200,
@@ -171,7 +171,7 @@ describe("McpDebugPage", () => {
               ],
             },
           }),
-        headers: { get: () => "session_retry" },
+        headers: new Headers({ "Mcp-Session-Id": "session_retry" }),
       } satisfies Partial<Response>)
       .mockResolvedValueOnce({
         status: 200,
@@ -191,7 +191,7 @@ describe("McpDebugPage", () => {
               },
             },
           }),
-        headers: { get: () => "session_retry" },
+        headers: new Headers({ "Mcp-Session-Id": "session_retry" }),
       } satisfies Partial<Response>);
 
     const initialRender = render(
