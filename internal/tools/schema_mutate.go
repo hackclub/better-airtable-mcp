@@ -183,14 +183,6 @@ func (t SchemaMutateTool) Call(ctx context.Context, raw json.RawMessage) (mcp.To
 		}), nil
 	}
 
-	if t.runtime == nil || t.runtime.Approval == nil {
-		return mcp.ErrorResult("manage_schema approval flow is not configured; payload validation passed", map[string]any{
-			"base":            strings.TrimSpace(input.Base),
-			"operation_count": len(input.Operations),
-			"operation_types": collectSchemaOperationTypes(input.Operations),
-		}), nil
-	}
-
 	userID, ok := authenticatedUserID(ctx)
 	if !ok {
 		err := fmt.Errorf("missing authenticated user")
@@ -392,10 +384,3 @@ func validateSchemaInput(input SchemaInput) error {
 	return nil
 }
 
-func collectSchemaOperationTypes(operations []SchemaOperation) []string {
-	types := make([]string, 0, len(operations))
-	for _, operation := range operations {
-		types = append(types, operation.Type)
-	}
-	return types
-}

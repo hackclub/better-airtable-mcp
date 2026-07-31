@@ -151,13 +151,14 @@ func TestAuthenticatedReadToolsOverMCP(t *testing.T) {
 		QueryDefaultLimit: 100,
 		QueryMaxLimit:     1000,
 	}
+	syncService := syncer.NewService(syncer.NewHTTPClient(fakeAirtable.URL, fakeAirtable.Client()), t.TempDir())
 	runtime := &tools.Runtime{
 		Store:  store,
 		Cipher: secret,
-		Syncer: syncer.NewService(syncer.NewHTTPClient(fakeAirtable.URL, fakeAirtable.Client()), t.TempDir()),
+		Syncer: syncService,
 		Config: cfg,
 	}
-	runtime.SyncManager = syncer.NewManager(runtime.Syncer, store, runtime, cfg.SyncInterval, 10*time.Minute)
+	runtime.SyncManager = syncer.NewManager(syncService, store, runtime, cfg.SyncInterval, 10*time.Minute)
 
 	handler := oauth.NewMiddleware(store, "").RequireBearer(mcp.NewHandler("better-airtable-mcp", "0.1.0", tools.NewCatalog(cfg, runtime)))
 
@@ -380,13 +381,14 @@ func TestAuthenticatedReadToolsRejectCachedBaseWithoutAirtableAccess(t *testing.
 		QueryDefaultLimit: 100,
 		QueryMaxLimit:     1000,
 	}
+	syncService := syncer.NewService(syncer.NewHTTPClient(fakeAirtable.URL, fakeAirtable.Client()), t.TempDir())
 	runtime := &tools.Runtime{
 		Store:  store,
 		Cipher: secret,
-		Syncer: syncer.NewService(syncer.NewHTTPClient(fakeAirtable.URL, fakeAirtable.Client()), t.TempDir()),
+		Syncer: syncService,
 		Config: cfg,
 	}
-	runtime.SyncManager = syncer.NewManager(runtime.Syncer, store, runtime, cfg.SyncInterval, 10*time.Minute)
+	runtime.SyncManager = syncer.NewManager(syncService, store, runtime, cfg.SyncInterval, 10*time.Minute)
 
 	handler := oauth.NewMiddleware(store, "").RequireBearer(mcp.NewHandler("better-airtable-mcp", "0.1.0", tools.NewCatalog(cfg, runtime)))
 
@@ -556,13 +558,14 @@ func TestCheckOperationRejectsSyncStatusWithoutAirtableAccess(t *testing.T) {
 		QueryDefaultLimit: 100,
 		QueryMaxLimit:     1000,
 	}
+	syncService := syncer.NewService(syncer.NewHTTPClient(fakeAirtable.URL, fakeAirtable.Client()), t.TempDir())
 	runtime := &tools.Runtime{
 		Store:  store,
 		Cipher: secret,
-		Syncer: syncer.NewService(syncer.NewHTTPClient(fakeAirtable.URL, fakeAirtable.Client()), t.TempDir()),
+		Syncer: syncService,
 		Config: cfg,
 	}
-	runtime.SyncManager = syncer.NewManager(runtime.Syncer, store, runtime, cfg.SyncInterval, 10*time.Minute)
+	runtime.SyncManager = syncer.NewManager(syncService, store, runtime, cfg.SyncInterval, 10*time.Minute)
 
 	handler := oauth.NewMiddleware(store, "").RequireBearer(mcp.NewHandler("better-airtable-mcp", "0.1.0", tools.NewCatalog(cfg, runtime)))
 
@@ -722,13 +725,14 @@ func TestAuthenticatedQueryReportsTruncationWhenServerAppliesDefaultLimit(t *tes
 		QueryDefaultLimit: 100,
 		QueryMaxLimit:     1000,
 	}
+	syncService := syncer.NewService(syncer.NewHTTPClient(fakeAirtable.URL, fakeAirtable.Client()), t.TempDir())
 	runtime := &tools.Runtime{
 		Store:  store,
 		Cipher: secret,
-		Syncer: syncer.NewService(syncer.NewHTTPClient(fakeAirtable.URL, fakeAirtable.Client()), t.TempDir()),
+		Syncer: syncService,
 		Config: cfg,
 	}
-	runtime.SyncManager = syncer.NewManager(runtime.Syncer, store, runtime, cfg.SyncInterval, 10*time.Minute)
+	runtime.SyncManager = syncer.NewManager(syncService, store, runtime, cfg.SyncInterval, 10*time.Minute)
 
 	handler := oauth.NewMiddleware(store, "").RequireBearer(mcp.NewHandler("better-airtable-mcp", "0.1.0", tools.NewCatalog(cfg, runtime)))
 

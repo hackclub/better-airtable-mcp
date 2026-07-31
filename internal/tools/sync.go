@@ -51,12 +51,6 @@ func (t SyncTool) Call(ctx context.Context, raw json.RawMessage) (mcp.ToolCallRe
 		return mcp.ToolCallResult{}, fmt.Errorf("base is required")
 	}
 
-	if t.runtime == nil || t.runtime.Syncer == nil {
-		return mcp.ErrorResult("sync orchestration is not implemented yet", map[string]any{
-			"base": input.Base,
-		}), nil
-	}
-
 	userID, ok := authenticatedUserID(ctx)
 	if !ok {
 		err := fmt.Errorf("missing authenticated user")

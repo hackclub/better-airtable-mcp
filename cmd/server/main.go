@@ -84,23 +84,25 @@ func main() {
 	mux.Handle("/", logx.Route("/", landing.NewHandler("README.md")))
 
 	syncService := syncer.NewService(syncer.NewHTTPClient("", nil), cfg.DuckDBDataDir)
+	syncManager := syncer.NewManager(syncService, store, tokenManager, cfg.SyncInterval, cfg.SyncTTL)
+	approvalService := approval.NewService(store, cipher, syncService, syncManager, tokenManager, syncer.NewHTTPClient("", nil), cfg.BaseURLString(), cfg.ApprovalTTL)
 	toolRuntime := &tools.Runtime{
 		Store:          store,
 		Cipher:         cipher,
 		Syncer:         syncService,
+		SyncManager:    syncManager,
+		Approval:       approvalService,
 		AirtableTokens: tokenManager,
 		Config:         cfg,
 	}
-	toolRuntime.SyncManager = syncer.NewManager(syncService, store, tokenManager, cfg.SyncInterval, cfg.SyncTTL)
-	toolRuntime.Approval = approval.NewService(store, cipher, syncService, toolRuntime.SyncManager, tokenManager, syncer.NewHTTPClient("", nil), cfg.BaseURLString(), cfg.ApprovalTTL)
-	if err := toolRuntime.SyncManager.SweepStaleDuckDBFiles(context.Background()); err != nil {
+	if err := syncManager.SweepStaleDuckDBFiles(context.Background()); err != nil {
 		logx.Event(context.Background(), "server", "server.background_init_failed",
 			"stage", "sweep_stale_duckdb_files",
 			"error_kind", logx.ErrorKind(err),
 			"error_message", logx.ErrorPreview(err),
 		)
 	}
-	if err := toolRuntime.SyncManager.RestoreActiveWorkers(context.Background()); err != nil {
+	if err := syncManager.RestoreActiveWorkers(context.Background()); err != nil {
 		logx.Event(context.Background(), "server", "server.background_init_failed",
 			"stage", "restore_active_sync_workers",
 			"error_kind", logx.ErrorKind(err),
@@ -126,12 +128,12 @@ func main() {
 	mux.Handle("/oauth/token", wrapPublic("/oauth/token", publicLimiter, oauthHandler.Token))
 	mux.Handle("/oauth/airtable/callback", wrapPublic("/oauth/airtable/callback", publicLimiter, oauthHandler.AirtableCallback))
 
-	go toolRuntime.Approval.RunExpiryLoop(context.Background(), time.Minute)
+	go approvalService.RunExpiryLoop(context.Background(), time.Minute)
 	go tokenManager.RunRefreshLoop(context.Background(), time.Minute)
 	go oauthHandler.RunCleanupLoop(context.Background(), time.Minute)
 	go mcpHandler.RunSessionExpiryLoop(context.Background(), time.Minute)
 
-	approvalHandler := approval.NewHandler(toolRuntime.Approval)
+	approvalHandler := approval.NewHandler(approvalService)
 	mux.Handle("/approve/", wrapPublic("/approve/:operation", publicLimiter, approvalHandler.ServeApprovalPage))
 	mux.Handle("/debug", logx.Route("/debug", http.HandlerFunc(approvalHandler.ServeDebugPage)))
 	mux.Handle("/approval-ui/", logx.Route("/approval-ui/*", http.HandlerFunc(approvalHandler.ServeAssets)))

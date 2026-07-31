@@ -64,13 +64,8 @@ func (t CheckOperationTool) Call(ctx context.Context, raw json.RawMessage) (mcp.
 		return mcp.ToolCallResult{}, err
 	}
 
-	if strings.HasPrefix(input.OperationID, "sync_") && t.runtime != nil && t.runtime.SyncManager != nil {
+	if strings.HasPrefix(input.OperationID, "sync_") {
 		baseID := strings.TrimPrefix(input.OperationID, "sync_")
-		if t.runtime.Syncer == nil {
-			return mcp.ErrorResult("operation tracking is not implemented yet", map[string]any{
-				"operation_id": input.OperationID,
-			}), nil
-		}
 		accessToken, err := t.runtime.AirtableAccessToken(ctx, userID)
 		if err != nil {
 			logToolFailed(ctx, "check_operation", err, "user_id", userID, "sync_operation_id", input.OperationID)
@@ -114,62 +109,55 @@ func (t CheckOperationTool) Call(ctx context.Context, raw json.RawMessage) (mcp.
 				"operation_id", "type", "status", "read_snapshot", "sync_started_at", "completed_at", "last_synced_at", "tables_total", "tables_started", "tables_completed", "pages_fetched", "records_visible", "records_synced_this_run", "error",
 			}, payload), payload), nil
 		}
+		return mcp.ErrorResult("operation was not found", map[string]any{
+			"operation_id": input.OperationID,
+		}), nil
 	}
 
-	if strings.HasPrefix(input.OperationID, "op_") && t.runtime != nil && t.runtime.Approval != nil {
-		if t.runtime.Store == nil {
-			return mcp.ErrorResult("operation tracking is not implemented yet", map[string]any{
-				"operation_id": input.OperationID,
-			}), nil
-		}
-		record, err := t.runtime.Store.GetPendingOperation(ctx, input.OperationID)
-		if err != nil {
-			if errors.Is(err, pgx.ErrNoRows) {
-				return mcp.ErrorResult("operation was not found", map[string]any{
-					"operation_id": input.OperationID,
-				}), nil
-			}
-			logToolFailed(ctx, "check_operation", err, "user_id", userID, "approval_operation_id_hash", logx.ApprovalOperationIDHash(input.OperationID))
-			return mcp.ToolCallResult{}, err
-		}
-		if record.UserID != userID {
+	// The prefix validation above guarantees an op_ id from here on.
+	record, err := t.runtime.Store.GetPendingOperation(ctx, input.OperationID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
 			return mcp.ErrorResult("operation was not found", map[string]any{
 				"operation_id": input.OperationID,
 			}), nil
 		}
-
-		operation, err := t.runtime.Approval.GetOperation(ctx, input.OperationID)
-		if err != nil {
-			logToolFailed(ctx, "check_operation", err, "user_id", userID, "approval_operation_id_hash", logx.ApprovalOperationIDHash(input.OperationID))
-			return mcp.ToolCallResult{}, err
-		}
-		payload := map[string]any{
-			"operation_id": operation.OperationID,
-			"type":         "mutate",
-			"status":       operation.Status,
-			"approval_url": operation.ApprovalURL,
-			"summary":      operation.Summary,
-		}
-		if operation.Status == "pending_approval" {
-			payload["assistant_instruction"] = approvalURLAssistantInstruction
-		}
-		if operation.Result != nil {
-			payload["result"] = operation.Result
-		}
-		if operation.Error != "" {
-			payload["error"] = operation.Error
-		}
-		logToolCompleted(ctx, "check_operation",
-			"user_id", userID,
-			"approval_operation_id_hash", logx.ApprovalOperationIDHash(input.OperationID),
-			"status", operation.Status,
-		)
-		return textOnlyResult(formatSingleRowCSV([]string{
-			"operation_id", "type", "status", "approval_url", "summary", "assistant_instruction", "result", "error",
-		}, payload), payload), nil
+		logToolFailed(ctx, "check_operation", err, "user_id", userID, "approval_operation_id_hash", logx.ApprovalOperationIDHash(input.OperationID))
+		return mcp.ToolCallResult{}, err
+	}
+	if record.UserID != userID {
+		return mcp.ErrorResult("operation was not found", map[string]any{
+			"operation_id": input.OperationID,
+		}), nil
 	}
 
-	return mcp.ErrorResult("operation tracking is not implemented yet", map[string]any{
-		"operation_id": input.OperationID,
-	}), nil
+	operation, err := t.runtime.Approval.GetOperation(ctx, input.OperationID)
+	if err != nil {
+		logToolFailed(ctx, "check_operation", err, "user_id", userID, "approval_operation_id_hash", logx.ApprovalOperationIDHash(input.OperationID))
+		return mcp.ToolCallResult{}, err
+	}
+	payload := map[string]any{
+		"operation_id": operation.OperationID,
+		"type":         "mutate",
+		"status":       operation.Status,
+		"approval_url": operation.ApprovalURL,
+		"summary":      operation.Summary,
+	}
+	if operation.Status == "pending_approval" {
+		payload["assistant_instruction"] = approvalURLAssistantInstruction
+	}
+	if operation.Result != nil {
+		payload["result"] = operation.Result
+	}
+	if operation.Error != "" {
+		payload["error"] = operation.Error
+	}
+	logToolCompleted(ctx, "check_operation",
+		"user_id", userID,
+		"approval_operation_id_hash", logx.ApprovalOperationIDHash(input.OperationID),
+		"status", operation.Status,
+	)
+	return textOnlyResult(formatSingleRowCSV([]string{
+		"operation_id", "type", "status", "approval_url", "summary", "assistant_instruction", "result", "error",
+	}, payload), payload), nil
 }

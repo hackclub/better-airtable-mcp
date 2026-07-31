@@ -181,12 +181,14 @@ func TestMutateApprovalFlowOverMCP(t *testing.T) {
 		Syncer: syncService,
 		Config: cfg,
 	}
-	runtime.SyncManager = syncer.NewManager(syncService, store, runtime, cfg.SyncInterval, cfg.SyncTTL)
-	runtime.Approval = approval.NewService(store, secret, syncService, runtime.SyncManager, runtime, syncer.NewHTTPClient(fakeAirtable.URL, fakeAirtable.Client()), cfg.BaseURLString(), cfg.ApprovalTTL)
+	syncManager := syncer.NewManager(syncService, store, runtime, cfg.SyncInterval, cfg.SyncTTL)
+	runtime.SyncManager = syncManager
+	approvalService := approval.NewService(store, secret, syncService, syncManager, runtime, syncer.NewHTTPClient(fakeAirtable.URL, fakeAirtable.Client()), cfg.BaseURLString(), cfg.ApprovalTTL)
+	runtime.Approval = approvalService
 
 	mux := http.NewServeMux()
 	mux.Handle("/mcp", oauth.NewMiddleware(store, "").RequireBearer(mcp.NewHandler("better-airtable-mcp", "0.1.0", tools.NewCatalog(cfg, runtime))))
-	approvalHandler := approval.NewHandler(runtime.Approval)
+	approvalHandler := approval.NewHandler(approvalService)
 	mux.HandleFunc("/api/operations/", approvalHandler.ServeOperationAPI)
 
 	ensureBaseSyncedForMutationTest(t, runtime, "user_1", "Project Tracker")
@@ -451,12 +453,14 @@ func TestConcurrentApproveExecutesMutationExactlyOnce(t *testing.T) {
 		Syncer: syncService,
 		Config: cfg,
 	}
-	runtime.SyncManager = syncer.NewManager(syncService, store, runtime, cfg.SyncInterval, cfg.SyncTTL)
-	runtime.Approval = approval.NewService(store, secret, syncService, runtime.SyncManager, runtime, syncer.NewHTTPClient(fakeAirtable.URL, fakeAirtable.Client()), cfg.BaseURLString(), cfg.ApprovalTTL)
+	syncManager := syncer.NewManager(syncService, store, runtime, cfg.SyncInterval, cfg.SyncTTL)
+	runtime.SyncManager = syncManager
+	approvalService := approval.NewService(store, secret, syncService, syncManager, runtime, syncer.NewHTTPClient(fakeAirtable.URL, fakeAirtable.Client()), cfg.BaseURLString(), cfg.ApprovalTTL)
+	runtime.Approval = approvalService
 
 	mux := http.NewServeMux()
 	mux.Handle("/mcp", oauth.NewMiddleware(store, "").RequireBearer(mcp.NewHandler("better-airtable-mcp", "0.1.0", tools.NewCatalog(cfg, runtime))))
-	approvalHandler := approval.NewHandler(runtime.Approval)
+	approvalHandler := approval.NewHandler(approvalService)
 	mux.HandleFunc("/api/operations/", approvalHandler.ServeOperationAPI)
 
 	ensureBaseSyncedForMutationTest(t, runtime, "user_1", "Project Tracker")
@@ -665,12 +669,14 @@ func TestMutateApprovalFlowLogsWithoutLeakingPayloadValues(t *testing.T) {
 		Syncer: syncService,
 		Config: cfg,
 	}
-	runtime.SyncManager = syncer.NewManager(syncService, store, runtime, cfg.SyncInterval, cfg.SyncTTL)
-	runtime.Approval = approval.NewService(store, secret, syncService, runtime.SyncManager, runtime, syncer.NewHTTPClient(fakeAirtable.URL, fakeAirtable.Client()), cfg.BaseURLString(), cfg.ApprovalTTL)
+	syncManager := syncer.NewManager(syncService, store, runtime, cfg.SyncInterval, cfg.SyncTTL)
+	runtime.SyncManager = syncManager
+	approvalService := approval.NewService(store, secret, syncService, syncManager, runtime, syncer.NewHTTPClient(fakeAirtable.URL, fakeAirtable.Client()), cfg.BaseURLString(), cfg.ApprovalTTL)
+	runtime.Approval = approvalService
 
 	mux := http.NewServeMux()
 	mux.Handle("/mcp", oauth.NewMiddleware(store, "").RequireBearer(mcp.NewHandler("better-airtable-mcp", "0.1.0", tools.NewCatalog(cfg, runtime))))
-	approvalHandler := approval.NewHandler(runtime.Approval)
+	approvalHandler := approval.NewHandler(approvalService)
 	mux.HandleFunc("/api/operations/", approvalHandler.ServeOperationAPI)
 
 	ensureBaseSyncedForMutationTest(t, runtime, "user_1", "Project Tracker")
@@ -833,8 +839,10 @@ func TestCheckOperationRejectsMutationStatusForDifferentUser(t *testing.T) {
 		Syncer: syncService,
 		Config: cfg,
 	}
-	runtime.SyncManager = syncer.NewManager(syncService, store, runtime, cfg.SyncInterval, cfg.SyncTTL)
-	runtime.Approval = approval.NewService(store, secret, syncService, runtime.SyncManager, runtime, syncer.NewHTTPClient(fakeAirtable.URL, fakeAirtable.Client()), cfg.BaseURLString(), cfg.ApprovalTTL)
+	syncManager := syncer.NewManager(syncService, store, runtime, cfg.SyncInterval, cfg.SyncTTL)
+	runtime.SyncManager = syncManager
+	approvalService := approval.NewService(store, secret, syncService, syncManager, runtime, syncer.NewHTTPClient(fakeAirtable.URL, fakeAirtable.Client()), cfg.BaseURLString(), cfg.ApprovalTTL)
+	runtime.Approval = approvalService
 
 	handler := oauth.NewMiddleware(store, "").RequireBearer(mcp.NewHandler("better-airtable-mcp", "0.1.0", tools.NewCatalog(cfg, runtime)))
 
@@ -1018,12 +1026,14 @@ func TestMutateCreateRecordsAcceptsOriginalAirtableFieldNamesOverMCP(t *testing.
 		Syncer: syncService,
 		Config: cfg,
 	}
-	runtime.SyncManager = syncer.NewManager(syncService, store, runtime, cfg.SyncInterval, cfg.SyncTTL)
-	runtime.Approval = approval.NewService(store, secret, syncService, runtime.SyncManager, runtime, syncer.NewHTTPClient(fakeAirtable.URL, fakeAirtable.Client()), cfg.BaseURLString(), cfg.ApprovalTTL)
+	syncManager := syncer.NewManager(syncService, store, runtime, cfg.SyncInterval, cfg.SyncTTL)
+	runtime.SyncManager = syncManager
+	approvalService := approval.NewService(store, secret, syncService, syncManager, runtime, syncer.NewHTTPClient(fakeAirtable.URL, fakeAirtable.Client()), cfg.BaseURLString(), cfg.ApprovalTTL)
+	runtime.Approval = approvalService
 
 	mux := http.NewServeMux()
 	mux.Handle("/mcp", oauth.NewMiddleware(store, "").RequireBearer(mcp.NewHandler("better-airtable-mcp", "0.1.0", tools.NewCatalog(cfg, runtime))))
-	approvalHandler := approval.NewHandler(runtime.Approval)
+	approvalHandler := approval.NewHandler(approvalService)
 	mux.HandleFunc("/api/operations/", approvalHandler.ServeOperationAPI)
 
 	mutateResponse := performAuthenticatedToolCall(t, mux, bearerToken, "mutate", map[string]any{
@@ -1224,12 +1234,14 @@ func TestMutateDeleteRecordIDsOverMCP(t *testing.T) {
 		Syncer: syncService,
 		Config: cfg,
 	}
-	runtime.SyncManager = syncer.NewManager(syncService, store, runtime, cfg.SyncInterval, cfg.SyncTTL)
-	runtime.Approval = approval.NewService(store, secret, syncService, runtime.SyncManager, runtime, syncer.NewHTTPClient(fakeAirtable.URL, fakeAirtable.Client()), cfg.BaseURLString(), cfg.ApprovalTTL)
+	syncManager := syncer.NewManager(syncService, store, runtime, cfg.SyncInterval, cfg.SyncTTL)
+	runtime.SyncManager = syncManager
+	approvalService := approval.NewService(store, secret, syncService, syncManager, runtime, syncer.NewHTTPClient(fakeAirtable.URL, fakeAirtable.Client()), cfg.BaseURLString(), cfg.ApprovalTTL)
+	runtime.Approval = approvalService
 
 	mux := http.NewServeMux()
 	mux.Handle("/mcp", oauth.NewMiddleware(store, "").RequireBearer(mcp.NewHandler("better-airtable-mcp", "0.1.0", tools.NewCatalog(cfg, runtime))))
-	approvalHandler := approval.NewHandler(runtime.Approval)
+	approvalHandler := approval.NewHandler(approvalService)
 	mux.HandleFunc("/api/operations/", approvalHandler.ServeOperationAPI)
 
 	ensureBaseSyncedForMutationTest(t, runtime, "user_1", "appProjects")
@@ -1390,8 +1402,10 @@ func TestMutateReturnsNotReadyWhenTargetRecordHasNotSyncedYetOverMCP(t *testing.
 		Syncer: syncService,
 		Config: cfg,
 	}
-	runtime.SyncManager = syncer.NewManager(syncService, store, runtime, cfg.SyncInterval, cfg.SyncTTL)
-	runtime.Approval = approval.NewService(store, secret, syncService, runtime.SyncManager, runtime, syncer.NewHTTPClient(fakeAirtable.URL, fakeAirtable.Client()), cfg.BaseURLString(), cfg.ApprovalTTL)
+	syncManager := syncer.NewManager(syncService, store, runtime, cfg.SyncInterval, cfg.SyncTTL)
+	runtime.SyncManager = syncManager
+	approvalService := approval.NewService(store, secret, syncService, syncManager, runtime, syncer.NewHTTPClient(fakeAirtable.URL, fakeAirtable.Client()), cfg.BaseURLString(), cfg.ApprovalTTL)
+	runtime.Approval = approvalService
 
 	mux := http.NewServeMux()
 	mux.Handle("/mcp", oauth.NewMiddleware(store, "").RequireBearer(mcp.NewHandler("better-airtable-mcp", "0.1.0", tools.NewCatalog(cfg, runtime))))

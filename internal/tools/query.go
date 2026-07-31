@@ -132,23 +132,6 @@ func (t QueryTool) Call(ctx context.Context, raw json.RawMessage) (mcp.ToolCallR
 		})
 	}
 
-	if t.runtime == nil || t.runtime.Syncer == nil {
-		previewResults := make([]map[string]any, 0, len(normalizedQueries))
-		for _, query := range normalizedQueries {
-			previewResults = append(previewResults, map[string]any{
-				"sql":             query.Normalized.SQL,
-				"effective_limit": query.Normalized.EffectiveLimit,
-			})
-		}
-		return mcp.ErrorResult(
-			"query execution is not implemented yet; SQL validation passed",
-			map[string]any{
-				"base":    input.Base,
-				"results": previewResults,
-			},
-		), nil
-	}
-
 	userID, ok := authenticatedUserID(ctx)
 	if !ok {
 		err := fmt.Errorf("missing authenticated user")

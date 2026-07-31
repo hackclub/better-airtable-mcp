@@ -47,12 +47,6 @@ func (t ListBasesTool) Call(ctx context.Context, raw json.RawMessage) (mcp.ToolC
 	}
 
 	input.Query = strings.TrimSpace(input.Query)
-	if t.runtime == nil || t.runtime.Syncer == nil {
-		return mcp.ErrorResult("list_bases is not implemented yet", map[string]any{
-			"query": input.Query,
-		}), nil
-	}
-
 	userID, ok := authenticatedUserID(ctx)
 	if !ok {
 		err := fmt.Errorf("missing authenticated user")

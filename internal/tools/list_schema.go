@@ -51,12 +51,6 @@ func (t ListSchemaTool) Call(ctx context.Context, raw json.RawMessage) (mcp.Tool
 		return mcp.ToolCallResult{}, fmt.Errorf("base is required")
 	}
 
-	if t.runtime == nil || t.runtime.Syncer == nil {
-		return mcp.ErrorResult("list_schema is not implemented yet", map[string]any{
-			"base": input.Base,
-		}), nil
-	}
-
 	userID, ok := authenticatedUserID(ctx)
 	if !ok {
 		err := fmt.Errorf("missing authenticated user")

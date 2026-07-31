@@ -139,6 +139,13 @@ func UserIDFromContext(ctx context.Context) (string, bool) {
 	return userID, ok
 }
 
+// ContextWithUserID returns a context carrying an authenticated user id, the
+// same way RequireBearer sets it. Intended for tests that exercise handlers
+// or tools below the middleware.
+func ContextWithUserID(ctx context.Context, userID string) context.Context {
+	return context.WithValue(ctx, userIDContextKey, userID)
+}
+
 func TokenHashFromContext(ctx context.Context) (string, bool) {
 	tokenHash, ok := ctx.Value(tokenHashContextKey).(string)
 	return tokenHash, ok

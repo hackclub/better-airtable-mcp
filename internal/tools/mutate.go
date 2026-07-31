@@ -145,15 +145,6 @@ func (t MutateTool) Call(ctx context.Context, raw json.RawMessage) (mcp.ToolCall
 		return mcp.ToolCallResult{}, err
 	}
 
-	if t.runtime == nil || t.runtime.Approval == nil {
-		return mcp.ErrorResult("mutate execution and approval flow are not implemented yet; payload validation passed", map[string]any{
-			"base":            strings.TrimSpace(input.Base),
-			"operation_count": len(input.Operations),
-			"record_count":    countMutationRecords(input.Operations),
-			"operation_types": collectOperationTypes(input.Operations),
-		}), nil
-	}
-
 	userID, ok := authenticatedUserID(ctx)
 	if !ok {
 		err := fmt.Errorf("missing authenticated user")
@@ -288,18 +279,4 @@ func validateMutateInput(input MutateInput) error {
 	return nil
 }
 
-func collectOperationTypes(operations []MutationOperation) []string {
-	types := make([]string, 0, len(operations))
-	for _, operation := range operations {
-		types = append(types, operation.Type)
-	}
-	return types
-}
 
-func countMutationRecords(operations []MutationOperation) int {
-	total := 0
-	for _, operation := range operations {
-		total += len(operation.Records)
-	}
-	return total
-}
