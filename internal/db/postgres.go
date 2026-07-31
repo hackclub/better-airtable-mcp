@@ -536,6 +536,23 @@ func (s *Store) UpdatePendingOperationStatus(ctx context.Context, id, status str
 	return nil
 }
 
+// TransitionPendingOperationStatus atomically moves an operation from
+// fromStatus to toStatus. It returns true only if this call performed the
+// transition (RowsAffected == 1); false means another caller already moved it
+// out of fromStatus. This is the compare-and-swap that makes approval
+// execution idempotent under concurrent requests.
+func (s *Store) TransitionPendingOperationStatus(ctx context.Context, id, fromStatus, toStatus string) (bool, error) {
+	commandTag, err := s.pool.Exec(ctx, `
+		UPDATE pending_operations
+		SET status = $3
+		WHERE id = $1 AND status = $2
+	`, id, fromStatus, toStatus)
+	if err != nil {
+		return false, fmt.Errorf("transition pending operation: %w", err)
+	}
+	return commandTag.RowsAffected() == 1, nil
+}
+
 func (s *Store) ExpirePendingOperations(ctx context.Context, now time.Time) (int64, error) {
 	commandTag, err := s.pool.Exec(ctx, `
 		UPDATE pending_operations

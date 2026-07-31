@@ -388,8 +388,13 @@ func (s *Service) getSchemaOperationView(ctx context.Context, operation db.Pendi
 }
 
 func (s *Service) approveSchemaMutation(ctx context.Context, operation db.PendingOperation) (OperationView, error) {
-	if err := s.store.UpdatePendingOperationStatus(ctx, operation.ID, "executing", nil, nil, nil); err != nil {
+	won, err := s.store.TransitionPendingOperationStatus(ctx, operation.ID, "pending_approval", "executing")
+	if err != nil {
 		return OperationView{}, err
+	}
+	if !won {
+		// A concurrent approval already claimed this operation; do not execute again.
+		return s.GetOperation(ctx, operation.ID)
 	}
 
 	payload, err := decryptJSON[schemaPayload](s.cipher, operation.PayloadCiphertext)

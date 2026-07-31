@@ -302,6 +302,221 @@ func TestMutateApprovalFlowOverMCP(t *testing.T) {
 	}
 }
 
+func TestConcurrentApproveExecutesMutationExactlyOnce(t *testing.T) {
+	port := mutateFreePort(t)
+	postgres := embeddedpostgres.NewDatabase(
+		embeddedpostgres.DefaultConfig().
+			Port(uint32(port)).
+			Database("better_airtable_concurrent_approve_test").
+			Username("postgres").
+			Password("postgres").
+			BinariesPath(filepath.Join(t.TempDir(), "postgres-binaries")).
+			DataPath(filepath.Join(t.TempDir(), "postgres-data")).
+			RuntimePath(filepath.Join(t.TempDir(), "postgres-runtime")),
+	)
+	if err := postgres.Start(); err != nil {
+		t.Fatalf("embedded postgres start failed: %v", err)
+	}
+	defer postgres.Stop()
+
+	store, err := db.Open(context.Background(), fmt.Sprintf("postgres://postgres:postgres@127.0.0.1:%d/better_airtable_concurrent_approve_test?sslmode=disable", port))
+	if err != nil {
+		t.Fatalf("db.Open() returned error: %v", err)
+	}
+	defer store.Close()
+	if err := store.Migrate(context.Background()); err != nil {
+		t.Fatalf("store.Migrate() returned error: %v", err)
+	}
+
+	var updateCalls atomic.Int32
+	var recordsMu sync.Mutex
+	records := map[string]map[string]any{
+		"recProject1": {
+			"Name":   "Website Redesign",
+			"Status": "Planning",
+		},
+	}
+
+	fakeAirtable := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/v0/meta/bases":
+			writeMCPJSON(t, w, map[string]any{
+				"bases": []map[string]any{
+					{"id": "appProjects", "name": "Project Tracker", "permissionLevel": "create"},
+				},
+			})
+		case r.URL.Path == "/v0/meta/bases/appProjects/tables":
+			writeMCPJSON(t, w, map[string]any{
+				"tables": []map[string]any{
+					{
+						"id":   "tblProjects",
+						"name": "Projects",
+						"fields": []map[string]any{
+							{"id": "fldName", "name": "Name", "type": "singleLineText"},
+							{"id": "fldStatus", "name": "Status", "type": "singleSelect"},
+						},
+					},
+				},
+			})
+		case r.URL.Path == "/v0/appProjects/tblProjects" && r.Method == http.MethodGet:
+			recordsMu.Lock()
+			defer recordsMu.Unlock()
+			payload := make([]map[string]any, 0, len(records))
+			for id, fields := range records {
+				payload = append(payload, map[string]any{
+					"id":          id,
+					"createdTime": "2026-04-01T12:00:00Z",
+					"fields":      fields,
+				})
+			}
+			writeMCPJSON(t, w, map[string]any{"records": payload})
+		case r.URL.Path == "/v0/appProjects/tblProjects" && r.Method == http.MethodPatch:
+			updateCalls.Add(1)
+			var request struct {
+				Records []struct {
+					ID     string         `json:"id"`
+					Fields map[string]any `json:"fields"`
+				} `json:"records"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+				t.Fatalf("decode patch payload: %v", err)
+			}
+
+			recordsMu.Lock()
+			defer recordsMu.Unlock()
+			responseRecords := make([]map[string]any, 0, len(request.Records))
+			for _, record := range request.Records {
+				current := records[record.ID]
+				for key, value := range record.Fields {
+					current[key] = value
+				}
+				responseRecords = append(responseRecords, map[string]any{
+					"id":          record.ID,
+					"createdTime": "2026-04-01T12:00:00Z",
+					"fields":      current,
+				})
+			}
+			writeMCPJSON(t, w, map[string]any{"records": responseRecords})
+		default:
+			t.Fatalf("unexpected Airtable %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer fakeAirtable.Close()
+
+	secret, err := cryptoutil.New([]byte(strings.Repeat("k", 32)))
+	if err != nil {
+		t.Fatalf("cryptoutil.New() returned error: %v", err)
+	}
+	if err := store.UpsertUser(context.Background(), db.User{ID: "user_1"}); err != nil {
+		t.Fatalf("store.UpsertUser() returned error: %v", err)
+	}
+	encryptedToken, err := secret.Encrypt([]byte("airtable-access-token"))
+	if err != nil {
+		t.Fatalf("secret.Encrypt() returned error: %v", err)
+	}
+	if err := store.PutAirtableToken(context.Background(), db.AirtableTokenRecord{
+		UserID:                 "user_1",
+		AccessTokenCiphertext:  encryptedToken,
+		RefreshTokenCiphertext: encryptedToken,
+		ExpiresAt:              time.Now().Add(time.Hour),
+		Scopes:                 "data.records:read data.records:write schema.bases:read",
+	}); err != nil {
+		t.Fatalf("store.PutAirtableToken() returned error: %v", err)
+	}
+
+	bearerToken := "mcp-access-token"
+	if err := store.PutMCPToken(context.Background(), db.MCPTokenRecord{
+		TokenHash:  oauth.HashToken(bearerToken),
+		UserID:     "user_1",
+		ClientID:   ptr("client_claude"),
+		ClientName: ptr("Claude"),
+		CreatedAt:  time.Now().UTC(),
+		ExpiresAt:  time.Now().Add(time.Hour).UTC(),
+	}); err != nil {
+		t.Fatalf("store.PutMCPToken() returned error: %v", err)
+	}
+
+	cfg := config.Config{
+		BaseURL:           mustParseTestURL(t, "http://example.test"),
+		SyncInterval:      time.Minute,
+		SyncTTL:           10 * time.Minute,
+		ApprovalTTL:       60 * time.Minute,
+		QueryDefaultLimit: 100,
+		QueryMaxLimit:     1000,
+	}
+	syncService := syncer.NewService(syncer.NewHTTPClient(fakeAirtable.URL, fakeAirtable.Client()), t.TempDir())
+	runtime := &tools.Runtime{
+		Store:  store,
+		Cipher: secret,
+		Syncer: syncService,
+		Config: cfg,
+	}
+	runtime.SyncManager = syncer.NewManager(syncService, store, runtime, cfg.SyncInterval, cfg.SyncTTL)
+	runtime.Approval = approval.NewService(store, secret, syncService, runtime.SyncManager, runtime, syncer.NewHTTPClient(fakeAirtable.URL, fakeAirtable.Client()), cfg.BaseURLString(), cfg.ApprovalTTL)
+
+	mux := http.NewServeMux()
+	mux.Handle("/mcp", oauth.NewMiddleware(store, "").RequireBearer(mcp.NewHandler("better-airtable-mcp", "0.1.0", tools.NewCatalog(cfg, runtime))))
+	approvalHandler := approval.NewHandler(runtime.Approval)
+	mux.HandleFunc("/api/operations/", approvalHandler.ServeOperationAPI)
+
+	ensureBaseSyncedForMutationTest(t, runtime, "user_1", "Project Tracker")
+
+	mutateResponse := performAuthenticatedToolCall(t, mux, bearerToken, "mutate", map[string]any{
+		"base": "Project Tracker",
+		"operations": []map[string]any{
+			{
+				"type":  "update_records",
+				"table": "projects",
+				"records": []map[string]any{
+					{
+						"id": "recProject1",
+						"fields": map[string]any{
+							"status": "Done",
+						},
+					},
+				},
+			},
+		},
+	})
+	mutateStructured := mutateResponse["result"].(map[string]any)["structuredContent"].(map[string]any)
+	operationID := mutateStructured["operation_id"].(string)
+
+	const approvers = 2
+	var wg sync.WaitGroup
+	codes := make([]int, approvers)
+	for i := 0; i < approvers; i++ {
+		wg.Add(1)
+		go func(slot int) {
+			defer wg.Done()
+			request := httptest.NewRequest(http.MethodPost, "/api/operations/"+operationID+"/approve", strings.NewReader(`{}`))
+			recorder := httptest.NewRecorder()
+			mux.ServeHTTP(recorder, request)
+			codes[slot] = recorder.Code
+		}(i)
+	}
+	wg.Wait()
+
+	for slot, code := range codes {
+		if code != http.StatusOK {
+			t.Fatalf("approve %d returned status %d", slot, code)
+		}
+	}
+	if got := updateCalls.Load(); got != 1 {
+		t.Fatalf("expected exactly one Airtable update call after concurrent approvals, got %d", got)
+	}
+
+	// A later repeat approval of the settled operation must not re-execute either.
+	repeat := httptest.NewRequest(http.MethodPost, "/api/operations/"+operationID+"/approve", strings.NewReader(`{}`))
+	repeatRecorder := httptest.NewRecorder()
+	mux.ServeHTTP(repeatRecorder, repeat)
+	if repeatRecorder.Code != http.StatusOK {
+		t.Fatalf("repeat approve returned status %d", repeatRecorder.Code)
+	}
+	if got := updateCalls.Load(); got != 1 {
+		t.Fatalf("expected repeat approval to be a no-op, got %d Airtable update calls", got)
+	}
+}
+
 func TestMutateApprovalFlowLogsWithoutLeakingPayloadValues(t *testing.T) {
 	port := mutateFreePort(t)
 	postgres := embeddedpostgres.NewDatabase(

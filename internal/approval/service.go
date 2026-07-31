@@ -521,8 +521,13 @@ func (s *Service) Approve(ctx context.Context, operationID string) (OperationVie
 		return s.approveSchemaMutation(ctx, operation)
 	}
 
-	if err := s.store.UpdatePendingOperationStatus(ctx, operation.ID, "executing", nil, nil, nil); err != nil {
+	won, err := s.store.TransitionPendingOperationStatus(ctx, operation.ID, "pending_approval", "executing")
+	if err != nil {
 		return OperationView{}, err
+	}
+	if !won {
+		// A concurrent approval already claimed this operation; do not execute again.
+		return s.GetOperation(ctx, operationID)
 	}
 
 	payload, err := decryptJSON[pendingPayload](s.cipher, operation.PayloadCiphertext)
