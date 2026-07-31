@@ -1,0 +1,55 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v2
+      - run: npm --prefix frontend ci
+      - run: npm --prefix frontend test
+      - run: npm --prefix frontend run typecheck
+      - name: Build frontend bundle
+        run: npm --prefix frontend run build
+      - name: Fail if committed dist is stale
+        run: |
+          if ! git diff --quiet -- internal/approval/dist; then
+            echo "internal/approval/dist is out of date. Run 'npm --prefix frontend run build' and commit the result."
+            git --no-pager diff --stat -- internal/approval/dist
+            exit 1
+          fi
+
+  go-unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v2
+      - run: go build ./...
+      - run: go vet ./...
+      - run: go vet -tags=integration ./...
+      - run: go test -short ./...
+
+  go-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v2
+      - uses: golangci/golangci-lint-action@v8
+        with:
+          version: latest
+
+  go-integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v2
+      - name: Cache embedded-postgres binaries
+        uses: actions/cache@v4
+        with:
+          path: ~/.embedded-postgres-go
+          key: embedded-postgres-${{ runner.os }}
+      - run: go test -tags=integration ./...
