@@ -129,7 +129,9 @@ func TestStoreMigrateAndRoundTripRecords(t *testing.T) {
 		t.Fatalf("unexpected expiring token list %#v", expiring)
 	}
 
-	activeUntil := time.Now().Add(10 * time.Minute).UTC()
+	// Truncate to microseconds: Postgres timestamps drop sub-microsecond
+	// precision, and Linux clocks produce nanosecond-precision time.Now().
+	activeUntil := time.Now().Add(10 * time.Minute).UTC().Truncate(time.Microsecond)
 	if err := store.TouchSyncState(ctx, "app123", activeUntil, "user_1"); err != nil {
 		t.Fatalf("TouchSyncState() returned error: %v", err)
 	}
@@ -148,7 +150,7 @@ func TestStoreMigrateAndRoundTripRecords(t *testing.T) {
 		t.Fatalf("expected touch-only sync state to preserve nil last_synced_at, got %#v", syncState)
 	}
 
-	lastSyncedAt := time.Now().UTC()
+	lastSyncedAt := time.Now().UTC().Truncate(time.Microsecond)
 	durationMS := int64(1234)
 	totalRecords := int64(42)
 	totalTables := 3
@@ -164,7 +166,7 @@ func TestStoreMigrateAndRoundTripRecords(t *testing.T) {
 		t.Fatalf("PutSyncState() returned error: %v", err)
 	}
 
-	newActiveUntil := time.Now().Add(20 * time.Minute).UTC()
+	newActiveUntil := time.Now().Add(20 * time.Minute).UTC().Truncate(time.Microsecond)
 	if err := store.TouchSyncState(ctx, "app123", newActiveUntil, "user_2"); err != nil {
 		t.Fatalf("TouchSyncState() second call returned error: %v", err)
 	}
@@ -336,6 +338,77 @@ func TestStoreMigrateAndRoundTripRecords(t *testing.T) {
 	}
 	if len(client.RedirectURIs) != 1 || !strings.Contains(client.RedirectURIs[0], "example.com") {
 		t.Fatalf("unexpected oauth client %#v", client)
+	}
+}
+
+func TestTransitionPendingOperationStatusIsCompareAndSwap(t *testing.T) {
+	port := freePort(t)
+	postgres := embeddedpostgres.NewDatabase(
+		embeddedpostgres.DefaultConfig().
+			Port(uint32(port)).
+			Database("better_airtable_cas_test").
+			Username("postgres").
+			Password("postgres").
+			BinariesPath(filepath.Join(t.TempDir(), "postgres-binaries")).
+			DataPath(filepath.Join(t.TempDir(), "postgres-data")).
+			RuntimePath(filepath.Join(t.TempDir(), "postgres-runtime")),
+	)
+	if err := postgres.Start(); err != nil {
+		t.Fatalf("embedded postgres start failed: %v", err)
+	}
+	defer func() {
+		if err := postgres.Stop(); err != nil {
+			t.Fatalf("embedded postgres stop failed: %v", err)
+		}
+	}()
+
+	ctx := context.Background()
+	store, err := Open(ctx, fmt.Sprintf("postgres://postgres:postgres@127.0.0.1:%d/better_airtable_cas_test?sslmode=disable", port))
+	if err != nil {
+		t.Fatalf("Open() returned error: %v", err)
+	}
+	defer store.Close()
+	if err := store.Migrate(ctx); err != nil {
+		t.Fatalf("Migrate() returned error: %v", err)
+	}
+	if err := store.UpsertUser(ctx, User{ID: "user_1"}); err != nil {
+		t.Fatalf("UpsertUser() returned error: %v", err)
+	}
+	if err := store.PutPendingOperation(ctx, PendingOperation{
+		ID:                "op_cas",
+		UserID:            "user_1",
+		BaseID:            "app123",
+		Status:            "pending_approval",
+		OperationType:     "record_mutation",
+		PayloadCiphertext: []byte("payload"),
+		CreatedAt:         time.Now().UTC(),
+		ExpiresAt:         time.Now().Add(10 * time.Minute).UTC(),
+	}); err != nil {
+		t.Fatalf("PutPendingOperation() returned error: %v", err)
+	}
+
+	won, err := store.TransitionPendingOperationStatus(ctx, "op_cas", "pending_approval", "executing")
+	if err != nil {
+		t.Fatalf("TransitionPendingOperationStatus() returned error: %v", err)
+	}
+	if !won {
+		t.Fatal("expected the first transition to win")
+	}
+
+	won, err = store.TransitionPendingOperationStatus(ctx, "op_cas", "pending_approval", "executing")
+	if err != nil {
+		t.Fatalf("second TransitionPendingOperationStatus() returned error: %v", err)
+	}
+	if won {
+		t.Fatal("expected the second transition to lose the compare-and-swap")
+	}
+
+	operation, err := store.GetPendingOperation(ctx, "op_cas")
+	if err != nil {
+		t.Fatalf("GetPendingOperation() returned error: %v", err)
+	}
+	if operation.Status != "executing" {
+		t.Fatalf("status = %q, want executing", operation.Status)
 	}
 }
 
