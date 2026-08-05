@@ -479,9 +479,13 @@ func (s *Service) GetOperation(ctx context.Context, operationID string) (Operati
 		for _, record := range payloadOperation.Records {
 			currentFields := currentValues[payloadOperation.Table][record.ID]
 			preview.Records = append(preview.Records, OperationPreviewRecord{
-				ID:            record.ID,
-				Fields:        cloneMap(record.Fields),
-				CurrentFields: cloneMap(currentFields),
+				ID: record.ID,
+				// AirtableFields keys every requested value by Airtable field name,
+				// whatever alias the caller used to address it. Fields keeps those raw
+				// aliases, so previewing it leaves the requested and current values in
+				// different key spaces and the diff reads as if nothing was there before.
+				Fields:        cloneMap(record.AirtableFields),
+				CurrentFields: keyFieldsByName(currentFields, payloadOperation.Fields),
 			})
 		}
 		view.Operations = append(view.Operations, preview)
@@ -1151,6 +1155,29 @@ func cloneMap(input map[string]any) map[string]any {
 		cloned[key] = value
 	}
 	return cloned
+}
+
+// keyFieldsByName rekeys a synced row, which arrives keyed by mirror column name,
+// onto the Airtable field names the preview's requested values use. Keys with no
+// matching field (id, created_time) pass through as they are.
+func keyFieldsByName(row map[string]any, fields []FieldPreview) map[string]any {
+	if len(row) == 0 {
+		return nil
+	}
+	names := make(map[string]string, len(fields))
+	for _, field := range fields {
+		if field.Key != "" && field.Name != "" {
+			names[field.Key] = field.Name
+		}
+	}
+	keyed := make(map[string]any, len(row))
+	for key, value := range row {
+		if name, ok := names[key]; ok {
+			key = name
+		}
+		keyed[key] = value
+	}
+	return keyed
 }
 
 func newOperationID() (string, error) {

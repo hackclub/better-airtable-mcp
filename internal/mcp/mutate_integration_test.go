@@ -249,8 +249,13 @@ func TestMutateApprovalFlowOverMCP(t *testing.T) {
 	if err := json.Unmarshal(getRecorder.Body.Bytes(), &operation); err != nil {
 		t.Fatalf("json.Unmarshal() returned error: %v", err)
 	}
-	if got := operation.Operations[0].Records[0].CurrentFields["status"]; got != "Planning" {
+	// The caller addressed the field as "status", but the preview keys both the
+	// requested and the current values by the Airtable field name so they diff.
+	if got := operation.Operations[0].Records[0].CurrentFields["Status"]; got != "Planning" {
 		t.Fatalf("expected preview current status Planning, got %#v", got)
+	}
+	if got := operation.Operations[0].Records[0].Fields["Status"]; got != "Done" {
+		t.Fatalf("expected preview requested status Done, got %#v", got)
 	}
 	if operation.MCPSessionID == "" {
 		t.Fatal("expected approval operation to include MCP session id")
@@ -1280,7 +1285,7 @@ func TestMutateDeleteRecordIDsOverMCP(t *testing.T) {
 	if operation.Operations[0].Records[0].ID != "recProject1" {
 		t.Fatalf("expected delete preview to reference recProject1, got %#v", operation.Operations[0].Records[0])
 	}
-	if got := operation.Operations[0].Records[0].CurrentFields["name"]; got != "Website Redesign" {
+	if got := operation.Operations[0].Records[0].CurrentFields["Name"]; got != "Website Redesign" {
 		t.Fatalf("expected delete preview current data, got %#v", operation.Operations[0].Records[0].CurrentFields)
 	}
 }
