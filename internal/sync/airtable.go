@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -44,6 +45,27 @@ const (
 	// instead of hanging a sync worker forever.
 	defaultHTTPTimeout = 30 * time.Second
 )
+
+// APIError is a non-2xx, non-429 response from the Airtable API. Its message
+// format is unchanged from the plain error it replaced; the type exists so
+// callers can branch on the status code (notably 401 after a token rotation).
+type APIError struct {
+	Method     string
+	Path       string
+	StatusCode int
+	Body       string
+}
+
+func (e *APIError) Error() string {
+	return fmt.Sprintf("airtable API %s %s returned %d: %s", e.Method, e.Path, e.StatusCode, e.Body)
+}
+
+// IsUnauthorized reports whether err is an Airtable 401, which is what an
+// access token gets once a refresh has rotated it out.
+func IsUnauthorized(err error) bool {
+	var apiErr *APIError
+	return errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusUnauthorized
+}
 
 type Client interface {
 	ListBases(ctx context.Context, accessToken string) ([]Base, error)
@@ -537,7 +559,12 @@ func (c *HTTPClient) doJSON(ctx context.Context, accessToken, method, requestPat
 				"error_kind", "external_api",
 				"error_message", logx.SanitizeExternalBody(string(body)),
 			)
-			return fmt.Errorf("airtable API %s %s returned %d: %s", method, request.URL.Path, response.StatusCode, strings.TrimSpace(string(body)))
+			return &APIError{
+				Method:     method,
+				Path:       request.URL.Path,
+				StatusCode: response.StatusCode,
+				Body:       strings.TrimSpace(string(body)),
+			}
 		}
 
 		if target == nil {

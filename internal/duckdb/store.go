@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -892,11 +893,31 @@ func openDatabase(path, accessMode string) (*sql.DB, error) {
 	return db, nil
 }
 
+// Every query and every sync page opens its own DuckDB instance, and DuckDB
+// defaults each instance to one worker thread per CPU. With a dozen syncs and
+// a few user queries open at once that is dozens of threads fighting over the
+// pod's 4 CPUs; on 2026-10-13 CPU sat at 100% for 40 minutes and trivial
+// queries waited over a minute. Cache files are small (tens of MB), so a
+// query rarely gains from more than two threads, and sync writes (one 100-row
+// page per transaction) need only one.
+const (
+	duckDBReadThreads  = 2
+	duckDBWriteThreads = 1
+)
+
+func threadsForAccessMode(accessMode string) int {
+	if strings.EqualFold(accessMode, "READ_ONLY") {
+		return duckDBReadThreads
+	}
+	return duckDBWriteThreads
+}
+
 func buildDSN(path, accessMode string) string {
 	values := url.Values{}
 	if accessMode != "" {
 		values.Set("access_mode", accessMode)
 	}
+	values.Set("threads", strconv.Itoa(threadsForAccessMode(accessMode)))
 	values.Set("enable_external_access", "false")
 	values.Set("autoload_known_extensions", "false")
 	values.Set("autoinstall_known_extensions", "false")

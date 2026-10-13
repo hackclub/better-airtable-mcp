@@ -162,12 +162,33 @@ func TestBuildDSNIncludesSecurityOptions(t *testing.T) {
 		"enable_external_access=false",
 		"autoload_known_extensions=false",
 		"autoinstall_known_extensions=false",
+		"threads=2",
 	}
 	for _, fragment := range requiredFragments {
 		if !strings.Contains(dsn, fragment) {
 			t.Fatalf("expected DSN %q to contain %q", dsn, fragment)
 		}
 	}
+}
+
+func TestOpenDatabaseCapsThreadsPerInstance(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "threads.db")
+
+	writer, err := openDatabase(path, "READ_WRITE")
+	if err != nil {
+		t.Fatalf("open read-write: %v", err)
+	}
+	assertSettingValue(t, writer, "threads", "1")
+	if err := writer.Close(); err != nil {
+		t.Fatalf("close writer: %v", err)
+	}
+
+	reader, err := openDatabase(path, "READ_ONLY")
+	if err != nil {
+		t.Fatalf("open read-only: %v", err)
+	}
+	defer reader.Close()
+	assertSettingValue(t, reader, "threads", "2")
 }
 
 func assertSettingValue(t *testing.T, db *sql.DB, settingName, expected string) {

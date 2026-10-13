@@ -21,7 +21,8 @@ type Service struct {
 
 	mu         sync.Mutex
 	syncLocks  map[string]*sync.Mutex
-	duckLocks  map[string]*sync.RWMutex
+	duckLocks  map[string]*ctxRWLock
+	syncSlots  chan struct{}
 	basesCache map[string]basesCacheEntry
 	now        func() time.Time
 }
@@ -63,6 +64,64 @@ type SyncProgress struct {
 
 const maxParallelRecordRequests = 5
 
+// defaultMaxConcurrentSyncs caps how many base syncs run at once across the
+// whole process. Every active base re-syncs on its interval, and after a
+// restart every restored worker starts a full sync at the same moment. With no
+// cap, ~15 simultaneous syncs plus user queries pinned all 4 CPUs for 40
+// minutes and tool calls timed out at the gateway (production, 2026-10-13).
+const defaultMaxConcurrentSyncs = 4
+
+// AccessTokenFunc returns the Airtable access token to use for the next
+// request. Sync runs call it per request instead of capturing one token at
+// the start: Airtable revokes the previous access token as soon as the refresh
+// loop rotates it, which used to fail every long sync with a 401.
+type AccessTokenFunc func(ctx context.Context) (string, error)
+
+// StaticAccessToken adapts a fixed token to AccessTokenFunc.
+func StaticAccessToken(token string) AccessTokenFunc {
+	return func(context.Context) (string, error) { return token, nil }
+}
+
+// SetMaxConcurrentSyncs changes the process-wide sync cap. Call it before any
+// sync starts.
+func (s *Service) SetMaxConcurrentSyncs(limit int) {
+	if limit < 1 {
+		limit = 1
+	}
+	s.syncSlots = make(chan struct{}, limit)
+}
+
+// acquireSyncSlot waits for one of the process-wide sync slots.
+func (s *Service) acquireSyncSlot(ctx context.Context) (func(), error) {
+	select {
+	case s.syncSlots <- struct{}{}:
+		return func() { <-s.syncSlots }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+// withAccessToken runs call with the current token. If Airtable answers 401
+// and the token source now returns a different token (it was rotated while
+// the request was in flight), it retries once with the fresh token.
+func withAccessToken[T any](ctx context.Context, tokens AccessTokenFunc, call func(token string) (T, error)) (T, error) {
+	var zero T
+	token, err := tokens(ctx)
+	if err != nil {
+		return zero, err
+	}
+	result, err := call(token)
+	if err == nil || !IsUnauthorized(err) {
+		return result, err
+	}
+	fresh, tokenErr := tokens(ctx)
+	if tokenErr != nil || fresh == token {
+		return result, err
+	}
+	logx.Event(ctx, "sync_service", "sync.access_token_rotated_retry")
+	return call(fresh)
+}
+
 type syncJob struct {
 	TableIndex int
 	Offset     string
@@ -94,7 +153,8 @@ func NewService(client Client, dataDir string) *Service {
 		client:     client,
 		dataDir:    dataDir,
 		syncLocks:  make(map[string]*sync.Mutex),
-		duckLocks:  make(map[string]*sync.RWMutex),
+		duckLocks:  make(map[string]*ctxRWLock),
+		syncSlots:  make(chan struct{}, defaultMaxConcurrentSyncs),
 		basesCache: make(map[string]basesCacheEntry),
 		now:        time.Now,
 	}
@@ -160,7 +220,12 @@ func (s *Service) SyncBase(ctx context.Context, accessToken, baseRef string) (Sy
 
 	unlockSync := s.lockSync(base.ID)
 	defer unlockSync()
-	return s.runSync(ctx, accessToken, base, nil)
+	releaseSlot, err := s.acquireSyncSlot(ctx)
+	if err != nil {
+		return SyncResult{}, err
+	}
+	defer releaseSlot()
+	return s.runSync(ctx, StaticAccessToken(accessToken), base, nil)
 }
 
 func (s *Service) ListSchema(ctx context.Context, accessToken, baseRef string) (duckdb.BaseSchema, error) {
@@ -176,7 +241,10 @@ func (s *Service) ListSchema(ctx context.Context, accessToken, baseRef string) (
 // base. Callers must have verified access and sync state first — no
 // resolution, authorization, or sync is performed here.
 func (s *Service) ListResolvedSchema(ctx context.Context, baseID, baseName string) (duckdb.BaseSchema, error) {
-	unlock := s.lockDuckRead(baseID)
+	unlock, err := s.lockDuckRead(ctx, baseID)
+	if err != nil {
+		return duckdb.BaseSchema{}, err
+	}
 	defer unlock()
 	return duckdb.ReadSchema(ctx, s.basePath(baseID), baseID, baseName)
 }
@@ -195,13 +263,19 @@ func (s *Service) QueryBase(ctx context.Context, accessToken, baseRef, query str
 // the sync manager's EnsureBaseReadable) — no resolution, authorization, or
 // sync is performed here.
 func (s *Service) QueryResolvedBase(ctx context.Context, baseID, query string) (duckdb.QueryResult, error) {
-	unlock := s.lockDuckRead(baseID)
+	unlock, err := s.lockDuckRead(ctx, baseID)
+	if err != nil {
+		return duckdb.QueryResult{}, err
+	}
 	defer unlock()
 	return duckdb.Query(ctx, s.basePath(baseID), query)
 }
 
 func (s *Service) ReadTableRowsByIDs(ctx context.Context, baseID, tableName string, ids []string) ([]map[string]any, error) {
-	unlock := s.lockDuckRead(baseID)
+	unlock, err := s.lockDuckRead(ctx, baseID)
+	if err != nil {
+		return nil, err
+	}
 	defer unlock()
 	return duckdb.ReadTableRowsByIDs(ctx, s.basePath(baseID), tableName, ids)
 }
@@ -282,30 +356,33 @@ func (s *Service) lockSync(baseID string) func() {
 	return lock.Unlock
 }
 
-func (s *Service) lockDuckRead(baseID string) func() {
+func (s *Service) duckLock(baseID string) *ctxRWLock {
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	lock, ok := s.duckLocks[baseID]
 	if !ok {
-		lock = &sync.RWMutex{}
+		lock = newCtxRWLock()
 		s.duckLocks[baseID] = lock
 	}
-	s.mu.Unlock()
-
-	lock.RLock()
-	return lock.RUnlock
+	return lock
 }
 
-func (s *Service) lockDuckWrite(baseID string) func() {
-	s.mu.Lock()
-	lock, ok := s.duckLocks[baseID]
-	if !ok {
-		lock = &sync.RWMutex{}
-		s.duckLocks[baseID] = lock
+// lockDuckRead takes the base's read lock, giving up when ctx ends so a
+// request whose caller has gone away stops queueing for the file.
+func (s *Service) lockDuckRead(ctx context.Context, baseID string) (func(), error) {
+	lock := s.duckLock(baseID)
+	if err := lock.RLock(ctx); err != nil {
+		return nil, fmt.Errorf("wait for base %s cache (a sync is writing to it): %w", baseID, err)
 	}
-	s.mu.Unlock()
+	return lock.RUnlock, nil
+}
 
-	lock.Lock()
-	return lock.Unlock
+func (s *Service) lockDuckWrite(ctx context.Context, baseID string) (func(), error) {
+	lock := s.duckLock(baseID)
+	if err := lock.Lock(ctx); err != nil {
+		return nil, fmt.Errorf("wait for base %s cache write lock: %w", baseID, err)
+	}
+	return lock.Unlock, nil
 }
 
 func (s *Service) basePath(baseID string) string {
@@ -320,9 +397,11 @@ func (s *Service) stagingPath(baseID string) string {
 	return filepath.Join(s.dataDir, baseID+".staging.db")
 }
 
-func (s *Service) runSync(ctx context.Context, accessToken string, base Base, progress func(SyncProgress)) (SyncResult, error) {
+func (s *Service) runSync(ctx context.Context, tokens AccessTokenFunc, base Base, progress func(SyncProgress)) (SyncResult, error) {
 	startedAt := time.Now().UTC()
-	tables, err := s.client.GetBaseSchema(ctx, accessToken, base.ID)
+	tables, err := withAccessToken(ctx, tokens, func(token string) ([]Table, error) {
+		return s.client.GetBaseSchema(ctx, token, base.ID)
+	})
 	if err != nil {
 		return SyncResult{}, err
 	}
@@ -378,7 +457,10 @@ func (s *Service) runSync(ctx context.Context, accessToken string, base Base, pr
 	var session *duckdb.WriteSession
 	var unlockDuck func()
 	if !useStaging {
-		unlockDuck = s.lockDuckWrite(base.ID)
+		unlockDuck, err = s.lockDuckWrite(ctx, base.ID)
+		if err != nil {
+			return fail(err)
+		}
 		if err := duckdb.InitializeSnapshot(ctx, targetPath, init); err != nil {
 			unlockDuck()
 			return fail(err)
@@ -439,10 +521,12 @@ func (s *Service) runSync(ctx context.Context, accessToken string, base Base, pr
 				defer workerWG.Done()
 				for job := range jobs {
 					runtime := runtimes[job.TableIndex]
-					page, err := s.client.ListRecordsPage(workerCtx, accessToken, base.ID, runtime.Plan.Table.AirtableTableID, ListRecordsPageOptions{
-						Offset:        job.Offset,
-						SortFieldName: runtime.Plan.Sort.SortFieldName,
-						SortDirection: runtime.Plan.Sort.SortDirection,
+					page, err := withAccessToken(workerCtx, tokens, func(token string) (ListRecordsPageResult, error) {
+						return s.client.ListRecordsPage(workerCtx, token, base.ID, runtime.Plan.Table.AirtableTableID, ListRecordsPageOptions{
+							Offset:        job.Offset,
+							SortFieldName: runtime.Plan.Sort.SortFieldName,
+							SortDirection: runtime.Plan.Sort.SortDirection,
+						})
 					})
 					if err != nil {
 						select {
@@ -531,9 +615,11 @@ func (s *Service) runSync(ctx context.Context, accessToken string, base Base, pr
 			if useStaging {
 				err = session.ApplyTablePage(ctx, runtime.Plan.Table, result.Records, tableState, syncInfo)
 			} else {
-				unlockDuck = s.lockDuckWrite(base.ID)
-				err = duckdb.ApplyTablePage(ctx, targetPath, runtime.Plan.Table, result.Records, tableState, syncInfo)
-				unlockDuck()
+				unlockDuck, err = s.lockDuckWrite(ctx, base.ID)
+				if err == nil {
+					err = duckdb.ApplyTablePage(ctx, targetPath, runtime.Plan.Table, result.Records, tableState, syncInfo)
+					unlockDuck()
+				}
 			}
 			if err != nil {
 				cancel()
@@ -575,9 +661,11 @@ func (s *Service) runSync(ctx context.Context, accessToken string, base Base, pr
 	}
 
 	if !useStaging {
-		unlockDuck = s.lockDuckWrite(base.ID)
-		err = duckdb.FinalizeSnapshot(ctx, targetPath, finalInfo)
-		unlockDuck()
+		unlockDuck, err = s.lockDuckWrite(ctx, base.ID)
+		if err == nil {
+			err = duckdb.FinalizeSnapshot(ctx, targetPath, finalInfo)
+			unlockDuck()
+		}
 		if err != nil {
 			return fail(err)
 		}
@@ -594,9 +682,11 @@ func (s *Service) runSync(ctx context.Context, accessToken string, base Base, pr
 			_ = os.Remove(targetPath)
 			return fail(fmt.Errorf("close staging write session: %w", closeErr))
 		}
-		unlockDuck = s.lockDuckWrite(base.ID)
-		err = swapDatabaseFiles(targetPath, activePath)
-		unlockDuck()
+		unlockDuck, err = s.lockDuckWrite(ctx, base.ID)
+		if err == nil {
+			err = swapDatabaseFiles(targetPath, activePath)
+			unlockDuck()
+		}
 		if err != nil {
 			_ = os.Remove(targetPath)
 			return fail(err)
@@ -702,15 +792,26 @@ func (s *Service) shouldUseStaging(baseID string) bool {
 // readSyncInfo reads the active snapshot's sync metadata under the read lock,
 // so it never opens the file while a writer or the staging swap holds it.
 func (s *Service) readSyncInfo(ctx context.Context, baseID string) (duckdb.SyncInfo, error) {
-	unlock := s.lockDuckRead(baseID)
+	unlock, err := s.lockDuckRead(ctx, baseID)
+	if err != nil {
+		return duckdb.SyncInfo{}, err
+	}
 	defer unlock()
 	return duckdb.ReadSyncInfo(ctx, s.basePath(baseID))
 }
 
 func (s *Service) markActiveSyncFailed(ctx context.Context, baseID string, progress SyncProgress, syncErr error) error {
+	// The run's context is often the reason the sync failed (deadline or
+	// cancellation), so record the failure on a short detached context.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), markFailedTimeout)
+	defer cancel()
+
 	// A read-write handle must never coexist with readers' read-only handles on
 	// the same file in this process.
-	unlock := s.lockDuckWrite(baseID)
+	unlock, err := s.lockDuckWrite(ctx, baseID)
+	if err != nil {
+		return err
+	}
 	defer unlock()
 	return duckdb.UpdateSyncFailure(ctx, s.basePath(baseID), duckdb.SyncInfo{
 		SyncStartedAt:        progress.SyncStartedAt,
@@ -725,6 +826,8 @@ func (s *Service) markActiveSyncFailed(ctx context.Context, baseID string, progr
 		Error:                syncErr.Error(),
 	})
 }
+
+const markFailedTimeout = 30 * time.Second
 
 func swapDatabaseFiles(sourcePath, destinationPath string) error {
 	if err := os.Rename(sourcePath, destinationPath); err == nil {

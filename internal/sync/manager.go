@@ -895,8 +895,9 @@ func (m *Manager) syncOnce(ctx context.Context, userID, baseID, baseName string,
 		"user_id", userID,
 		"base_id", baseID,
 	)
-	accessToken, err := m.tokens.AirtableAccessToken(ctx, userID)
-	if err != nil {
+	// Fail fast when the user's Airtable authorization is gone, before
+	// queueing for a sync slot.
+	if _, err := m.tokens.AirtableAccessToken(ctx, userID); err != nil {
 		logx.Event(ctx, "sync_manager", "sync.run_failed",
 			"user_id", userID,
 			"base_id", baseID,
@@ -906,7 +907,24 @@ func (m *Manager) syncOnce(ctx context.Context, userID, baseID, baseName string,
 		return SyncResult{}, err
 	}
 
-	result, err := m.service.runSync(ctx, accessToken, Base{ID: baseID, Name: baseName}, progress)
+	releaseSlot, err := m.service.acquireSyncSlot(ctx)
+	if err != nil {
+		logx.Event(ctx, "sync_manager", "sync.run_failed",
+			"user_id", userID,
+			"base_id", baseID,
+			"error_kind", logx.ErrorKind(err),
+			"error_message", "timed out waiting for a sync slot: "+logx.ErrorPreview(err),
+		)
+		return SyncResult{}, err
+	}
+	defer releaseSlot()
+
+	// Resolve the token per Airtable request: the refresh loop may rotate it
+	// mid-run, and Airtable revokes the old one immediately.
+	tokens := func(ctx context.Context) (string, error) {
+		return m.tokens.AirtableAccessToken(ctx, userID)
+	}
+	result, err := m.service.runSync(ctx, tokens, Base{ID: baseID, Name: baseName}, progress)
 	if err != nil {
 		logx.Event(ctx, "sync_manager", "sync.run_failed",
 			"user_id", userID,

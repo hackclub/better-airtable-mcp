@@ -84,6 +84,7 @@ func main() {
 	mux.Handle("/", logx.Route("/", landing.NewHandler("README.md")))
 
 	syncService := syncer.NewService(syncer.NewHTTPClient("", nil), cfg.DuckDBDataDir)
+	syncService.SetMaxConcurrentSyncs(cfg.SyncMaxConcurrent)
 	syncManager := syncer.NewManager(syncService, store, tokenManager, cfg.SyncInterval, cfg.SyncTTL)
 	approvalService := approval.NewService(store, cipher, syncService, syncManager, tokenManager, syncer.NewHTTPClient("", nil), cfg.BaseURLString(), cfg.ApprovalTTL)
 	toolRuntime := &tools.Runtime{

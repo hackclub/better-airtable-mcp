@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"time"
@@ -22,7 +23,15 @@ type Handler struct {
 	toolIndex     map[string]Tool
 	sessions      *SessionManager
 	heartbeat     time.Duration
+	toolTimeout   time.Duration
 }
+
+// DefaultToolCallTimeout bounds one tools/call. The ingress in front of the
+// server drops a POST after about 50 seconds and the client then sees a bare
+// 502 with no explanation (seen in production on 2026-10-13, when tool calls
+// queued behind busy syncs for 40-115 seconds). Finishing first lets the
+// server return a readable, retryable error instead.
+const DefaultToolCallTimeout = 40 * time.Second
 
 type rpcRequest struct {
 	JSONRPC string          `json:"jsonrpc"`
@@ -62,6 +71,7 @@ func NewHandler(serverName, serverVersion string, tools []Tool) *Handler {
 		toolIndex:     index,
 		sessions:      NewSessionManager(),
 		heartbeat:     25 * time.Second,
+		toolTimeout:   DefaultToolCallTimeout,
 	}
 }
 
@@ -310,14 +320,28 @@ func (h *Handler) dispatch(ctx context.Context, request rpcRequest) (any, *rpcEr
 			return ErrorResult(fmt.Sprintf("unknown tool %q", params.Name), nil), nil
 		}
 
-		result, err := tool.Call(ctx, params.Arguments)
+		callCtx := ctx
+		if h.toolTimeout > 0 {
+			var cancel context.CancelFunc
+			callCtx, cancel = context.WithTimeout(ctx, h.toolTimeout)
+			defer cancel()
+		}
+		result, err := tool.Call(callCtx, params.Arguments)
 		if err != nil {
+			if ctx.Err() == nil && errors.Is(callCtx.Err(), context.DeadlineExceeded) {
+				return ErrorResult(toolTimeoutMessage(params.Name, h.toolTimeout), nil), nil
+			}
 			return ErrorResult(err.Error(), nil), nil
 		}
 		return result, nil
 	default:
 		return nil, &rpcError{Code: -32601, Message: "method not found"}
 	}
+}
+
+func toolTimeoutMessage(toolName string, timeout time.Duration) string {
+	return fmt.Sprintf("%s did not finish within %s because the server is busy, usually because a sync is still writing this base's cache. "+
+		"Retry in a minute. To watch the sync, call check_operation with operation_id \"sync_<base id>\".", toolName, timeout)
 }
 
 func (h *Handler) writeRPCError(w http.ResponseWriter, id json.RawMessage, code int, message string) {

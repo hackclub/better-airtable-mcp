@@ -18,6 +18,7 @@ const (
 	defaultApprovalTTL       = 60 * time.Minute
 	defaultQueryLimit        = 100
 	defaultQueryMaxLimit     = 1000
+	defaultSyncMaxConcurrent = 4
 	requiredEncryptionKeyLen = 32
 )
 
@@ -34,6 +35,7 @@ type Config struct {
 	ApprovalTTL          time.Duration
 	QueryDefaultLimit    int
 	QueryMaxLimit        int
+	SyncMaxConcurrent    int
 }
 
 func LoadFromEnv() (Config, error) {
@@ -49,6 +51,7 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 		ApprovalTTL:       defaultApprovalTTL,
 		QueryDefaultLimit: defaultQueryLimit,
 		QueryMaxLimit:     defaultQueryMaxLimit,
+		SyncMaxConcurrent: defaultSyncMaxConcurrent,
 	}
 
 	var problems []string
@@ -87,6 +90,7 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 	cfg.ApprovalTTL = durationFromMinutes(lookup, "APPROVAL_TTL_MINUTES", cfg.ApprovalTTL, &problems)
 	cfg.QueryDefaultLimit = intWithDefault(lookup, "QUERY_DEFAULT_LIMIT", cfg.QueryDefaultLimit, &problems)
 	cfg.QueryMaxLimit = intWithDefault(lookup, "QUERY_MAX_LIMIT", cfg.QueryMaxLimit, &problems)
+	cfg.SyncMaxConcurrent = intWithDefault(lookup, "SYNC_MAX_CONCURRENT", cfg.SyncMaxConcurrent, &problems)
 
 	if cfg.QueryDefaultLimit <= 0 {
 		problems = append(problems, "QUERY_DEFAULT_LIMIT must be greater than zero")
@@ -99,6 +103,9 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 	}
 	if cfg.SyncInterval <= 0 {
 		problems = append(problems, "SYNC_INTERVAL_SECONDS must be greater than zero")
+	}
+	if cfg.SyncMaxConcurrent <= 0 {
+		problems = append(problems, "SYNC_MAX_CONCURRENT must be greater than zero")
 	}
 	if cfg.SyncTTL <= 0 {
 		problems = append(problems, "SYNC_TTL_MINUTES must be greater than zero")

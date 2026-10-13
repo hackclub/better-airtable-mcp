@@ -33,6 +33,9 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.QueryMaxLimit != defaultQueryMaxLimit {
 		t.Fatalf("expected default query max limit %d, got %d", defaultQueryMaxLimit, cfg.QueryMaxLimit)
 	}
+	if cfg.SyncMaxConcurrent != defaultSyncMaxConcurrent {
+		t.Fatalf("expected default sync concurrency %d, got %d", defaultSyncMaxConcurrent, cfg.SyncMaxConcurrent)
+	}
 	if got := cfg.MCPURL(); got != "https://better-airtable-mcp.hackclub.com/mcp" {
 		t.Fatalf("expected MCP URL to be populated, got %q", got)
 	}
@@ -47,6 +50,7 @@ func TestLoadRejectsInvalidValues(t *testing.T) {
 		"APP_ENCRYPTION_KEY":     "too-short",
 		"QUERY_DEFAULT_LIMIT":    "500",
 		"QUERY_MAX_LIMIT":        "100",
+		"SYNC_MAX_CONCURRENT":    "0",
 	}))
 	if err == nil {
 		t.Fatal("expected Load() to fail for invalid configuration")
@@ -57,6 +61,7 @@ func TestLoadRejectsInvalidValues(t *testing.T) {
 		"BASE_URL must be a valid absolute URL",
 		"APP_ENCRYPTION_KEY must be exactly 32 bytes",
 		"QUERY_DEFAULT_LIMIT must be less than or equal to QUERY_MAX_LIMIT",
+		"SYNC_MAX_CONCURRENT must be greater than zero",
 	} {
 		if !strings.Contains(message, fragment) {
 			t.Fatalf("expected error to contain %q, got %q", fragment, message)

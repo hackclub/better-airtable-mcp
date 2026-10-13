@@ -1158,6 +1158,7 @@ All configuration via environment variables:
 | `APPROVAL_TTL_MINUTES` | Minutes before pending approvals expire | `60` |
 | `QUERY_DEFAULT_LIMIT` | Default row limit for queries | `100` |
 | `QUERY_MAX_LIMIT` | Maximum row limit for queries | `1000` |
+| `SYNC_MAX_CONCURRENT` | Maximum base syncs running at once across the process; others wait for a slot | `4` |
 
 ---
 
