@@ -517,10 +517,13 @@ const (
 	failureBackoffBase = 2 * time.Second
 	failureBackoffMax  = 5 * time.Minute
 
-	// syncRunTimeout caps a single base sync run. Large bases legitimately
-	// take minutes at ~4 req/s, so the cap is generous — it exists to turn
-	// an indefinitely stalled run into a normal retriable failure.
-	syncRunTimeout = 15 * time.Minute
+	// syncRunTimeout caps a single base sync run, turning an indefinitely
+	// stalled run into a normal retriable failure. It must sit well above
+	// the slowest legitimate run: a table's pages are fetched one after
+	// another, and the Unified YSWS DB needs about 17 minutes per sync on
+	// prod (1,616 of its 1,753 pages done when the old 15 minute cap hit,
+	// 2026-10-13), so every run of it failed and rebuilt from scratch.
+	syncRunTimeout = 1 * time.Hour
 )
 
 // failureBackoff returns how long to wait after the last failed run before the
