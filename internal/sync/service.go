@@ -64,6 +64,12 @@ type SyncProgress struct {
 
 const maxParallelRecordRequests = 5
 
+// An active-file sync flushes its buffered pages once either limit is hit.
+const (
+	activeFlushRecords  = 2000
+	activeFlushInterval = 3 * time.Second
+)
+
 // defaultMaxConcurrentSyncs caps how many base syncs run at once across the
 // whole process. Every active base re-syncs on its interval, and after a
 // restart every restored worker starts a full sync at the same moment. With no
@@ -561,6 +567,9 @@ func (s *Service) runSync(ctx context.Context, tokens AccessTokenFunc, base Base
 
 		pendingTables := len(plans)
 		var totalVisibleRecords int64
+		var activeBatch []duckdb.TablePage
+		var activeBatchRecords int
+		lastActiveFlush := time.Now()
 		for pendingTables > 0 {
 			var result syncPageResult
 			select {
@@ -569,7 +578,7 @@ func (s *Service) runSync(ctx context.Context, tokens AccessTokenFunc, base Base
 				// Workers bail out on workerCtx.Done() without sending a result,
 				// so a bare receive here would block forever once the run times
 				// out. Treat the deadline like any other page error.
-				result = syncPageResult{Err: fmt.Errorf("sync run aborted: %w", ctx.Err())}
+				result = syncPageResult{Err: fmt.Errorf("sync run aborted: %w", context.Cause(ctx))}
 			}
 			if result.Err != nil {
 				cancel()
@@ -620,13 +629,42 @@ func (s *Service) runSync(ctx context.Context, tokens AccessTokenFunc, base Base
 				RecordsSyncedThisRun: currentInfo.RecordsSyncedThisRun,
 			}
 
+			// Queue the table's next page before writing this one, so the
+			// Airtable round trip overlaps the write. A table's pages are
+			// sequential (each offset comes from the previous page), so for
+			// the largest table the run time is the sum of these round trips.
+			// Each table has at most one job in flight, so the send never
+			// blocks, and per-table write order is unchanged because results
+			// are still applied one at a time by this loop.
+			if result.NextOffset != "" {
+				jobs <- syncJob{TableIndex: result.TableIndex, Offset: result.NextOffset}
+			}
+
+			flushed := true
 			if useStaging {
 				err = session.ApplyTablePage(ctx, runtime.Plan.Table, result.Records, tableState, syncInfo)
 			} else {
-				unlockDuck, err = s.lockDuckWrite(ctx, base.ID)
-				if err == nil {
-					err = duckdb.ApplyTablePage(ctx, targetPath, runtime.Plan.Table, result.Records, tableState, syncInfo)
-					unlockDuck()
+				// Active-file writes reopen (and so checkpoint) the file every
+				// time, so pages are batched and flushed together. Readers see
+				// new rows a few seconds later instead of per page.
+				activeBatch = append(activeBatch, duckdb.TablePage{
+					Table:   runtime.Plan.Table,
+					Records: result.Records,
+					State:   tableState,
+				})
+				activeBatchRecords += len(result.Records)
+				flushed = pendingTables == 0 ||
+					activeBatchRecords >= activeFlushRecords ||
+					time.Since(lastActiveFlush) >= activeFlushInterval
+				if flushed {
+					unlockDuck, err = s.lockDuckWrite(ctx, base.ID)
+					if err == nil {
+						err = duckdb.ApplyTablePages(ctx, targetPath, activeBatch, syncInfo)
+						unlockDuck()
+					}
+					activeBatch = activeBatch[:0]
+					activeBatchRecords = 0
+					lastActiveFlush = time.Now()
 				}
 			}
 			if err != nil {
@@ -641,12 +679,10 @@ func (s *Service) runSync(ctx context.Context, tokens AccessTokenFunc, base Base
 				return fail(err)
 			}
 
-			if progress != nil {
+			// Progress is reported only once rows are written, since partial
+			// reads use it as the count of visible records.
+			if progress != nil && flushed {
 				progress(currentInfo)
-			}
-
-			if result.NextOffset != "" {
-				jobs <- syncJob{TableIndex: result.TableIndex, Offset: result.NextOffset}
 			}
 		}
 

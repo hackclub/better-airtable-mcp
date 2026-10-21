@@ -27,6 +27,9 @@ type Manager struct {
 	ttl      time.Duration
 	now      func() time.Time
 
+	// stallTimeout is syncStallTimeout, a field so tests can shorten it.
+	stallTimeout time.Duration
+
 	mu      sync.Mutex
 	workers map[string]*workerState
 }
@@ -92,6 +95,8 @@ func NewManager(service *Service, store *db.Store, tokens TokenSource, interval,
 		ttl:      ttl,
 		now:      time.Now,
 		workers:  make(map[string]*workerState),
+
+		stallTimeout: syncStallTimeout,
 	}
 }
 
@@ -319,9 +324,8 @@ func (m *Manager) activateBase(ctx context.Context, userID, baseRef string) (Bas
 		})
 	}
 
-	worker := m.getOrCreateWorker(base)
 	activeUntil := m.now().Add(m.ttl)
-	worker.touch(userID, activeUntil)
+	worker := m.getOrCreateWorker(base, userID, activeUntil)
 	if m.store != nil {
 		_ = m.store.TouchSyncState(ctx, base.ID, activeUntil.UTC(), userID)
 	}
@@ -333,14 +337,19 @@ func (m *Manager) activateBase(ctx context.Context, userID, baseRef string) (Bas
 	return base, worker, nil
 }
 
-func (m *Manager) getOrCreateWorker(base Base) *workerState {
+// getOrCreateWorker returns the base's worker, recording the caller and its
+// activity window on it. A new worker gets them before its goroutine starts:
+// started first, it could see a zero activeUntil, judge itself expired, delete
+// the base's cache file and exit while the caller waited on it.
+func (m *Manager) getOrCreateWorker(base Base, userID string, activeUntil time.Time) *workerState {
 	m.mu.Lock()
-	defer m.mu.Unlock()
-
 	if worker, ok := m.workers[base.ID]; ok {
 		worker.baseName = base.Name
+		m.mu.Unlock()
+		worker.touch(userID, activeUntil)
 		return worker
 	}
+	defer m.mu.Unlock()
 
 	worker := &workerState{
 		baseID:   base.ID,
@@ -350,6 +359,8 @@ func (m *Manager) getOrCreateWorker(base Base) *workerState {
 		wakeCh:   make(chan struct{}, 1),
 	}
 	worker.seedFromSnapshot()
+	worker.syncTokenUserID = userID
+	worker.activeUntil = activeUntil.UTC()
 	m.workers[base.ID] = worker
 	logx.Event(context.Background(), "sync_manager", "sync.worker_created",
 		"base_id", base.ID,
@@ -373,10 +384,12 @@ func (m *Manager) restoreWorker(state db.SyncState) {
 		}
 		worker.seedFromSnapshot()
 		m.workers[state.BaseID] = worker
+		// Restore before starting, for the same reason as getOrCreateWorker.
+		worker.restoreFromState(state)
 		go worker.run()
+	} else {
+		worker.restoreFromState(state)
 	}
-
-	worker.restoreFromState(state)
 	logx.Event(context.Background(), "sync_manager", "sync.worker_restored",
 		"base_id", state.BaseID,
 		"active_until", timeValue(state.ActiveUntil),
@@ -517,13 +530,16 @@ const (
 	failureBackoffBase = 2 * time.Second
 	failureBackoffMax  = 5 * time.Minute
 
-	// syncRunTimeout caps a single base sync run, turning an indefinitely
-	// stalled run into a normal retriable failure. It must sit well above
-	// the slowest legitimate run: a table's pages are fetched one after
-	// another, and the Unified YSWS DB needs about 17 minutes per sync on
-	// prod (1,616 of its 1,753 pages done when the old 15 minute cap hit,
-	// 2026-10-13), so every run of it failed and rebuilt from scratch.
-	syncRunTimeout = 1 * time.Hour
+	// syncStallTimeout fails a run that has written no page for this long,
+	// turning an indefinitely stalled run into a normal retriable failure.
+	// It must exceed the slowest legitimate page: one Airtable request with
+	// every retry is up to 6 x 30s timeouts plus 5 x 90s backoffs (~10.5m).
+	syncStallTimeout = 15 * time.Minute
+
+	// syncRunTimeout is only a backstop behind the stall watch. Large bases
+	// page through one table sequentially and legitimately run for tens of
+	// minutes when Airtable is slow, so this must stay well above that.
+	syncRunTimeout = 3 * time.Hour
 )
 
 // failureBackoff returns how long to wait after the last failed run before the
@@ -927,7 +943,23 @@ func (m *Manager) syncOnce(ctx context.Context, userID, baseID, baseName string,
 	tokens := func(ctx context.Context) (string, error) {
 		return m.tokens.AirtableAccessToken(ctx, userID)
 	}
-	result, err := m.service.runSync(ctx, tokens, Base{ID: baseID, Name: baseName}, progress)
+	// The stall watch starts after the slot is acquired, so time spent queued
+	// behind other syncs never counts as a stall.
+	stallTimeout := m.stallTimeout
+	if stallTimeout <= 0 {
+		stallTimeout = syncStallTimeout
+	}
+	runCtx, stall := watchForStall(ctx, stallTimeout)
+	result, err := m.service.runSync(runCtx, tokens, Base{ID: baseID, Name: baseName}, func(p SyncProgress) {
+		stall.Touch()
+		if progress != nil {
+			progress(p)
+		}
+	})
+	if err != nil && !errors.Is(err, errSyncStalled) && errors.Is(context.Cause(runCtx), errSyncStalled) {
+		err = fmt.Errorf("%w: %w", context.Cause(runCtx), err)
+	}
+	stall.Stop()
 	if err != nil {
 		logx.Event(ctx, "sync_manager", "sync.run_failed",
 			"user_id", userID,
