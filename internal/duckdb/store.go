@@ -319,33 +319,29 @@ func ApplyTablePage(ctx context.Context, path string, table TableSnapshot, recor
 }
 
 func applyTablePage(ctx context.Context, db *sql.DB, table TableSnapshot, records []RecordSnapshot, tableState TableSyncState, info SyncInfo) error {
-	tx, err := db.BeginTx(ctx, nil)
+	return writePages(ctx, db, []TablePage{{Table: table, Records: records, State: tableState}}, info)
+}
+
+// TablePage is one fetched Airtable page and the table state after it.
+type TablePage struct {
+	Table   TableSnapshot
+	Records []RecordSnapshot
+	State   TableSyncState
+}
+
+// ApplyTablePages writes several pages in one open and one transaction.
+// Closing a READ_WRITE handle checkpoints the file, so an active-file sync
+// that opened once per 100-record page spent much of its time opening and
+// checkpointing: replaying the Unified YSWS DB (174k records), batching pages
+// alone cut the run from 271s to 157s.
+func ApplyTablePages(ctx context.Context, path string, pages []TablePage, info SyncInfo) error {
+	db, err := openDatabase(path, "READ_WRITE")
 	if err != nil {
-		return fmt.Errorf("begin duckdb transaction: %w", err)
-	}
-	defer func() {
-		_ = tx.Rollback()
-	}()
-
-	if err := insertRecords(ctx, tx, TableSnapshot{
-		DuckDBTableName: table.DuckDBTableName,
-		Fields:          table.Fields,
-		Records:         records,
-	}); err != nil {
 		return err
 	}
-	if err := upsertTableSyncState(ctx, tx, tableState); err != nil {
-		return err
-	}
-	if err := upsertSyncInfo(ctx, tx, info); err != nil {
-		return err
-	}
+	defer db.Close()
 
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit duckdb page: %w", err)
-	}
-
-	return nil
+	return writePages(ctx, db, pages, info)
 }
 
 func UpdateSyncFailure(ctx context.Context, path string, info SyncInfo) error {
@@ -682,7 +678,7 @@ func createMetadataTables(ctx context.Context, tx *sql.Tx) error {
 	return nil
 }
 
-func upsertSyncInfo(ctx context.Context, tx *sql.Tx, info SyncInfo) error {
+func upsertSyncInfo(ctx context.Context, tx sqlExecutor, info SyncInfo) error {
 	if _, err := tx.ExecContext(ctx, `DELETE FROM _sync_info`); err != nil {
 		return fmt.Errorf("clear sync info: %w", err)
 	}
@@ -729,7 +725,7 @@ func upsertSyncInfo(ctx context.Context, tx *sql.Tx, info SyncInfo) error {
 	return nil
 }
 
-func upsertTableSyncState(ctx context.Context, tx *sql.Tx, state TableSyncState) error {
+func upsertTableSyncState(ctx context.Context, tx sqlExecutor, state TableSyncState) error {
 	if _, err := tx.ExecContext(
 		ctx,
 		`INSERT INTO _table_sync (
@@ -803,7 +799,7 @@ func insertMetadataRows(ctx context.Context, tx *sql.Tx, table TableSnapshot) er
 	return nil
 }
 
-func insertRecords(ctx context.Context, tx *sql.Tx, table TableSnapshot) error {
+func insertRecords(ctx context.Context, tx sqlExecutor, table TableSnapshot) error {
 	if len(table.Records) == 0 {
 		return nil
 	}
@@ -898,12 +894,20 @@ func openDatabase(path, accessMode string) (*sql.DB, error) {
 // a few user queries open at once that is dozens of threads fighting over the
 // pod's 4 CPUs; on 2026-10-13 CPU sat at 100% for 40 minutes and trivial
 // queries waited over a minute. Cache files are small (tens of MB), so a
-// query rarely gains from more than two threads, and sync writes (one 100-row
-// page per transaction) need only one.
+// query rarely gains from more than two threads, and sync writes (appended a
+// batch of pages per transaction) need only one.
 const (
 	duckDBReadThreads  = 2
 	duckDBWriteThreads = 1
 )
+
+// duckDBWriteMemoryLimit caps the buffer pool of a sync's write instance.
+// DuckDB defaults every instance to 80% of the container's memory and does
+// not account for the Go heap beside it. A write instance held open across a
+// whole batch (or a whole staging run) on the 174k-record Unified YSWS DB grew
+// enough to be OOM-killed in a 2.5 GB cgroup; capped, it completes there with
+// room to spare and evicts committed blocks to the file instead.
+const duckDBWriteMemoryLimit = "512MB"
 
 func threadsForAccessMode(accessMode string) int {
 	if strings.EqualFold(accessMode, "READ_ONLY") {
@@ -918,6 +922,9 @@ func buildDSN(path, accessMode string) string {
 		values.Set("access_mode", accessMode)
 	}
 	values.Set("threads", strconv.Itoa(threadsForAccessMode(accessMode)))
+	if !strings.EqualFold(accessMode, "READ_ONLY") {
+		values.Set("memory_limit", duckDBWriteMemoryLimit)
+	}
 	values.Set("enable_external_access", "false")
 	values.Set("autoload_known_extensions", "false")
 	values.Set("autoinstall_known_extensions", "false")

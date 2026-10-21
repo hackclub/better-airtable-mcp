@@ -179,6 +179,7 @@ func TestOpenDatabaseCapsThreadsPerInstance(t *testing.T) {
 		t.Fatalf("open read-write: %v", err)
 	}
 	assertSettingValue(t, writer, "threads", "1")
+	assertSettingValue(t, writer, "memory_limit", "488.2 MiB")
 	if err := writer.Close(); err != nil {
 		t.Fatalf("close writer: %v", err)
 	}

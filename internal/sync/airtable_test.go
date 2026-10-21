@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -358,7 +359,9 @@ func TestHTTPClientLogsRetryWithoutTokenLeakage(t *testing.T) {
 	}))
 	defer server.Close()
 
-	var output bytes.Buffer
+	// Sync workers left running by other tests also log through the default
+	// logger, so the buffer must tolerate concurrent writes.
+	var output lockedBuffer
 	previous := slog.Default()
 	slog.SetDefault(logx.NewLogger(&output))
 	t.Cleanup(func() {
@@ -388,4 +391,21 @@ func TestNewHTTPClientDefaultsToTimeoutBearingClient(t *testing.T) {
 	if client.httpClient.Timeout <= 0 {
 		t.Fatalf("expected default http client to carry a timeout, got %v", client.httpClient.Timeout)
 	}
+}
+
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
 }
