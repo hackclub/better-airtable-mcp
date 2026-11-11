@@ -961,7 +961,7 @@ CREATE TABLE pending_operations (
   error                      TEXT,
   created_at                 TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   expires_at                 TIMESTAMPTZ NOT NULL,
-  resolved_at                TIMESTAMPTZ
+  resolved_at                TIMESTAMPTZ      -- execution start while executing; resolution time once terminal (see §5.4)
 );
 
 -- Sync state tracking
