@@ -27,6 +27,9 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.SyncInterval != time.Minute {
 		t.Fatalf("expected default sync interval %v, got %v", time.Minute, cfg.SyncInterval)
 	}
+	if cfg.ApprovalTTL != 24*time.Hour {
+		t.Fatalf("expected default approval TTL 24h, got %v", cfg.ApprovalTTL)
+	}
 	if cfg.QueryDefaultLimit != defaultQueryLimit {
 		t.Fatalf("expected default query limit %d, got %d", defaultQueryLimit, cfg.QueryDefaultLimit)
 	}
@@ -38,6 +41,45 @@ func TestLoadDefaults(t *testing.T) {
 	}
 	if got := cfg.MCPURL(); got != "https://better-airtable-mcp.hackclub.com/mcp" {
 		t.Fatalf("expected MCP URL to be populated, got %q", got)
+	}
+}
+
+func TestLoadApprovalTTL(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		value   string
+		want    time.Duration
+		wantErr bool
+	}{
+		{name: "blank uses default", value: " ", want: 24 * time.Hour},
+		{name: "shorter override", value: "60", want: time.Hour},
+		{name: "longer override", value: "2880", want: 48 * time.Hour},
+		{name: "zero", value: "0", wantErr: true},
+		{name: "negative", value: "-1", wantErr: true},
+		{name: "invalid", value: "one day", wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := Load(testLookup(map[string]string{
+				"DATABASE_URL":           "postgres://localhost/better_airtable",
+				"AIRTABLE_CLIENT_ID":     "client-id",
+				"AIRTABLE_CLIENT_SECRET": "client-secret",
+				"BASE_URL":               "https://better-airtable-mcp.hackclub.com",
+				"APP_ENCRYPTION_KEY":     strings.Repeat("x", 32),
+				"APPROVAL_TTL_MINUTES":   tc.value,
+			}))
+			if tc.wantErr {
+				if err == nil || !strings.Contains(err.Error(), "APPROVAL_TTL_MINUTES") {
+					t.Fatalf("expected approval TTL error, got %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Load() returned error: %v", err)
+			}
+			if cfg.ApprovalTTL != tc.want {
+				t.Fatalf("expected approval TTL %v, got %v", tc.want, cfg.ApprovalTTL)
+			}
+		})
 	}
 }
 

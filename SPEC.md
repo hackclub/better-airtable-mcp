@@ -463,7 +463,7 @@ For `delete_records`, `records` may be either objects containing `id` or plain A
 - Stores the pending operation in Postgres
 - Returns immediately with the approval URL and operation ID
 - `operation_id` is generated from at least 128 bits of randomness; the approval URL itself is the credential
-- The operation expires after **60 minutes** if not approved
+- The operation expires after **24 hours** by default if not approved (configurable via `APPROVAL_TTL_MINUTES`)
 - **Approval is all-or-nothing**: the user approves or rejects the entire request as a unit; there is no partial approval UI
 - **Execution is not transactional**: Airtable mutations are sent in batches of up to 10 records/request, sequentially, and the server stops on the first failed Airtable request
 - If a later batch fails after earlier batches succeeded, the operation status becomes `partially_completed` and the result includes which batches/records succeeded before the failure
@@ -599,7 +599,7 @@ field to "deprecated" and calls it a deletion).
 - Resolves table/field references to Airtable IDs from the synced schema; rejects
   unknown tables/fields and name collisions for create operations.
 - Stores a pending operation with `operation_type = "schema_mutation"`; returns the
-  approval URL and 60-minute expiry, exactly like `mutate`.
+  approval URL and default 24-hour expiry, exactly like `mutate`.
 - On approval, executes one meta API call per operation, sequentially, using the
   requesting user's Airtable token. A mid-sequence failure yields `partially_completed`.
 - Schema changes restructure the base, so execution triggers a full base re-sync.
@@ -811,7 +811,7 @@ If rejected:
   → Operation status → "rejected"
   → No changes made
 
-If 60 minutes pass with no action:
+If the approval TTL passes with no action (24 hours by default):
   → Operation status → "expired"
   → No changes made
 ```
@@ -1155,7 +1155,7 @@ All configuration via environment variables:
 | `APP_ENCRYPTION_KEY` | 32-byte key for app-level encryption of Airtable tokens and pending operation payloads | required |
 | `SYNC_INTERVAL_SECONDS` | Target seconds between sync starts while a base is active | `60` |
 | `SYNC_TTL_MINUTES` | Minutes of inactivity before cache eviction | `10` |
-| `APPROVAL_TTL_MINUTES` | Minutes before pending approvals expire | `60` |
+| `APPROVAL_TTL_MINUTES` | Minutes before pending approvals expire | `1440` (24 hours) |
 | `QUERY_DEFAULT_LIMIT` | Default row limit for queries | `100` |
 | `QUERY_MAX_LIMIT` | Maximum row limit for queries | `1000` |
 | `SYNC_MAX_CONCURRENT` | Maximum base syncs running at once across the process; others wait for a slot | `4` |
@@ -1174,7 +1174,7 @@ All configuration via environment variables:
 | **Approval for all record writes** | Core product thesis — no surprises |
 | **Approval is atomic; execution is not** | Users make a single approve/reject decision, but Airtable's API does not offer cross-request transactions |
 | **Snake_case table/field names** | SQL ergonomics for LLMs; metadata table preserves the mapping |
-| **60-minute approval expiry** | Long enough to review, short enough to avoid stale operations |
+| **24-hour default approval expiry** | Allows a full day to review; previews show a snapshot staleness notice |
 | **On-disk DuckDB (not in-memory)** | Survives sync worker restarts; shared across connections |
 | **DuckDB files wiped on redeploy** | Acceptable since they're caches; Postgres is the source of truth for everything durable |
 | **Startup sweep for stale DuckDB files** | TTL-based cleanup is lazy during normal operation, so boot should remove expired or orphaned cache files left behind by crashes/restarts |

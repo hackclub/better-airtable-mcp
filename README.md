@@ -111,7 +111,7 @@ Optional, with defaults:
 - `PORT` (default `8080`)
 - `DUCKDB_DATA_DIR` (default `/data/duckdb`) - where per-base DuckDB cache files are stored
 - `SYNC_INTERVAL_SECONDS` (default `60`) and `SYNC_TTL_MINUTES` (default `10`)
-- `APPROVAL_TTL_MINUTES` (default `60`) - how long a pending approval stays valid
+- `APPROVAL_TTL_MINUTES` (default `1440`, or 24 hours) - how long a pending approval stays valid
 - `QUERY_DEFAULT_LIMIT` (default `100`) and `QUERY_MAX_LIMIT` (default `1000`)
 - `SYNC_MAX_CONCURRENT` (default `4`) - how many base syncs may run at once; the rest queue for a slot
 
