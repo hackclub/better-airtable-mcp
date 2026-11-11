@@ -885,15 +885,16 @@ CREATE TABLE pending_operations (
   error                      TEXT,              -- error message if failed
   created_at                 TIMESTAMPTZ NOT NULL,
   expires_at                 TIMESTAMPTZ NOT NULL,
-  resolved_at                TIMESTAMPTZ        -- execution start while executing; resolution time once terminal
+  execution_started_at       TIMESTAMPTZ,       -- when execution begins
+  resolved_at                TIMESTAMPTZ        -- terminal resolution time only
 );
 ```
 
 A background goroutine expires stale operations every minute.
 It also marks operations stuck in `executing` for more than 15 minutes as failed,
 independent of approval expiry. The atomic transition to `executing` records its
-start in `resolved_at`; a terminal status update replaces that with the resolution
-time. Execution itself is bounded to 5 minutes. On startup, legacy executing rows
+start in `execution_started_at`; `resolved_at` remains NULL until terminal resolution.
+Execution itself is bounded to 5 minutes. On startup, legacy executing rows
 without a start timestamp receive the startup time, giving them a full 15-minute
 recovery window. Repeated migrations preserve existing timestamps.
 
@@ -961,7 +962,8 @@ CREATE TABLE pending_operations (
   error                      TEXT,
   created_at                 TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   expires_at                 TIMESTAMPTZ NOT NULL,
-  resolved_at                TIMESTAMPTZ      -- execution start while executing; resolution time once terminal (see §5.4)
+  execution_started_at       TIMESTAMPTZ,     -- when execution begins
+  resolved_at                TIMESTAMPTZ      -- terminal resolution time only
 );
 
 -- Sync state tracking

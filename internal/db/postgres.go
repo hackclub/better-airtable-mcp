@@ -68,6 +68,7 @@ type PendingOperation struct {
 	Error                   *string
 	CreatedAt               time.Time
 	ExpiresAt               time.Time
+	ExecutionStartedAt      *time.Time
 	ResolvedAt              *time.Time
 }
 
@@ -169,6 +170,7 @@ func (s *Store) Migrate(ctx context.Context) error {
 			error TEXT,
 			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 			expires_at TIMESTAMPTZ NOT NULL,
+			execution_started_at TIMESTAMPTZ,
 			resolved_at TIMESTAMPTZ
 		)`,
 		`CREATE TABLE IF NOT EXISTS sync_state (
@@ -203,9 +205,17 @@ func (s *Store) Migrate(ctx context.Context) error {
 	if _, err := s.pool.Exec(ctx, `ALTER TABLE mcp_tokens ADD COLUMN IF NOT EXISTS client_name TEXT`); err != nil {
 		return fmt.Errorf("ensure mcp_tokens.client_name column: %w", err)
 	}
+	if _, err := s.pool.Exec(ctx, `ALTER TABLE pending_operations ADD COLUMN IF NOT EXISTS execution_started_at TIMESTAMPTZ`); err != nil {
+		return fmt.Errorf("ensure pending_operations.execution_started_at column: %w", err)
+	}
 	// Older versions did not timestamp entry into executing. Give those rows
 	// a full recovery window from startup; never reset a known execution start.
-	if _, err := s.pool.Exec(ctx, `UPDATE pending_operations SET resolved_at = NOW() WHERE status = 'executing' AND resolved_at IS NULL`); err != nil {
+	// Clear any nonterminal resolution timestamp left by an older version.
+	if _, err := s.pool.Exec(ctx, `
+		UPDATE pending_operations
+		SET execution_started_at = COALESCE(execution_started_at, NOW()), resolved_at = NULL
+		WHERE status = 'executing' AND (execution_started_at IS NULL OR resolved_at IS NOT NULL)
+	`); err != nil {
 		return fmt.Errorf("backfill executing operation timestamps: %w", err)
 	}
 
@@ -451,8 +461,9 @@ func (s *Store) PutPendingOperation(ctx context.Context, operation PendingOperat
 			error,
 			created_at,
 			expires_at,
+			execution_started_at,
 			resolved_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
 		ON CONFLICT (id) DO UPDATE
 		SET user_id = EXCLUDED.user_id,
 		    base_id = EXCLUDED.base_id,
@@ -464,6 +475,7 @@ func (s *Store) PutPendingOperation(ctx context.Context, operation PendingOperat
 		    error = EXCLUDED.error,
 		    created_at = EXCLUDED.created_at,
 		    expires_at = EXCLUDED.expires_at,
+		    execution_started_at = EXCLUDED.execution_started_at,
 		    resolved_at = EXCLUDED.resolved_at
 	`,
 		operation.ID,
@@ -477,6 +489,7 @@ func (s *Store) PutPendingOperation(ctx context.Context, operation PendingOperat
 		operation.Error,
 		operation.CreatedAt,
 		operation.ExpiresAt,
+		operation.ExecutionStartedAt,
 		operation.ResolvedAt,
 	)
 	if err != nil {
@@ -500,6 +513,7 @@ func (s *Store) GetPendingOperation(ctx context.Context, id string) (PendingOper
 			error,
 			created_at,
 			expires_at,
+			execution_started_at,
 			resolved_at
 		FROM pending_operations
 		WHERE id = $1
@@ -515,6 +529,7 @@ func (s *Store) GetPendingOperation(ctx context.Context, id string) (PendingOper
 		&operation.Error,
 		&operation.CreatedAt,
 		&operation.ExpiresAt,
+		&operation.ExecutionStartedAt,
 		&operation.ResolvedAt,
 	)
 	if err != nil {
@@ -546,13 +561,12 @@ func (s *Store) UpdatePendingOperationStatus(ctx context.Context, id, status str
 // transition (RowsAffected == 1); false means another caller already moved it
 // out of fromStatus. This is the compare-and-swap that makes approval
 // execution idempotent under concurrent requests.
-// Entering executing records the execution start in resolved_at; the terminal
-// status update replaces it with the completion time.
+// Entering executing atomically records execution_started_at.
 func (s *Store) TransitionPendingOperationStatus(ctx context.Context, id, fromStatus, toStatus string) (bool, error) {
 	commandTag, err := s.pool.Exec(ctx, `
 		UPDATE pending_operations
 		SET status = $3,
-		    resolved_at = CASE WHEN $3 = 'executing' THEN NOW() ELSE resolved_at END
+		    execution_started_at = CASE WHEN $3 = 'executing' THEN NOW() ELSE execution_started_at END
 		WHERE id = $1 AND status = $2
 	`, id, fromStatus, toStatus)
 	if err != nil {
@@ -563,14 +577,14 @@ func (s *Store) TransitionPendingOperationStatus(ctx context.Context, id, fromSt
 
 // RecoverStaleExecutingOperations marks operations stuck in 'executing' past
 // the execution-start cutoff as 'failed' with a recovery note, independent of
-// approval expiry. While executing, resolved_at holds the execution start.
+// approval expiry, using execution_started_at.
 // Returns the number recovered.
 func (s *Store) RecoverStaleExecutingOperations(ctx context.Context, cutoff time.Time) (int64, error) {
 	note := "operation interrupted before completion; recovered by sweep"
 	commandTag, err := s.pool.Exec(ctx, `
 		UPDATE pending_operations
 		SET status = 'failed', error = $2, resolved_at = NOW()
-		WHERE status = 'executing' AND resolved_at < $1
+		WHERE status = 'executing' AND execution_started_at < $1
 	`, cutoff, note)
 	if err != nil {
 		return 0, fmt.Errorf("recover stale executing operations: %w", err)

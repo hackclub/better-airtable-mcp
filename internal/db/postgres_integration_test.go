@@ -371,6 +371,13 @@ func TestTransitionPendingOperationStatusIsCompareAndSwap(t *testing.T) {
 	if err := store.Migrate(ctx); err != nil {
 		t.Fatalf("Migrate() returned error: %v", err)
 	}
+	// Exercise an upgrade from the old schema as well as a fresh database.
+	if _, err := store.pool.Exec(ctx, `ALTER TABLE pending_operations DROP COLUMN execution_started_at`); err != nil {
+		t.Fatalf("simulate old schema: %v", err)
+	}
+	if err := store.Migrate(ctx); err != nil {
+		t.Fatalf("Migrate() old schema returned error: %v", err)
+	}
 	if err := store.UpsertUser(ctx, User{ID: "user_1"}); err != nil {
 		t.Fatalf("UpsertUser() returned error: %v", err)
 	}
@@ -399,8 +406,11 @@ func TestTransitionPendingOperationStatusIsCompareAndSwap(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetPendingOperation() after claim returned error: %v", err)
 	}
-	if claimed.ResolvedAt == nil || claimed.ResolvedAt.Before(startedBefore) || claimed.ResolvedAt.After(time.Now().UTC()) {
-		t.Fatalf("expected execution start timestamp at claim time, got %v", claimed.ResolvedAt)
+	if claimed.ExecutionStartedAt == nil || claimed.ExecutionStartedAt.Before(startedBefore) || claimed.ExecutionStartedAt.After(time.Now().UTC()) {
+		t.Fatalf("expected execution start timestamp at claim time, got %v", claimed.ExecutionStartedAt)
+	}
+	if claimed.ResolvedAt != nil {
+		t.Fatalf("executing operation has resolution timestamp %v", claimed.ResolvedAt)
 	}
 
 	won, err = store.TransitionPendingOperationStatus(ctx, "op_cas", "pending_approval", "executing")
@@ -418,8 +428,11 @@ func TestTransitionPendingOperationStatusIsCompareAndSwap(t *testing.T) {
 	if operation.Status != "executing" {
 		t.Fatalf("status = %q, want executing", operation.Status)
 	}
-	if operation.ResolvedAt == nil || !operation.ResolvedAt.Equal(*claimed.ResolvedAt) {
+	if operation.ExecutionStartedAt == nil || !operation.ExecutionStartedAt.Equal(*claimed.ExecutionStartedAt) {
 		t.Fatal("losing compare-and-swap changed execution start timestamp")
+	}
+	if operation.ResolvedAt != nil {
+		t.Fatal("losing compare-and-swap set resolution timestamp")
 	}
 }
 
@@ -476,16 +489,21 @@ func TestRecoverStaleExecutingOperations(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Microsecond)
 	put := func(id, status string, startedAt *time.Time, expiresAt time.Time) {
 		t.Helper()
+		var resolvedAt *time.Time
+		if status == "completed" {
+			resolvedAt = startedAt
+		}
 		if err := store.PutPendingOperation(ctx, PendingOperation{
-			ID:                id,
-			UserID:            "user_1",
-			BaseID:            "app123",
-			Status:            status,
-			OperationType:     "record_mutation",
-			PayloadCiphertext: []byte("payload"),
-			CreatedAt:         now.Add(-2 * time.Hour),
-			ExpiresAt:         expiresAt,
-			ResolvedAt:        startedAt,
+			ID:                 id,
+			UserID:             "user_1",
+			BaseID:             "app123",
+			Status:             status,
+			OperationType:      "record_mutation",
+			PayloadCiphertext:  []byte("payload"),
+			CreatedAt:          now.Add(-2 * time.Hour),
+			ExpiresAt:          expiresAt,
+			ExecutionStartedAt: startedAt,
+			ResolvedAt:         resolvedAt,
 		}); err != nil {
 			t.Fatalf("PutPendingOperation(%s) returned error: %v", id, err)
 		}
@@ -497,6 +515,10 @@ func TestRecoverStaleExecutingOperations(t *testing.T) {
 	put("op_pending", "pending_approval", nil, now.Add(24*time.Hour))
 	put("op_completed", "completed", ptr(now.Add(-time.Hour)), now.Add(24*time.Hour))
 	put("op_legacy", "executing", nil, now.Add(24*time.Hour))
+	// Simulate an older version that wrote the start into resolved_at.
+	if err := store.UpdatePendingOperationStatus(ctx, "op_legacy", "executing", nil, nil, ptr(now.Add(-time.Hour))); err != nil {
+		t.Fatalf("set legacy resolved_at returned error: %v", err)
+	}
 
 	if err := store.Migrate(ctx); err != nil {
 		t.Fatalf("Migrate() legacy backfill returned error: %v", err)
@@ -505,8 +527,11 @@ func TestRecoverStaleExecutingOperations(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetPendingOperation(op_legacy) returned error: %v", err)
 	}
-	if legacy.ResolvedAt == nil || legacy.ResolvedAt.Before(now) || legacy.ResolvedAt.After(time.Now().UTC()) {
-		t.Fatalf("expected legacy execution timestamp at migration time, got %v", legacy.ResolvedAt)
+	if legacy.ExecutionStartedAt == nil || legacy.ExecutionStartedAt.Before(now) || legacy.ExecutionStartedAt.After(time.Now().UTC()) {
+		t.Fatalf("expected legacy execution timestamp at migration time, got %v", legacy.ExecutionStartedAt)
+	}
+	if legacy.ResolvedAt != nil {
+		t.Fatal("migration left a nonterminal resolution timestamp")
 	}
 	if err := store.Migrate(ctx); err != nil {
 		t.Fatalf("repeated Migrate() returned error: %v", err)
@@ -539,12 +564,18 @@ func TestRecoverStaleExecutingOperations(t *testing.T) {
 		if op.Status != want {
 			t.Fatalf("expected %s status %s, got %s", id, want, op.Status)
 		}
-		if id == "op_legacy" && (op.ResolvedAt == nil || !op.ResolvedAt.Equal(*legacy.ResolvedAt)) {
+		if op.Status == "executing" && op.ResolvedAt != nil {
+			t.Fatalf("executing operation %s has resolution timestamp", id)
+		}
+		if id == "op_completed" && (op.ResolvedAt == nil || !op.ResolvedAt.Equal(now.Add(-time.Hour))) {
+			t.Fatal("migration changed terminal resolution timestamp")
+		}
+		if id == "op_legacy" && (op.ExecutionStartedAt == nil || !op.ExecutionStartedAt.Equal(*legacy.ExecutionStartedAt)) {
 			t.Fatal("repeated migration reset legacy execution timestamp")
 		}
 	}
 	// A legacy row must also be recoverable once its startup grace window passes.
-	recovered, err = store.RecoverStaleExecutingOperations(ctx, legacy.ResolvedAt.Add(16*time.Minute))
+	recovered, err = store.RecoverStaleExecutingOperations(ctx, legacy.ExecutionStartedAt.Add(16*time.Minute))
 	if err != nil || recovered != 3 {
 		t.Fatalf("recovery after grace window = %d, %v; want 3, nil", recovered, err)
 	}
