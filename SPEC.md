@@ -885,11 +885,17 @@ CREATE TABLE pending_operations (
   error                      TEXT,              -- error message if failed
   created_at                 TIMESTAMPTZ NOT NULL,
   expires_at                 TIMESTAMPTZ NOT NULL,
-  resolved_at                TIMESTAMPTZ        -- when approved/rejected
+  resolved_at                TIMESTAMPTZ        -- execution start while executing; resolution time once terminal
 );
 ```
 
 A background goroutine expires stale operations every minute.
+It also marks operations stuck in `executing` for more than 15 minutes as failed,
+independent of approval expiry. The atomic transition to `executing` records its
+start in `resolved_at`; a terminal status update replaces that with the resolution
+time. Execution itself is bounded to 5 minutes. On startup, legacy executing rows
+without a start timestamp receive the startup time, giving them a full 15-minute
+recovery window. Repeated migrations preserve existing timestamps.
 
 ---
 

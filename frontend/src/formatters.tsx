@@ -725,6 +725,9 @@ export function countdownLabel(expiresAt: string, now = new Date()): string {
   }
   const totalSeconds = Math.floor(remaining / 1000);
   const minutes = Math.floor(totalSeconds / 60);
+  if (minutes >= 60) {
+    return `${Math.floor(minutes / 60)}h ${minutes % 60}m`;
+  }
   const seconds = totalSeconds % 60;
   return `${minutes}m ${String(seconds).padStart(2, "0")}s`;
 }

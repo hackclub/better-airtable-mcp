@@ -387,12 +387,20 @@ func TestTransitionPendingOperationStatusIsCompareAndSwap(t *testing.T) {
 		t.Fatalf("PutPendingOperation() returned error: %v", err)
 	}
 
+	startedBefore := time.Now().UTC().Truncate(time.Microsecond)
 	won, err := store.TransitionPendingOperationStatus(ctx, "op_cas", "pending_approval", "executing")
 	if err != nil {
 		t.Fatalf("TransitionPendingOperationStatus() returned error: %v", err)
 	}
 	if !won {
 		t.Fatal("expected the first transition to win")
+	}
+	claimed, err := store.GetPendingOperation(ctx, "op_cas")
+	if err != nil {
+		t.Fatalf("GetPendingOperation() after claim returned error: %v", err)
+	}
+	if claimed.ResolvedAt == nil || claimed.ResolvedAt.Before(startedBefore) || claimed.ResolvedAt.After(time.Now().UTC()) {
+		t.Fatalf("expected execution start timestamp at claim time, got %v", claimed.ResolvedAt)
 	}
 
 	won, err = store.TransitionPendingOperationStatus(ctx, "op_cas", "pending_approval", "executing")
@@ -409,6 +417,9 @@ func TestTransitionPendingOperationStatusIsCompareAndSwap(t *testing.T) {
 	}
 	if operation.Status != "executing" {
 		t.Fatalf("status = %q, want executing", operation.Status)
+	}
+	if operation.ResolvedAt == nil || !operation.ResolvedAt.Equal(*claimed.ResolvedAt) {
+		t.Fatal("losing compare-and-swap changed execution start timestamp")
 	}
 }
 
@@ -462,26 +473,46 @@ func TestRecoverStaleExecutingOperations(t *testing.T) {
 		t.Fatalf("UpsertUser() returned error: %v", err)
 	}
 
-	put := func(id string, expiresAt time.Time) {
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	put := func(id, status string, startedAt *time.Time, expiresAt time.Time) {
 		t.Helper()
 		if err := store.PutPendingOperation(ctx, PendingOperation{
 			ID:                id,
 			UserID:            "user_1",
 			BaseID:            "app123",
-			Status:            "executing",
+			Status:            status,
 			OperationType:     "record_mutation",
 			PayloadCiphertext: []byte("payload"),
-			CreatedAt:         time.Now().Add(-2 * time.Hour).UTC(),
+			CreatedAt:         now.Add(-2 * time.Hour),
 			ExpiresAt:         expiresAt,
+			ResolvedAt:        startedAt,
 		}); err != nil {
 			t.Fatalf("PutPendingOperation(%s) returned error: %v", id, err)
 		}
 	}
 
-	put("op_stale", time.Now().Add(-time.Hour).UTC())
-	put("op_fresh", time.Now().Add(10*time.Minute).UTC())
+	put("op_stale", "executing", ptr(now.Add(-20*time.Minute)), now.Add(24*time.Hour))
+	put("op_fresh", "executing", ptr(now.Add(-time.Minute)), now.Add(-time.Hour))
+	put("op_boundary", "executing", ptr(now.Add(-15*time.Minute)), now.Add(24*time.Hour))
+	put("op_pending", "pending_approval", nil, now.Add(24*time.Hour))
+	put("op_completed", "completed", ptr(now.Add(-time.Hour)), now.Add(24*time.Hour))
+	put("op_legacy", "executing", nil, now.Add(24*time.Hour))
 
-	recovered, err := store.RecoverStaleExecutingOperations(ctx, time.Now().Add(-15*time.Minute).UTC())
+	if err := store.Migrate(ctx); err != nil {
+		t.Fatalf("Migrate() legacy backfill returned error: %v", err)
+	}
+	legacy, err := store.GetPendingOperation(ctx, "op_legacy")
+	if err != nil {
+		t.Fatalf("GetPendingOperation(op_legacy) returned error: %v", err)
+	}
+	if legacy.ResolvedAt == nil || legacy.ResolvedAt.Before(now) || legacy.ResolvedAt.After(time.Now().UTC()) {
+		t.Fatalf("expected legacy execution timestamp at migration time, got %v", legacy.ResolvedAt)
+	}
+	if err := store.Migrate(ctx); err != nil {
+		t.Fatalf("repeated Migrate() returned error: %v", err)
+	}
+
+	recovered, err := store.RecoverStaleExecutingOperations(ctx, now.Add(-15*time.Minute))
 	if err != nil {
 		t.Fatalf("RecoverStaleExecutingOperations() returned error: %v", err)
 	}
@@ -497,11 +528,24 @@ func TestRecoverStaleExecutingOperations(t *testing.T) {
 		t.Fatalf("expected stale executing op to be failed with a note, got %#v", stale)
 	}
 
-	fresh, err := store.GetPendingOperation(ctx, "op_fresh")
-	if err != nil {
-		t.Fatalf("GetPendingOperation(op_fresh) returned error: %v", err)
+	for id, want := range map[string]string{
+		"op_fresh": "executing", "op_boundary": "executing", "op_legacy": "executing",
+		"op_pending": "pending_approval", "op_completed": "completed",
+	} {
+		op, err := store.GetPendingOperation(ctx, id)
+		if err != nil {
+			t.Fatalf("GetPendingOperation(%s) returned error: %v", id, err)
+		}
+		if op.Status != want {
+			t.Fatalf("expected %s status %s, got %s", id, want, op.Status)
+		}
+		if id == "op_legacy" && (op.ResolvedAt == nil || !op.ResolvedAt.Equal(*legacy.ResolvedAt)) {
+			t.Fatal("repeated migration reset legacy execution timestamp")
+		}
 	}
-	if fresh.Status != "executing" {
-		t.Fatalf("expected fresh executing op to be untouched, got %#v", fresh)
+	// A legacy row must also be recoverable once its startup grace window passes.
+	recovered, err = store.RecoverStaleExecutingOperations(ctx, legacy.ResolvedAt.Add(16*time.Minute))
+	if err != nil || recovered != 3 {
+		t.Fatalf("recovery after grace window = %d, %v; want 3, nil", recovered, err)
 	}
 }

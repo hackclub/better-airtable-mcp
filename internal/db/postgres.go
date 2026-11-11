@@ -203,6 +203,11 @@ func (s *Store) Migrate(ctx context.Context) error {
 	if _, err := s.pool.Exec(ctx, `ALTER TABLE mcp_tokens ADD COLUMN IF NOT EXISTS client_name TEXT`); err != nil {
 		return fmt.Errorf("ensure mcp_tokens.client_name column: %w", err)
 	}
+	// Older versions did not timestamp entry into executing. Give those rows
+	// a full recovery window from startup; never reset a known execution start.
+	if _, err := s.pool.Exec(ctx, `UPDATE pending_operations SET resolved_at = NOW() WHERE status = 'executing' AND resolved_at IS NULL`); err != nil {
+		return fmt.Errorf("backfill executing operation timestamps: %w", err)
+	}
 
 	return nil
 }
@@ -541,10 +546,13 @@ func (s *Store) UpdatePendingOperationStatus(ctx context.Context, id, status str
 // transition (RowsAffected == 1); false means another caller already moved it
 // out of fromStatus. This is the compare-and-swap that makes approval
 // execution idempotent under concurrent requests.
+// Entering executing records the execution start in resolved_at; the terminal
+// status update replaces it with the completion time.
 func (s *Store) TransitionPendingOperationStatus(ctx context.Context, id, fromStatus, toStatus string) (bool, error) {
 	commandTag, err := s.pool.Exec(ctx, `
 		UPDATE pending_operations
-		SET status = $3
+		SET status = $3,
+		    resolved_at = CASE WHEN $3 = 'executing' THEN NOW() ELSE resolved_at END
 		WHERE id = $1 AND status = $2
 	`, id, fromStatus, toStatus)
 	if err != nil {
@@ -554,16 +562,15 @@ func (s *Store) TransitionPendingOperationStatus(ctx context.Context, id, fromSt
 }
 
 // RecoverStaleExecutingOperations marks operations stuck in 'executing' past
-// the cutoff as 'failed' with a recovery note. A row only enters 'executing'
-// before its expires_at (approval rejects expired operations), and execution
-// itself is time-bounded — so a row whose expires_at is older than the cutoff
-// belongs to a process that died mid-flight. Returns the number recovered.
+// the execution-start cutoff as 'failed' with a recovery note, independent of
+// approval expiry. While executing, resolved_at holds the execution start.
+// Returns the number recovered.
 func (s *Store) RecoverStaleExecutingOperations(ctx context.Context, cutoff time.Time) (int64, error) {
 	note := "operation interrupted before completion; recovered by sweep"
 	commandTag, err := s.pool.Exec(ctx, `
 		UPDATE pending_operations
 		SET status = 'failed', error = $2, resolved_at = NOW()
-		WHERE status = 'executing' AND expires_at < $1
+		WHERE status = 'executing' AND resolved_at < $1
 	`, cutoff, note)
 	if err != nil {
 		return 0, fmt.Errorf("recover stale executing operations: %w", err)

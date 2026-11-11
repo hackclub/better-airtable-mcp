@@ -22,7 +22,7 @@ const schemaMetaFetchTimeout = 4 * time.Second
 // hang forever.
 const executeCriticalTimeout = 5 * time.Minute
 
-// staleExecutingWindow is how far past an operation's expires_at the expiry
+// staleExecutingWindow is how long after an operation starts executing the expiry
 // loop waits before reaping an `executing` row as crashed. It must stay
 // comfortably larger than executeCriticalTimeout so an in-flight execution
 // is never reaped.

@@ -45,6 +45,19 @@ describe("formatters", () => {
     ).toBe("expired");
   });
 
+  it.each([
+    [3599, "59m 59s"],
+    [3600, "1h 0m"],
+    [3661, "1h 1m"],
+    [86398, "23h 59m"],
+    [86400, "24h 0m"],
+    [172800, "48h 0m"],
+  ])("formats %i seconds remaining as %s", (seconds, expected) => {
+    const now = new Date("2026-04-01T12:00:00Z");
+    expect(countdownLabel(new Date(now.getTime() + seconds * 1000).toISOString(), now))
+      .toBe(expected);
+  });
+
   it("renders a bare date as the same calendar day in timezones west of UTC", () => {
     // Tests run with TZ=America/New_York (see the test script); a UTC-midnight
     // parse would render 2026-07-24 as the 23rd.
