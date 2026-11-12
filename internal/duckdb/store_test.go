@@ -3,6 +3,8 @@ package duckdb
 import (
 	"context"
 	"database/sql"
+	"errors"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -295,5 +297,43 @@ func TestWriteSessionReusesOneConnectionAcrossRun(t *testing.T) {
 	}
 	if !result.LastSyncedAt.Equal(completedAt) {
 		t.Fatalf("expected finalized last_synced_at %v, got %v", completedAt, result.LastSyncedAt)
+	}
+}
+
+func TestInitializeSnapshotRebuildsUnreadableCacheFile(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "app123.db")
+	if err := os.WriteFile(dbPath, []byte(strings.Repeat("not a duckdb file ", 20000)), 0o644); err != nil {
+		t.Fatalf("write garbage cache file: %v", err)
+	}
+
+	if err := InitializeSnapshot(ctx, dbPath, SnapshotInit{
+		BaseID:        "app123",
+		BaseName:      "Test Base",
+		SyncStartedAt: time.Date(2026, 4, 1, 12, 0, 0, 0, time.UTC),
+	}); err != nil {
+		t.Fatalf("InitializeSnapshot() on an unreadable file returned error: %v", err)
+	}
+
+	info, err := ReadSyncInfo(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("ReadSyncInfo() after rebuild returned error: %v", err)
+	}
+	if info.Status != "syncing" {
+		t.Fatalf("expected rebuilt cache to be mid-sync, got status %q", info.Status)
+	}
+}
+
+func TestIsUnreadableCacheFileOnlyMatchesPermanentErrors(t *testing.T) {
+	cases := map[string]bool{
+		"IO Error: Trying to read a database file with version number 69, but we can only read versions between 64 and 68.": true,
+		`IO Error: The file "/data/duckdb/app1.db" exists, but it is not a valid DuckDB database file!`:                     true,
+		`IO Error: Could not set lock on file "/data/duckdb/app1.db": Conflicting lock is held`:                             false,
+		"IO Error: No space left on device": false,
+	}
+	for msg, want := range cases {
+		if got := isUnreadableCacheFile(errors.New(msg)); got != want {
+			t.Errorf("isUnreadableCacheFile(%q) = %v, want %v", msg, got, want)
+		}
 	}
 }

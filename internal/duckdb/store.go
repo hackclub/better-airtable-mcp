@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
@@ -242,12 +243,41 @@ func InitializeSnapshot(ctx context.Context, path string, init SnapshotInit) err
 	}
 
 	db, err := openDatabase(path, "READ_WRITE")
+	if err != nil && isUnreadableCacheFile(err) {
+		// The file is only a cache of Airtable data, so one this DuckDB
+		// build cannot read (written by a newer storage version, e.g. after
+		// a rollback, or not a DuckDB file at all) is discarded and rebuilt
+		// by the sync rather than failing every sync of the base forever.
+		if removeErr := removeDatabaseFiles(path); removeErr != nil {
+			return errors.Join(err, removeErr)
+		}
+		db, err = openDatabase(path, "READ_WRITE")
+	}
 	if err != nil {
 		return err
 	}
 	defer db.Close()
 
 	return initializeSnapshot(ctx, db, init)
+}
+
+// isUnreadableCacheFile reports whether an open error means the file can
+// never be opened by this DuckDB build, as opposed to a transient failure
+// (a held lock, a full disk) that must not cost the cache.
+func isUnreadableCacheFile(err error) bool {
+	msg := err.Error()
+	return strings.Contains(msg, "database file with version number") ||
+		strings.Contains(msg, "is not a valid DuckDB database file")
+}
+
+func removeDatabaseFiles(path string) error {
+	var errs error
+	for _, p := range []string{path, path + ".wal"} {
+		if err := os.Remove(p); err != nil && !errors.Is(err, os.ErrNotExist) {
+			errs = errors.Join(errs, fmt.Errorf("remove unreadable duckdb file: %w", err))
+		}
+	}
+	return errs
 }
 
 func initializeSnapshot(ctx context.Context, db *sql.DB, init SnapshotInit) error {
