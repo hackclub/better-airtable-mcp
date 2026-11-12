@@ -16,6 +16,8 @@ import (
 	"time"
 
 	_ "github.com/duckdb/duckdb-go/v2"
+
+	"github.com/hackclub/better-airtable-mcp/internal/logx"
 )
 
 type BaseSnapshot struct {
@@ -248,6 +250,10 @@ func InitializeSnapshot(ctx context.Context, path string, init SnapshotInit) err
 		// build cannot read (written by a newer storage version, e.g. after
 		// a rollback, or not a DuckDB file at all) is discarded and rebuilt
 		// by the sync rather than failing every sync of the base forever.
+		logx.Event(ctx, "duckdb_store", "duckdb.unreadable_cache_rebuilt",
+			"file", filepath.Base(path),
+			"error_message", logx.ErrorPreview(err),
+		)
 		if removeErr := removeDatabaseFiles(path); removeErr != nil {
 			return errors.Join(err, removeErr)
 		}

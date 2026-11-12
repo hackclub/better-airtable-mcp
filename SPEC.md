@@ -1237,6 +1237,7 @@ All configuration via environment variables:
 | Mutate approved but Airtable API fails before any batch succeeds | Operation status → `failed` with error details |
 | Mutate approved but Airtable API fails after one or more batches succeed | Operation status → `partially_completed`; include partial result details and stop on first failed Airtable request |
 | DuckDB file missing (post-redeploy) | Triggers fresh sync transparently |
+| DuckDB file unreadable by this build (newer storage version after a rollback, or not a DuckDB file) | The next sync deletes it and rebuilds it from Airtable |
 
 ---
 
