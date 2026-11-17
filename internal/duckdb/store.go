@@ -694,14 +694,20 @@ func createMetadataTables(ctx context.Context, tx *sql.Tx) error {
 			tables_completed INTEGER,
 			pages_fetched BIGINT,
 			records_synced_this_run BIGINT,
-			error VARCHAR
+			error VARCHAR,
+			schema_hash VARCHAR,
+			cache_format INTEGER
 		)`,
 		`CREATE TABLE _table_sync (
 			duckdb_table_name VARCHAR PRIMARY KEY,
 			sync_status VARCHAR,
 			visible_record_count BIGINT,
 			pages_fetched BIGINT,
-			has_more BOOLEAN
+			has_more BOOLEAN,
+			delta_watermark TIMESTAMP,
+			delta_checked_at TIMESTAMP,
+			reconciled_at TIMESTAMP,
+			computed_stale BOOLEAN
 		)`,
 	}
 
@@ -715,10 +721,6 @@ func createMetadataTables(ctx context.Context, tx *sql.Tx) error {
 }
 
 func upsertSyncInfo(ctx context.Context, tx sqlExecutor, info SyncInfo) error {
-	if _, err := tx.ExecContext(ctx, `DELETE FROM _sync_info`); err != nil {
-		return fmt.Errorf("clear sync info: %w", err)
-	}
-
 	var syncStartedAt any
 	if !info.SyncStartedAt.IsZero() {
 		syncStartedAt = info.SyncStartedAt.UTC()
@@ -727,7 +729,48 @@ func upsertSyncInfo(ctx context.Context, tx sqlExecutor, info SyncInfo) error {
 	if !info.LastSyncedAt.IsZero() {
 		lastSyncedAt = info.LastSyncedAt.UTC()
 	}
+	args := []any{
+		syncStartedAt,
+		lastSyncedAt,
+		info.SyncDurationMS,
+		info.TotalRecords,
+		info.TotalTables,
+		info.Status,
+		info.TablesStarted,
+		info.TablesCompleted,
+		info.PagesFetched,
+		info.RecordsSyncedThisRun,
+		nullableString(info.Error),
+	}
 
+	// The row is updated in place so the columns this function does not own
+	// (schema_hash, cache_format) survive every progress write.
+	result, err := tx.ExecContext(
+		ctx,
+		`UPDATE _sync_info SET
+			sync_started_at = ?,
+			last_synced_at = ?,
+			sync_duration_ms = ?,
+			total_records = ?,
+			total_tables = ?,
+			status = ?,
+			tables_started = ?,
+			tables_completed = ?,
+			pages_fetched = ?,
+			records_synced_this_run = ?,
+			error = ?`,
+		args...,
+	)
+	if err != nil {
+		return fmt.Errorf("update sync info: %w", err)
+	}
+	if updated, err := result.RowsAffected(); err == nil && updated > 0 {
+		return nil
+	}
+
+	if _, err := tx.ExecContext(ctx, `DELETE FROM _sync_info`); err != nil {
+		return fmt.Errorf("clear sync info: %w", err)
+	}
 	if _, err := tx.ExecContext(
 		ctx,
 		`INSERT INTO _sync_info (
@@ -743,17 +786,7 @@ func upsertSyncInfo(ctx context.Context, tx sqlExecutor, info SyncInfo) error {
 			records_synced_this_run,
 			error
 		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		syncStartedAt,
-		lastSyncedAt,
-		info.SyncDurationMS,
-		info.TotalRecords,
-		info.TotalTables,
-		info.Status,
-		info.TablesStarted,
-		info.TablesCompleted,
-		info.PagesFetched,
-		info.RecordsSyncedThisRun,
-		nullableString(info.Error),
+		args...,
 	); err != nil {
 		return fmt.Errorf("insert sync info: %w", err)
 	}

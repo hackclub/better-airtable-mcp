@@ -113,10 +113,11 @@ type Base struct {
 }
 
 type Table struct {
-	ID          string  `json:"id"`
-	Name        string  `json:"name"`
-	Description string  `json:"description,omitempty"`
-	Fields      []Field `json:"fields"`
+	ID             string  `json:"id"`
+	Name           string  `json:"name"`
+	Description    string  `json:"description,omitempty"`
+	PrimaryFieldID string  `json:"primary_field_id,omitempty"`
+	Fields         []Field `json:"fields"`
 }
 
 type Field struct {
@@ -124,6 +125,9 @@ type Field struct {
 	Name        string `json:"name"`
 	Type        string `json:"type"`
 	Description string `json:"description,omitempty"`
+	// Options is Airtable's type-specific field configuration, kept verbatim.
+	// Delta sync reads link, lookup and rollup wiring from it.
+	Options json.RawMessage `json:"options,omitempty"`
 }
 
 type Record struct {
@@ -143,10 +147,11 @@ type listBasesResponse struct {
 
 type baseSchemaResponse struct {
 	Tables []struct {
-		ID          string  `json:"id"`
-		Name        string  `json:"name"`
-		Description string  `json:"description"`
-		Fields      []Field `json:"fields"`
+		ID             string  `json:"id"`
+		Name           string  `json:"name"`
+		Description    string  `json:"description"`
+		PrimaryFieldID string  `json:"primaryFieldId"`
+		Fields         []Field `json:"fields"`
 	} `json:"tables"`
 }
 
@@ -159,6 +164,53 @@ type ListRecordsPageOptions struct {
 	Offset        string
 	SortFieldName string
 	SortDirection string
+	// ModifiedSince, when set, limits the page to records created or edited
+	// by a user after that instant.
+	ModifiedSince time.Time
+	// RecordIDs, when set, limits the page to those records. Records that no
+	// longer exist are simply absent from the result.
+	RecordIDs []string
+}
+
+// MaxRecordIDsPerRequest is how many record IDs one ListRecordsPage call may
+// ask for: one full page.
+const MaxRecordIDsPerRequest = 100
+
+// modifiedSinceFormula matches records created or edited after since.
+// LAST_MODIFIED_TIME() is blank for a record no user has edited, and a blank
+// operand makes IS_AFTER an error that would drop the record, so those fall
+// back to their creation time.
+func modifiedSinceFormula(since time.Time) string {
+	return fmt.Sprintf(
+		"IS_AFTER(IF(LAST_MODIFIED_TIME(), LAST_MODIFIED_TIME(), CREATED_TIME()), '%s')",
+		since.UTC().Format("2006-01-02T15:04:05.000Z"),
+	)
+}
+
+func recordIDsFormula(ids []string) string {
+	terms := make([]string, 0, len(ids))
+	for _, id := range ids {
+		terms = append(terms, "RECORD_ID()='"+strings.ReplaceAll(id, "'", "")+"'")
+	}
+	return "OR(" + strings.Join(terms, ",") + ")"
+}
+
+func (o ListRecordsPageOptions) filterFormula() string {
+	var parts []string
+	if !o.ModifiedSince.IsZero() {
+		parts = append(parts, modifiedSinceFormula(o.ModifiedSince))
+	}
+	if len(o.RecordIDs) > 0 {
+		parts = append(parts, recordIDsFormula(o.RecordIDs))
+	}
+	switch len(parts) {
+	case 0:
+		return ""
+	case 1:
+		return parts[0]
+	default:
+		return "AND(" + strings.Join(parts, ",") + ")"
+	}
 }
 
 type ListRecordsPageResult struct {
@@ -239,10 +291,11 @@ func (c *HTTPClient) GetBaseSchema(ctx context.Context, accessToken, baseID stri
 	tables := make([]Table, 0, len(payload.Tables))
 	for _, table := range payload.Tables {
 		tables = append(tables, Table{
-			ID:          table.ID,
-			Name:        table.Name,
-			Description: table.Description,
-			Fields:      table.Fields,
+			ID:             table.ID,
+			Name:           table.Name,
+			Description:    table.Description,
+			PrimaryFieldID: table.PrimaryFieldID,
+			Fields:         table.Fields,
 		})
 	}
 
@@ -272,22 +325,39 @@ func (c *HTTPClient) ListRecords(ctx context.Context, accessToken, baseID, table
 }
 
 func (c *HTTPClient) ListRecordsPage(ctx context.Context, accessToken, baseID, tableID string, options ListRecordsPageOptions) (ListRecordsPageResult, error) {
+	recordPath := fmt.Sprintf("/v0/%s/%s", url.PathEscape(baseID), url.PathEscape(tableID))
+	sortField := strings.TrimSpace(options.SortFieldName)
+	direction := strings.ToLower(strings.TrimSpace(options.SortDirection))
+	if direction == "" {
+		direction = "desc"
+	}
+
+	var payload listRecordsResponse
+	if formula := options.filterFormula(); formula != "" {
+		// A filter over a hundred record IDs outgrows a URL, so filtered
+		// pages go through the POST form of the same endpoint.
+		body := map[string]any{"pageSize": 100, "filterByFormula": formula}
+		if options.Offset != "" {
+			body["offset"] = options.Offset
+		}
+		if sortField != "" {
+			body["sort"] = []map[string]string{{"field": sortField, "direction": direction}}
+		}
+		if err := c.doJSON(ctx, accessToken, http.MethodPost, recordPath+"/listRecords", nil, body, &payload); err != nil {
+			return ListRecordsPageResult{}, err
+		}
+		return ListRecordsPageResult(payload), nil
+	}
+
 	query := url.Values{}
 	query.Set("pageSize", "100")
 	if options.Offset != "" {
 		query.Set("offset", options.Offset)
 	}
-	if strings.TrimSpace(options.SortFieldName) != "" {
-		query.Set("sort[0][field]", strings.TrimSpace(options.SortFieldName))
-		direction := strings.ToLower(strings.TrimSpace(options.SortDirection))
-		if direction == "" {
-			direction = "desc"
-		}
+	if sortField != "" {
+		query.Set("sort[0][field]", sortField)
 		query.Set("sort[0][direction]", direction)
 	}
-
-	var payload listRecordsResponse
-	recordPath := fmt.Sprintf("/v0/%s/%s", url.PathEscape(baseID), url.PathEscape(tableID))
 	if err := c.doJSON(ctx, accessToken, http.MethodGet, recordPath, query, nil, &payload); err != nil {
 		return ListRecordsPageResult{}, err
 	}

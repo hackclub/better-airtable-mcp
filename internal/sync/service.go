@@ -11,6 +11,8 @@ import (
 	"sync"
 	"time"
 
+	"golang.org/x/time/rate"
+
 	"github.com/hackclub/better-airtable-mcp/internal/duckdb"
 	"github.com/hackclub/better-airtable-mcp/internal/logx"
 )
@@ -25,6 +27,9 @@ type Service struct {
 	syncSlots  chan struct{}
 	basesCache map[string]basesCacheEntry
 	now        func() time.Time
+
+	// deltaBudget overrides deltaPropagationBudget when positive.
+	deltaBudget int
 }
 
 // baseListCacheTTL bounds how long a fetched base list is reused for base
@@ -231,7 +236,7 @@ func (s *Service) SyncBase(ctx context.Context, accessToken, baseRef string) (Sy
 		return SyncResult{}, err
 	}
 	defer releaseSlot()
-	return s.runSync(ctx, StaticAccessToken(accessToken), base, nil)
+	return s.runSync(ctx, StaticAccessToken(accessToken), base, syncRunOptions{}, nil)
 }
 
 func (s *Service) ListSchema(ctx context.Context, accessToken, baseRef string) (duckdb.BaseSchema, error) {
@@ -403,13 +408,26 @@ func (s *Service) stagingPath(baseID string) string {
 	return filepath.Join(s.dataDir, baseID+".staging.db")
 }
 
-func (s *Service) runSync(ctx context.Context, tokens AccessTokenFunc, base Base, progress func(SyncProgress)) (SyncResult, error) {
-	startedAt := time.Now().UTC()
+// syncRunOptions tunes one full sync run.
+type syncRunOptions struct {
+	// requestsPerSecond, when positive, caps how fast the run pages through
+	// Airtable. A background reconcile uses it to leave most of the base's
+	// shared API budget to everything else.
+	requestsPerSecond float64
+}
+
+func (s *Service) runSync(ctx context.Context, tokens AccessTokenFunc, base Base, options syncRunOptions, progress func(SyncProgress)) (SyncResult, error) {
+	startedAt := s.now().UTC()
 	tables, err := withAccessToken(ctx, tokens, func(token string) ([]Table, error) {
 		return s.client.GetBaseSchema(ctx, token, base.ID)
 	})
 	if err != nil {
 		return SyncResult{}, err
+	}
+	reconcileMeta := duckdb.ReconcileMeta{SchemaHash: schemaHash(tables), Watermark: startedAt}
+	var pacer *rate.Limiter
+	if options.requestsPerSecond > 0 {
+		pacer = rate.NewLimiter(rate.Limit(options.requestsPerSecond), 1)
 	}
 
 	plans, err := buildSyncPlans(tables)
@@ -527,6 +545,11 @@ func (s *Service) runSync(ctx context.Context, tokens AccessTokenFunc, base Base
 				defer workerWG.Done()
 				for job := range jobs {
 					runtime := runtimes[job.TableIndex]
+					if pacer != nil {
+						if err := pacer.Wait(workerCtx); err != nil {
+							return
+						}
+					}
 					page, err := withAccessToken(workerCtx, tokens, func(token string) (ListRecordsPageResult, error) {
 						return s.client.ListRecordsPage(workerCtx, token, base.ID, runtime.Plan.Table.AirtableTableID, ListRecordsPageOptions{
 							Offset:        job.Offset,
@@ -690,7 +713,7 @@ func (s *Service) runSync(ctx context.Context, tokens AccessTokenFunc, base Base
 		workerWG.Wait()
 	}
 
-	completedAt := time.Now().UTC()
+	completedAt := s.now().UTC()
 	finalInfo := duckdb.SyncInfo{
 		SyncStartedAt:        startedAt,
 		LastSyncedAt:         completedAt,
@@ -705,16 +728,25 @@ func (s *Service) runSync(ctx context.Context, tokens AccessTokenFunc, base Base
 	}
 
 	if !useStaging {
+		reconcileMeta.ReconciledAt = completedAt
 		unlockDuck, err = s.lockDuckWrite(ctx, base.ID)
 		if err == nil {
 			err = duckdb.FinalizeSnapshot(ctx, targetPath, finalInfo)
+			if err == nil {
+				err = duckdb.MarkReconciled(ctx, targetPath, reconcileMeta)
+			}
 			unlockDuck()
 		}
 		if err != nil {
 			return fail(err)
 		}
 	} else {
+		reconcileMeta.ReconciledAt = completedAt
 		if err := session.FinalizeSnapshot(ctx, finalInfo); err != nil {
+			_ = os.Remove(targetPath)
+			return fail(err)
+		}
+		if err := session.MarkReconciled(ctx, reconcileMeta); err != nil {
 			_ = os.Remove(targetPath)
 			return fail(err)
 		}

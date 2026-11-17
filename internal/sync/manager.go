@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -29,6 +30,16 @@ type Manager struct {
 
 	// stallTimeout is syncStallTimeout, a field so tests can shorten it.
 	stallTimeout time.Duration
+
+	// reconcileInterval is how old a base's last full fetch may get before
+	// another one is scheduled. Zero disables scheduled reconciles.
+	reconcileInterval time.Duration
+	// reconcileRate caps a scheduled reconcile's Airtable requests per second.
+	reconcileRate float64
+	// freshenWait bounds how long a read waits for an in-flight delta.
+	freshenWait time.Duration
+	// cacheMaxBytes is the disk budget for cache files. Zero means no limit.
+	cacheMaxBytes int64
 
 	mu      sync.Mutex
 	workers map[string]*workerState
@@ -84,6 +95,18 @@ type workerState struct {
 
 	lastFailedAt        time.Time
 	consecutiveFailures int
+
+	// fullRequested makes the next requested sync a full one.
+	fullRequested bool
+	// runningMode is the mode of the run in progress.
+	runningMode string
+	// lastFreshAt is when the newest successful sync of any kind started:
+	// the cache holds every edit made up to then.
+	lastFreshAt time.Time
+	// oldestReconciledAt is the oldest table's last full fetch.
+	oldestReconciledAt time.Time
+	// idleReconcileTried stops an expired worker retrying its reconcile.
+	idleReconcileTried bool
 }
 
 func NewManager(service *Service, store *db.Store, tokens TokenSource, interval, ttl time.Duration) *Manager {
@@ -97,8 +120,37 @@ func NewManager(service *Service, store *db.Store, tokens TokenSource, interval,
 		workers:  make(map[string]*workerState),
 
 		stallTimeout: syncStallTimeout,
+
+		reconcileInterval: defaultReconcileInterval,
+		reconcileRate:     defaultReconcileRate,
+		freshenWait:       defaultFreshenWait,
 	}
 }
+
+const (
+	defaultReconcileInterval = 6 * time.Hour
+	// defaultReconcileRate leaves most of Airtable's 5 requests per second
+	// per base to interactive work and to every other integration.
+	defaultReconcileRate = 2.0
+	defaultFreshenWait   = 5 * time.Second
+)
+
+// SetReconcileInterval changes how often a base in use gets a full fetch.
+func (m *Manager) SetReconcileInterval(interval time.Duration) {
+	m.reconcileInterval = interval
+}
+
+// SetCacheMaxBytes sets the disk budget for cache files.
+func (m *Manager) SetCacheMaxBytes(limit int64) {
+	m.cacheMaxBytes = limit
+}
+
+// Sync modes a worker run can take.
+const (
+	syncModeAuto      = "auto"      // delta when the cache allows it, otherwise a full sync
+	syncModeFull      = "full"      // a full sync at full speed, asked for explicitly
+	syncModeReconcile = "reconcile" // a scheduled full fetch at the reconcile rate
+)
 
 func (m *Manager) RestoreActiveWorkers(ctx context.Context) error {
 	if m == nil || m.store == nil {
@@ -120,19 +172,12 @@ func (m *Manager) RestoreActiveWorkers(ctx context.Context) error {
 	return nil
 }
 
+// SweepStaleDuckDBFiles runs at startup. Cache files are kept across idle
+// periods and restarts, so the sweep only removes staging files a crashed
+// refresh left behind and then enforces the disk budget.
 func (m *Manager) SweepStaleDuckDBFiles(ctx context.Context) error {
-	if m == nil || m.service == nil || m.store == nil {
+	if m == nil || m.service == nil {
 		return nil
-	}
-
-	states, err := m.store.ListActiveSyncStates(ctx, m.now().UTC())
-	if err != nil {
-		return err
-	}
-
-	activeBaseIDs := make(map[string]struct{}, len(states))
-	for _, state := range states {
-		activeBaseIDs[state.BaseID] = struct{}{}
 	}
 
 	entries, err := os.ReadDir(m.service.dataDir)
@@ -145,20 +190,110 @@ func (m *Manager) SweepStaleDuckDBFiles(ctx context.Context) error {
 
 	var removeErr error
 	for _, entry := range entries {
-		if entry.IsDir() || filepath.Ext(entry.Name()) != ".db" {
+		name := entry.Name()
+		if entry.IsDir() || !(strings.HasSuffix(name, ".staging.db") || strings.HasSuffix(name, ".staging.db.wal")) {
 			continue
 		}
-
-		baseID := strings.TrimSuffix(entry.Name(), ".db")
-		if _, ok := activeBaseIDs[baseID]; ok {
-			continue
-		}
-
-		if err := os.Remove(filepath.Join(m.service.dataDir, entry.Name())); err != nil && !errors.Is(err, os.ErrNotExist) {
-			removeErr = errors.Join(removeErr, fmt.Errorf("remove stale duckdb file %s: %w", entry.Name(), err))
+		if err := os.Remove(filepath.Join(m.service.dataDir, name)); err != nil && !errors.Is(err, os.ErrNotExist) {
+			removeErr = errors.Join(removeErr, fmt.Errorf("remove stale staging file %s: %w", name, err))
 		}
 	}
 
+	return errors.Join(removeErr, m.enforceCacheBudget(ctx))
+}
+
+// enforceCacheBudget deletes the least recently used cache files until the
+// directory fits the disk budget. Bases with a live worker are never evicted.
+func (m *Manager) enforceCacheBudget(ctx context.Context) error {
+	if m == nil || m.service == nil || m.cacheMaxBytes <= 0 {
+		return nil
+	}
+
+	entries, err := os.ReadDir(m.service.dataDir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("read duckdb data dir: %w", err)
+	}
+
+	type cacheFile struct {
+		baseID   string
+		bytes    int64
+		lastUsed time.Time
+	}
+	files := map[string]*cacheFile{}
+	var total int64
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || strings.Contains(name, ".staging.") {
+			continue
+		}
+		baseID, isCache := strings.CutSuffix(strings.TrimSuffix(name, ".wal"), ".db")
+		if !isCache {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil {
+			continue
+		}
+		file := files[baseID]
+		if file == nil {
+			file = &cacheFile{baseID: baseID}
+			files[baseID] = file
+		}
+		file.bytes += info.Size()
+		if info.ModTime().After(file.lastUsed) {
+			file.lastUsed = info.ModTime()
+		}
+		total += info.Size()
+	}
+	if total <= m.cacheMaxBytes {
+		return nil
+	}
+
+	if m.store != nil {
+		if usage, err := m.store.ListCacheUsage(ctx); err == nil {
+			for _, entry := range usage {
+				if file := files[entry.BaseID]; file != nil {
+					file.lastUsed = entry.LastUsedAt
+				}
+			}
+		}
+	}
+	candidates := make([]*cacheFile, 0, len(files))
+	m.mu.Lock()
+	for baseID, file := range files {
+		if _, active := m.workers[baseID]; !active {
+			candidates = append(candidates, file)
+		}
+	}
+	m.mu.Unlock()
+	sort.Slice(candidates, func(i, j int) bool { return candidates[i].lastUsed.Before(candidates[j].lastUsed) })
+
+	var removeErr error
+	for _, file := range candidates {
+		if total <= m.cacheMaxBytes {
+			break
+		}
+		unlock, err := m.service.lockDuckWrite(ctx, file.baseID)
+		if err != nil {
+			return errors.Join(removeErr, err)
+		}
+		path := m.service.basePath(file.baseID)
+		for _, target := range []string{path, path + ".wal"} {
+			if err := os.Remove(target); err != nil && !errors.Is(err, os.ErrNotExist) {
+				removeErr = errors.Join(removeErr, fmt.Errorf("evict cache file %s: %w", filepath.Base(target), err))
+			}
+		}
+		unlock()
+		total -= file.bytes
+		logx.Event(ctx, "sync_manager", "sync.cache_evicted",
+			"base_id", file.baseID,
+			"cache_bytes", file.bytes,
+			"last_used_at", file.lastUsed.UTC().Format(time.RFC3339),
+		)
+	}
 	return removeErr
 }
 
@@ -190,6 +325,9 @@ func (m *Manager) EnsureBaseReadable(ctx context.Context, userID, baseRef string
 	}
 
 	if worker.isReadable() {
+		// The cache answers immediately; give a delta a short, bounded
+		// chance to land first so the answer includes recent edits.
+		worker.waitForFresh(ctx, m.interval, m.freshenWait)
 		return base, nil
 	}
 
@@ -227,6 +365,47 @@ func (m *Manager) RequestSync(ctx context.Context, userID, baseRef string) (Sync
 	status.BaseID = base.ID
 	status.BaseName = base.Name
 	return status, nil
+}
+
+// RequestFullSync is RequestSync for a caller that wants every record
+// downloaded again instead of a delta.
+func (m *Manager) RequestFullSync(ctx context.Context, userID, baseRef string) (SyncOperationStatus, error) {
+	base, worker, err := m.activateBase(ctx, userID, baseRef)
+	if err != nil {
+		return SyncOperationStatus{}, err
+	}
+	worker.requestFullSync()
+	status := worker.snapshotStatus()
+	status.BaseID = base.ID
+	status.BaseName = base.Name
+	return status, nil
+}
+
+// RefreshRecords writes records an approved mutation just changed straight
+// into the cache, so the next read sees them without waiting for a sync. A
+// cache that cannot be patched in place is left to the follow-up sync.
+func (m *Manager) RefreshRecords(ctx context.Context, userID, baseID, tableID string, changedIDs, deletedIDs []string) error {
+	if m == nil || m.service == nil || m.tokens == nil {
+		return fmt.Errorf("sync manager is not configured")
+	}
+	tokens := func(ctx context.Context) (string, error) {
+		return m.tokens.AirtableAccessToken(ctx, userID)
+	}
+	err := m.service.RefreshRecords(ctx, tokens, Base{ID: baseID}, tableID, changedIDs, deletedIDs)
+	if err != nil {
+		logx.Event(ctx, "sync_manager", "sync.write_through_failed",
+			"base_id", baseID,
+			"error_kind", logx.ErrorKind(err),
+			"error_message", logx.ErrorPreview(err),
+		)
+		return err
+	}
+	logx.Event(ctx, "sync_manager", "sync.write_through_completed",
+		"base_id", baseID,
+		"changed_records", len(changedIDs),
+		"deleted_records", len(deletedIDs),
+	)
+	return nil
 }
 
 func (m *Manager) TriggerSync(ctx context.Context, userID, baseID string) error {
@@ -405,7 +584,7 @@ func (m *Manager) removeWorker(baseID string) {
 func (w *workerState) run() {
 	for {
 		now := w.manager.now()
-		shouldSync, waitFor, userID := w.nextAction(now)
+		shouldSync, waitFor, userID, mode := w.nextAction(now)
 		if !shouldSync {
 			if waitFor <= 0 {
 				w.cleanupExpired()
@@ -434,12 +613,14 @@ func (w *workerState) run() {
 		w.mu.Unlock()
 
 		runCtx, cancelRun := context.WithTimeout(context.Background(), syncRunTimeout)
-		result, err := w.manager.syncOnce(runCtx, userID, w.baseID, w.baseName, w.handleProgress)
+		outcome, err := w.manager.syncOnce(runCtx, userID, w.baseID, w.baseName, mode, w.handleProgress)
 		cancelRun()
 		completedAt := w.manager.now().UTC()
+		result := outcome.Result
 
 		w.mu.Lock()
 		w.inProgress = false
+		w.runningMode = ""
 		if w.rerunRequested {
 			w.rerunRequested = false
 			w.syncRequested = true
@@ -461,6 +642,8 @@ func (w *workerState) run() {
 			w.readable = true
 			w.readSnapshotComplete = true
 			w.needsInitialRefresh = false
+			w.lastFreshAt = startedAt
+			w.oldestReconciledAt = outcome.OldestReconciledAt
 			w.lastResult = result
 			w.baseName = result.BaseName
 			w.tablesTotal = result.TablesSynced
@@ -473,21 +656,49 @@ func (w *workerState) run() {
 	}
 }
 
-func (w *workerState) nextAction(now time.Time) (shouldSync bool, waitFor time.Duration, userID string) {
+// reconcileOverdue reports how far past its reconcile interval the base is.
+// Callers must hold w.mu.
+func (w *workerState) reconcileOverdue(now time.Time) (overdue time.Duration, due bool) {
+	interval := w.manager.reconcileInterval
+	if interval <= 0 || w.oldestReconciledAt.IsZero() || !w.readSnapshotComplete {
+		return 0, false
+	}
+	age := now.Sub(w.oldestReconciledAt)
+	return age - interval, age >= interval
+}
+
+func (w *workerState) nextAction(now time.Time) (shouldSync bool, waitFor time.Duration, userID string, mode string) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
+	start := func(mode string) (bool, time.Duration, string, string) {
+		w.inProgress = true
+		w.syncRequested = false
+		w.lastError = ""
+		w.runningMode = mode
+		return true, 0, w.syncTokenUserID, mode
+	}
+
 	if !now.Before(w.activeUntil) {
-		return false, 0, ""
+		// Nobody has used the base for a whole activity window. If its full
+		// fetch is due, this is the moment to run it: no reader is waiting on
+		// a delta. The worker exits afterwards either way.
+		if _, due := w.reconcileOverdue(now); due && !w.inProgress && !w.idleReconcileTried && w.consecutiveFailures == 0 {
+			w.idleReconcileTried = true
+			return start(syncModeReconcile)
+		}
+		return false, 0, "", ""
 	}
 
 	if !w.inProgress {
 		// A manual sync request always runs immediately, overriding any backoff.
 		if w.syncRequested {
-			w.inProgress = true
-			w.syncRequested = false
-			w.lastError = ""
-			return true, 0, w.syncTokenUserID
+			mode := syncModeAuto
+			if w.fullRequested {
+				mode = syncModeFull
+				w.fullRequested = false
+			}
+			return start(mode)
 		}
 
 		// After a failed run, wait out an exponential backoff before retrying so a
@@ -497,16 +708,18 @@ func (w *workerState) nextAction(now time.Time) (shouldSync bool, waitFor time.D
 		// re-fire immediately.
 		if backoff := w.failureBackoff(); backoff > 0 {
 			if remaining := w.lastFailedAt.Add(backoff).Sub(now); remaining > 0 {
-				return false, minDuration(remaining, w.activeUntil.Sub(now)), ""
+				return false, minDuration(remaining, w.activeUntil.Sub(now)), "", ""
 			}
 		}
 
 		dueForRefresh := w.lastStartedAt.IsZero() || !now.Before(w.lastStartedAt.Add(w.manager.interval))
 		if !duckdb.DatabaseFileExists(w.manager.service.basePath(w.baseID)) || w.needsInitialRefresh || dueForRefresh {
-			w.inProgress = true
-			w.syncRequested = false
-			w.lastError = ""
-			return true, 0, w.syncTokenUserID
+			// A base in constant use never goes idle, so its reconcile runs
+			// here once it is a full interval overdue.
+			if overdue, due := w.reconcileOverdue(now); due && overdue >= w.manager.reconcileInterval && !w.needsInitialRefresh {
+				return start(syncModeReconcile)
+			}
+			return start(syncModeAuto)
 		}
 	}
 
@@ -523,7 +736,7 @@ func (w *workerState) nextAction(now time.Time) (shouldSync bool, waitFor time.D
 		}
 	}
 
-	return false, nextDue, ""
+	return false, nextDue, "", ""
 }
 
 const (
@@ -567,8 +780,9 @@ func minDuration(a, b time.Duration) time.Duration {
 	return b
 }
 
+// cleanupExpired retires an idle worker. The cache file stays on disk: the
+// next tool call reads it immediately and only fetches what changed since.
 func (w *workerState) cleanupExpired() {
-	_ = os.Remove(w.manager.service.basePath(w.baseID))
 	logx.Event(context.Background(), "sync_manager", "sync.worker_expired",
 		"base_id", w.baseID,
 	)
@@ -592,6 +806,8 @@ func (w *workerState) seedFromSnapshot() {
 	if !info.LastSyncedAt.IsZero() && info.Status == "completed" {
 		w.readSnapshotComplete = true
 		w.needsInitialRefresh = true
+		w.lastFreshAt = info.LastSyncedAt
+		w.oldestReconciledAt = w.manager.service.oldestReconciledAt(context.Background(), w.baseID)
 		completedAt := info.LastSyncedAt
 		w.lastCompletedAt = &completedAt
 		w.lastResult = SyncResult{
@@ -611,6 +827,7 @@ func (w *workerState) touch(userID string, activeUntil time.Time) {
 	w.mu.Lock()
 	w.syncTokenUserID = userID
 	w.activeUntil = activeUntil.UTC()
+	w.idleReconcileTried = false
 	w.mu.Unlock()
 	w.notify()
 }
@@ -726,6 +943,67 @@ func (w *workerState) requestImmediateSync() {
 	}
 	w.mu.Unlock()
 	w.notify()
+}
+
+// requestFullSync asks for a full download instead of a delta. If a run is
+// already in progress the full sync follows it.
+func (w *workerState) requestFullSync() {
+	w.mu.Lock()
+	w.fullRequested = true
+	if w.inProgress {
+		w.rerunRequested = true
+	} else {
+		w.syncRequested = true
+	}
+	w.mu.Unlock()
+	w.notify()
+}
+
+// waitForFresh gives a complete cache a bounded chance to catch up before a
+// read: if the last successful sync started longer than maxAge ago it asks
+// for a delta and waits up to maxWait for one to finish. It never fails the
+// read; a delta that is slow or broken just means the read is served from
+// what the cache already holds.
+func (w *workerState) waitForFresh(ctx context.Context, maxAge, maxWait time.Duration) {
+	if maxWait <= 0 {
+		return
+	}
+	now := w.manager.now()
+	w.mu.Lock()
+	complete := w.readable && w.readSnapshotComplete
+	freshAt := w.lastFreshAt
+	fresh := !freshAt.IsZero() && now.Sub(freshAt) < maxAge
+	skip := !complete || fresh || (w.inProgress && w.runningMode != syncModeAuto) || w.failureBackoff() > 0
+	if !skip && !w.inProgress {
+		w.syncRequested = true
+	}
+	failures := w.consecutiveFailures
+	w.mu.Unlock()
+	if skip {
+		return
+	}
+	w.notify()
+
+	deadline := time.NewTimer(maxWait)
+	defer deadline.Stop()
+	tick := time.NewTicker(25 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-deadline.C:
+			return
+		case <-tick.C:
+			w.mu.Lock()
+			done := w.lastFreshAt.After(freshAt) || w.consecutiveFailures > failures ||
+				(w.inProgress && w.runningMode != syncModeAuto)
+			w.mu.Unlock()
+			if done {
+				return
+			}
+		}
+	}
 }
 
 // requestFollowUpSync is requestImmediateSync for callers that just changed
@@ -909,32 +1187,37 @@ func (w *workerState) snapshotStatus() SyncOperationStatus {
 	return status
 }
 
-func (m *Manager) syncOnce(ctx context.Context, userID, baseID, baseName string, progress func(SyncProgress)) (SyncResult, error) {
+// syncOutcome is what one worker run produced.
+type syncOutcome struct {
+	Result             SyncResult
+	Mode               string // "delta" or "full": what actually ran
+	OldestReconciledAt time.Time
+}
+
+func (m *Manager) syncOnce(ctx context.Context, userID, baseID, baseName, mode string, progress func(SyncProgress)) (syncOutcome, error) {
 	logx.Event(ctx, "sync_manager", "sync.run_started",
 		"user_id", userID,
 		"base_id", baseID,
+		"mode", mode,
 	)
-	// Fail fast when the user's Airtable authorization is gone, before
-	// queueing for a sync slot.
-	if _, err := m.tokens.AirtableAccessToken(ctx, userID); err != nil {
+	fail := func(err error, message string) (syncOutcome, error) {
 		logx.Event(ctx, "sync_manager", "sync.run_failed",
 			"user_id", userID,
 			"base_id", baseID,
 			"error_kind", logx.ErrorKind(err),
-			"error_message", logx.ErrorPreview(err),
+			"error_message", message,
 		)
-		return SyncResult{}, err
+		return syncOutcome{}, err
+	}
+	// Fail fast when the user's Airtable authorization is gone, before
+	// queueing for a sync slot.
+	if _, err := m.tokens.AirtableAccessToken(ctx, userID); err != nil {
+		return fail(err, logx.ErrorPreview(err))
 	}
 
 	releaseSlot, err := m.service.acquireSyncSlot(ctx)
 	if err != nil {
-		logx.Event(ctx, "sync_manager", "sync.run_failed",
-			"user_id", userID,
-			"base_id", baseID,
-			"error_kind", logx.ErrorKind(err),
-			"error_message", "timed out waiting for a sync slot: "+logx.ErrorPreview(err),
-		)
-		return SyncResult{}, err
+		return fail(err, "timed out waiting for a sync slot: "+logx.ErrorPreview(err))
 	}
 	defer releaseSlot()
 
@@ -950,26 +1233,59 @@ func (m *Manager) syncOnce(ctx context.Context, userID, baseID, baseName string,
 		stallTimeout = syncStallTimeout
 	}
 	runCtx, stall := watchForStall(ctx, stallTimeout)
-	result, err := m.service.runSync(runCtx, tokens, Base{ID: baseID, Name: baseName}, func(p SyncProgress) {
-		stall.Touch()
-		if progress != nil {
-			progress(p)
+	defer stall.Stop()
+	withStallCause := func(err error) error {
+		if err != nil && !errors.Is(err, errSyncStalled) && errors.Is(context.Cause(runCtx), errSyncStalled) {
+			return fmt.Errorf("%w: %w", context.Cause(runCtx), err)
 		}
-	})
-	if err != nil && !errors.Is(err, errSyncStalled) && errors.Is(context.Cause(runCtx), errSyncStalled) {
-		err = fmt.Errorf("%w: %w", context.Cause(runCtx), err)
+		return err
 	}
-	stall.Stop()
-	if err != nil {
-		logx.Event(ctx, "sync_manager", "sync.run_failed",
-			"user_id", userID,
-			"base_id", baseID,
-			"error_kind", logx.ErrorKind(err),
-			"error_message", logx.ErrorPreview(err),
-		)
-		return SyncResult{}, err
+	base := Base{ID: baseID, Name: baseName}
+
+	outcome := syncOutcome{Mode: "full"}
+	ranDelta := false
+	if mode == syncModeAuto {
+		delta, err := m.service.runDelta(runCtx, tokens, base, stall.Touch)
+		if err = withStallCause(err); err != nil {
+			return fail(err, logx.ErrorPreview(err))
+		}
+		if delta.NeedsFull {
+			logx.Event(ctx, "sync_manager", "sync.delta_needs_full",
+				"base_id", baseID,
+				"reason", delta.Reason,
+			)
+		} else {
+			ranDelta = true
+			outcome.Mode = "delta"
+			outcome.Result = SyncResult{
+				BaseID:        baseID,
+				BaseName:      baseName,
+				LastSyncedAt:  delta.CheckedAt,
+				TablesSynced:  delta.TablesChecked,
+				RecordsSynced: int(delta.TotalRecords),
+				SyncDuration:  delta.Duration,
+			}
+		}
+	}
+	if !ranDelta {
+		options := syncRunOptions{}
+		if mode == syncModeReconcile {
+			options.requestsPerSecond = m.reconcileRate
+		}
+		result, err := m.service.runSync(runCtx, tokens, base, options, func(p SyncProgress) {
+			stall.Touch()
+			if progress != nil {
+				progress(p)
+			}
+		})
+		if err = withStallCause(err); err != nil {
+			return fail(err, logx.ErrorPreview(err))
+		}
+		outcome.Result = result
 	}
 
+	result := outcome.Result
+	outcome.OldestReconciledAt = m.service.oldestReconciledAt(ctx, baseID)
 	if m.store != nil {
 		lastSyncedAt := result.LastSyncedAt.UTC()
 		durationMS := result.SyncDuration.Milliseconds()
@@ -978,25 +1294,40 @@ func (m *Manager) syncOnce(ctx context.Context, userID, baseID, baseName string,
 		activeUntil := m.now().Add(m.ttl).UTC()
 		syncTokenUserID := userID
 
-		_ = m.store.PutSyncState(ctx, db.SyncState{
-			BaseID:             result.BaseID,
-			LastSyncedAt:       &lastSyncedAt,
-			LastSyncDurationMS: &durationMS,
-			TotalRecords:       &totalRecords,
-			TotalTables:        &totalTables,
-			ActiveUntil:        &activeUntil,
-			SyncTokenUserID:    &syncTokenUserID,
-		})
+		state := db.SyncState{
+			BaseID:          result.BaseID,
+			LastSyncedAt:    &lastSyncedAt,
+			TotalRecords:    &totalRecords,
+			TotalTables:     &totalTables,
+			ActiveUntil:     &activeUntil,
+			SyncTokenUserID: &syncTokenUserID,
+		}
+		if !ranDelta {
+			// Only a full sync's duration is a meaningful estimate of how
+			// long a full sync of this base takes.
+			state.LastSyncDurationMS = &durationMS
+		}
+		_ = m.store.PutSyncState(ctx, state)
+
+		var reconciledAt *time.Time
+		if !outcome.OldestReconciledAt.IsZero() {
+			reconciledAt = &outcome.OldestReconciledAt
+		}
+		_ = m.store.RecordCacheStats(ctx, result.BaseID, m.service.cacheFileBytes(result.BaseID), reconciledAt)
+	}
+	if !ranDelta {
+		_ = m.enforceCacheBudget(ctx)
 	}
 	logx.Event(ctx, "sync_manager", "sync.run_completed",
 		"user_id", userID,
 		"base_id", result.BaseID,
+		"mode", outcome.Mode,
 		"tables_synced", result.TablesSynced,
 		"records_synced", result.RecordsSynced,
 		"sync_duration_ms", result.SyncDuration.Milliseconds(),
 	)
 
-	return result, nil
+	return outcome, nil
 }
 
 func timeValue(value *time.Time) string {
@@ -1004,4 +1335,65 @@ func timeValue(value *time.Time) string {
 		return ""
 	}
 	return value.UTC().Format(time.RFC3339)
+}
+
+// Freshness says how current a base's cache is.
+type Freshness struct {
+	// State is "first_sync" while the base has never been fully downloaded
+	// (reads see only what has loaded so far), "catching_up" when a complete
+	// cache is known to lag, and "fresh" otherwise.
+	State string
+	// AsOf is the time up to which edits and new records are in the cache.
+	AsOf time.Time
+	// ReconciledAt is the time up to which deletions are verified.
+	ReconciledAt time.Time
+	// TablesCatchingUp lists tables whose computed columns may lag.
+	TablesCatchingUp []string
+}
+
+const (
+	FreshnessFresh      = "fresh"
+	FreshnessCatchingUp = "catching_up"
+	FreshnessFirstSync  = "first_sync"
+)
+
+// Freshness reports how current the cache of a base is. ok is false when the
+// base has no cache file at all.
+func (m *Manager) Freshness(ctx context.Context, baseID string) (Freshness, bool) {
+	if m == nil || m.service == nil {
+		return Freshness{}, false
+	}
+	state, ok, err := m.service.readCacheState(ctx, baseID)
+	if err != nil || !ok {
+		return Freshness{}, false
+	}
+	if state.Info.Status != "completed" || state.Info.LastSyncedAt.IsZero() || state.CacheFormat != duckdb.CacheFormat {
+		// Either the first download is still running, or the file predates
+		// delta sync and is about to be rebuilt; a partial or unverified
+		// cache is reported the same way.
+		freshness := Freshness{State: FreshnessFirstSync}
+		m.mu.Lock()
+		worker := m.workers[baseID]
+		m.mu.Unlock()
+		if worker != nil && worker.isCompleteReadable() {
+			freshness.State = FreshnessCatchingUp
+			freshness.AsOf = state.Info.LastSyncedAt
+		}
+		return freshness, true
+	}
+
+	// AsOf was stamped with the service's clock, so age is measured on it too.
+	freshness := Freshness{State: FreshnessFresh, AsOf: state.Info.LastSyncedAt}
+	for _, table := range state.Tables {
+		if table.ComputedStale {
+			freshness.TablesCatchingUp = append(freshness.TablesCatchingUp, table.TableName)
+		}
+		if !table.ReconciledAt.IsZero() && (freshness.ReconciledAt.IsZero() || table.ReconciledAt.Before(freshness.ReconciledAt)) {
+			freshness.ReconciledAt = table.ReconciledAt
+		}
+	}
+	if len(freshness.TablesCatchingUp) > 0 || (m.interval > 0 && m.service.now().Sub(freshness.AsOf) > 2*m.interval+m.freshenWait) {
+		freshness.State = FreshnessCatchingUp
+	}
+	return freshness, true
 }

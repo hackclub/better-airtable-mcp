@@ -44,7 +44,7 @@ func TestManagerCoalescesManualSyncRequestsDuringInFlightSync(t *testing.T) {
 					},
 				},
 			})
-		case "/v0/appProjects/tblProjects":
+		case "/v0/appProjects/tblProjects", "/v0/appProjects/tblProjects/listRecords":
 			recordCalls.Add(1)
 			select {
 			case blockRecords <- struct{}{}:
@@ -109,7 +109,7 @@ func TestManagerCoalescesManualSyncRequestsDuringInFlightSync(t *testing.T) {
 	}
 }
 
-func TestManagerRemovesDuckDBFileAfterTTLExpiry(t *testing.T) {
+func TestManagerKeepsDuckDBFileAfterTTLExpiry(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/v0/meta/bases":
@@ -128,7 +128,7 @@ func TestManagerRemovesDuckDBFileAfterTTLExpiry(t *testing.T) {
 					},
 				},
 			})
-		case "/v0/appProjects/tblProjects":
+		case "/v0/appProjects/tblProjects", "/v0/appProjects/tblProjects/listRecords":
 			writeManagerJSON(t, w, map[string]any{
 				"records": []map[string]any{
 					{"id": "rec1", "createdTime": "2026-04-01T12:00:00Z", "fields": map[string]any{"Name": "A"}},
@@ -155,15 +155,23 @@ func TestManagerRemovesDuckDBFileAfterTTLExpiry(t *testing.T) {
 		t.Fatalf("expected DuckDB file to exist: %v", err)
 	}
 
+	// The idle worker retires, but the cache file must outlive it: the next
+	// tool call reads it straight away instead of downloading the base again.
 	deadline := time.Now().Add(6 * time.Second)
 	for time.Now().Before(deadline) {
-		if _, err := os.Stat(dbPath); os.IsNotExist(err) {
+		manager.mu.Lock()
+		workers := len(manager.workers)
+		manager.mu.Unlock()
+		if workers == 0 {
+			if _, err := os.Stat(dbPath); err != nil {
+				t.Fatalf("expected DuckDB file %s to survive TTL expiry: %v", dbPath, err)
+			}
 			return
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
 
-	t.Fatalf("expected DuckDB file %s to be removed after TTL expiry", dbPath)
+	t.Fatalf("expected the idle worker to retire after TTL expiry")
 }
 
 func TestManagerEnsureBaseReadyRefreshesExistingSnapshotBeforeReturning(t *testing.T) {
@@ -188,7 +196,7 @@ func TestManagerEnsureBaseReadyRefreshesExistingSnapshotBeforeReturning(t *testi
 					},
 				},
 			})
-		case "/v0/appProjects/tblProjects":
+		case "/v0/appProjects/tblProjects", "/v0/appProjects/tblProjects/listRecords":
 			recordCalls.Add(1)
 			<-releaseRecords
 			writeManagerJSON(t, w, map[string]any{
@@ -348,7 +356,7 @@ func TestManagerEnsureBaseSchemaSampledWaitsForFirstPageAcrossTables(t *testing.
 					},
 				},
 			})
-		case "/v0/appProjects/tblProjects":
+		case "/v0/appProjects/tblProjects", "/v0/appProjects/tblProjects/listRecords":
 			writeManagerJSON(t, w, map[string]any{
 				"records": []map[string]any{
 					{"id": "recProject1", "createdTime": "2026-04-01T12:00:00Z", "fields": map[string]any{"Name": "Website Redesign"}},
@@ -436,7 +444,7 @@ func TestManagerContinuouslyResyncsWhileActive(t *testing.T) {
 					},
 				},
 			})
-		case "/v0/appProjects/tblProjects":
+		case "/v0/appProjects/tblProjects", "/v0/appProjects/tblProjects/listRecords":
 			recordCalls.Add(1)
 			name := "Initial Snapshot"
 			if generation.Load() > 0 {
@@ -510,7 +518,7 @@ func TestTriggerSyncDuringInFlightSyncRunsFollowUpSync(t *testing.T) {
 					},
 				},
 			})
-		case "/v0/appProjects/tblProjects":
+		case "/v0/appProjects/tblProjects", "/v0/appProjects/tblProjects/listRecords":
 			call := recordCalls.Add(1)
 			if call == 1 {
 				select {

@@ -86,6 +86,8 @@ func main() {
 	syncService := syncer.NewService(syncer.NewHTTPClient("", nil), cfg.DuckDBDataDir)
 	syncService.SetMaxConcurrentSyncs(cfg.SyncMaxConcurrent)
 	syncManager := syncer.NewManager(syncService, store, tokenManager, cfg.SyncInterval, cfg.SyncTTL)
+	syncManager.SetReconcileInterval(cfg.ReconcileInterval)
+	syncManager.SetCacheMaxBytes(cfg.CacheMaxBytes)
 	approvalService := approval.NewService(store, cipher, syncService, syncManager, tokenManager, syncer.NewHTTPClient("", nil), cfg.BaseURLString(), cfg.ApprovalTTL)
 	toolRuntime := &tools.Runtime{
 		Store:          store,

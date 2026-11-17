@@ -54,7 +54,7 @@ func TestRunSyncReturnsWhenRunDeadlineExpires(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		done := make(chan error, 1)
 		go func() {
-			_, err := service.runSync(ctx, StaticAccessToken("token"), Base{ID: "appStall", Name: "Stall"}, nil)
+			_, err := service.runSync(ctx, StaticAccessToken("token"), Base{ID: "appStall", Name: "Stall"}, syncRunOptions{}, nil)
 			done <- err
 		}()
 
