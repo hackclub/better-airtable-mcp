@@ -34,6 +34,16 @@ const (
 	defaultBaseRateLimit = rate.Limit(4)
 	defaultBaseRateBurst = 1
 
+	// Airtable also throttles each signed-in user across all of their bases,
+	// at about the same rate as one base. Budgeting only per base lets one
+	// person with two bases syncing run at twice their limit, and every 429
+	// then parks a table for 30 seconds or more. defaultUserRateLimit is the
+	// total for one user. defaultUserBulkRateLimit caps how much of it large
+	// downloads may take, so refreshes, writes and schema reads for the same
+	// person always find room instead of queueing behind a download.
+	defaultUserRateLimit     = rate.Limit(4)
+	defaultUserBulkRateLimit = rate.Limit(3)
+
 	// 6 attempts is 5 retries. With Airtable's 30s Retry-After hint and the
 	// exponential schedule below, the worst-case total wait per request is
 	// bounded by maxRetryBackoff * (maxRetryAttempts-1).
@@ -86,19 +96,40 @@ type HTTPClient struct {
 	sleep       func(context.Context, time.Duration) error
 	randomFloat func() float64
 
-	mu             sync.Mutex
-	nextUserWindow map[string]*rateWindow
-	baseLimiters   map[string]*baseLimiterEntry
+	mu           sync.Mutex
+	userLimiters map[string]*userLimiterEntry
+	baseLimiters map[string]*baseLimiterEntry
 
-	baseRateLimit    rate.Limit
-	baseRateBurst    int
-	maxRetryAttempts int
-	maxRetryBackoff  time.Duration
+	baseRateLimit     rate.Limit
+	baseRateBurst     int
+	userRateLimit     rate.Limit
+	userBulkRateLimit rate.Limit
+	maxRetryAttempts  int
+	maxRetryBackoff   time.Duration
 }
 
-type rateWindow struct {
-	nextAllowedAt time.Time
-	lastSeen      time.Time
+// userLimiterEntry is one signed-in user's Airtable budget. Every request
+// draws from all; requests marked with WithBulkRequests draw from bulk first.
+type userLimiterEntry struct {
+	all  *rate.Limiter
+	bulk *rate.Limiter
+	// slowUntil is set after a 429: until then both limiters run at half rate.
+	slowUntil time.Time
+	lastSeen  time.Time
+}
+
+type bulkRequestsKey struct{}
+
+// WithBulkRequests marks the Airtable requests made with ctx as part of a
+// large download. They are held to a share of the user's budget so that the
+// same user's small requests are not stuck behind them.
+func WithBulkRequests(ctx context.Context) context.Context {
+	return context.WithValue(ctx, bulkRequestsKey{}, true)
+}
+
+func isBulkRequest(ctx context.Context) bool {
+	bulk, _ := ctx.Value(bulkRequestsKey{}).(bool)
+	return bulk
 }
 
 type baseLimiterEntry struct {
@@ -234,17 +265,19 @@ func NewHTTPClient(baseURL string, httpClient *http.Client) *HTTPClient {
 	}
 
 	return &HTTPClient{
-		baseURL:          strings.TrimRight(baseURL, "/"),
-		httpClient:       httpClient,
-		clock:            time.Now,
-		sleep:            sleepContext,
-		randomFloat:      rand.Float64,
-		nextUserWindow:   make(map[string]*rateWindow),
-		baseLimiters:     make(map[string]*baseLimiterEntry),
-		baseRateLimit:    defaultBaseRateLimit,
-		baseRateBurst:    defaultBaseRateBurst,
-		maxRetryAttempts: defaultMaxRetryAttempts,
-		maxRetryBackoff:  defaultMaxRetryBackoff,
+		baseURL:           strings.TrimRight(baseURL, "/"),
+		httpClient:        httpClient,
+		clock:             time.Now,
+		sleep:             sleepContext,
+		randomFloat:       rand.Float64,
+		userLimiters:      make(map[string]*userLimiterEntry),
+		baseLimiters:      make(map[string]*baseLimiterEntry),
+		baseRateLimit:     defaultBaseRateLimit,
+		baseRateBurst:     defaultBaseRateBurst,
+		userRateLimit:     defaultUserRateLimit,
+		userBulkRateLimit: defaultUserBulkRateLimit,
+		maxRetryAttempts:  defaultMaxRetryAttempts,
+		maxRetryBackoff:   defaultMaxRetryBackoff,
 	}
 }
 
@@ -596,6 +629,7 @@ func (c *HTTPClient) doJSON(ctx context.Context, accessToken, method, requestPat
 			response.Body.Close()
 			if attempt < maxAttempts-1 {
 				retryDelay := c.computeRateLimitBackoff(response.Header.Get("Retry-After"), attempt)
+				c.slowUserAfterRateLimit(accessToken, retryDelay)
 				logx.Event(ctx, "airtable_client", "airtable.request.retry",
 					"method", method,
 					"base_id", baseID,
@@ -732,7 +766,57 @@ func (c *HTTPClient) waitForUserRateLimit(ctx context.Context, accessToken strin
 	if tokenKey == "" {
 		return nil
 	}
-	return c.waitForWindow(ctx, c.nextUserWindow, tokenKey, 20*time.Millisecond)
+
+	now := c.clock()
+	c.mu.Lock()
+	entry, exists := c.userLimiters[tokenKey]
+	if !exists {
+		entry = &userLimiterEntry{
+			all:  rate.NewLimiter(c.userRateLimit, 1),
+			bulk: rate.NewLimiter(c.userBulkRateLimit, 1),
+		}
+		c.userLimiters[tokenKey] = entry
+	}
+	entry.lastSeen = now
+	if !entry.slowUntil.IsZero() && !now.Before(entry.slowUntil) {
+		entry.all.SetLimitAt(now, c.userRateLimit)
+		entry.bulk.SetLimitAt(now, c.userBulkRateLimit)
+		entry.slowUntil = time.Time{}
+	}
+	c.pruneUserLimitersLocked(now)
+	c.mu.Unlock()
+
+	if isBulkRequest(ctx) {
+		if err := c.waitForLimiter(ctx, entry.bulk, "user "+tokenKey[:8]+" bulk"); err != nil {
+			return err
+		}
+	}
+	return c.waitForLimiter(ctx, entry.all, "user "+tokenKey[:8])
+}
+
+// slowUserAfterRateLimit halves a user's budget for as long as Airtable asked
+// the rejected request to wait. A 429 means the user is over their limit in
+// Airtable's eyes, whatever this process has counted: other clients spend the
+// same allowance.
+func (c *HTTPClient) slowUserAfterRateLimit(accessToken string, delay time.Duration) {
+	tokenKey := rateLimitTokenKey(accessToken)
+	if tokenKey == "" || delay <= 0 {
+		return
+	}
+	now := c.clock()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	entry, exists := c.userLimiters[tokenKey]
+	if !exists {
+		return
+	}
+	if entry.slowUntil.IsZero() {
+		entry.all.SetLimitAt(now, c.userRateLimit/2)
+		entry.bulk.SetLimitAt(now, c.userBulkRateLimit/2)
+	}
+	if until := now.Add(delay); until.After(entry.slowUntil) {
+		entry.slowUntil = until
+	}
 }
 
 func (c *HTTPClient) waitForBaseRateLimit(ctx context.Context, requestPath string) error {
@@ -756,9 +840,15 @@ func (c *HTTPClient) waitForBaseRateLimit(ctx context.Context, requestPath strin
 	limiter := entry.limiter
 	c.mu.Unlock()
 
+	return c.waitForLimiter(ctx, limiter, "base "+baseID)
+}
+
+// waitForLimiter takes one slot from limiter and sleeps until it is due.
+func (c *HTTPClient) waitForLimiter(ctx context.Context, limiter *rate.Limiter, name string) error {
+	now := c.clock()
 	reservation := limiter.ReserveN(now, 1)
 	if !reservation.OK() {
-		return fmt.Errorf("airtable rate limiter for base %s rejected reservation", baseID)
+		return fmt.Errorf("airtable rate limiter for %s rejected reservation", name)
 	}
 	delay := reservation.DelayFrom(now)
 	if delay <= 0 {
@@ -771,47 +861,20 @@ func (c *HTTPClient) waitForBaseRateLimit(ctx context.Context, requestPath strin
 	return nil
 }
 
+func (c *HTTPClient) pruneUserLimitersLocked(now time.Time) {
+	const ttl = 10 * time.Minute
+	for key, entry := range c.userLimiters {
+		if now.Sub(entry.lastSeen) > ttl {
+			delete(c.userLimiters, key)
+		}
+	}
+}
+
 func (c *HTTPClient) pruneBaseLimitersLocked(now time.Time) {
 	const ttl = 10 * time.Minute
 	for key, entry := range c.baseLimiters {
 		if now.Sub(entry.lastSeen) > ttl {
 			delete(c.baseLimiters, key)
-		}
-	}
-}
-
-func (c *HTTPClient) waitForWindow(ctx context.Context, windows map[string]*rateWindow, key string, interval time.Duration) error {
-	if strings.TrimSpace(key) == "" {
-		return nil
-	}
-
-	c.mu.Lock()
-	now := c.clock()
-	entry, ok := windows[key]
-	if !ok {
-		entry = &rateWindow{}
-		windows[key] = entry
-	}
-	nextAllowedAt := entry.nextAllowedAt
-	if nextAllowedAt.Before(now) {
-		nextAllowedAt = now
-	}
-	entry.nextAllowedAt = nextAllowedAt.Add(interval)
-	entry.lastSeen = now
-	c.pruneRateWindowsLocked(now)
-	c.mu.Unlock()
-
-	if delay := nextAllowedAt.Sub(now); delay > 0 {
-		return c.sleep(ctx, delay)
-	}
-	return nil
-}
-
-func (c *HTTPClient) pruneRateWindowsLocked(now time.Time) {
-	const ttl = 10 * time.Minute
-	for key, window := range c.nextUserWindow {
-		if now.Sub(window.lastSeen) > ttl {
-			delete(c.nextUserWindow, key)
 		}
 	}
 }

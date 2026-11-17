@@ -100,8 +100,8 @@ func TestHTTPClientAppliesPerUserRateLimit(t *testing.T) {
 	if len(delays) != 1 {
 		t.Fatalf("expected one rate-limit sleep, got %d (%v)", len(delays), delays)
 	}
-	if delays[0] != 20*time.Millisecond {
-		t.Fatalf("expected 20ms user-token delay, got %s", delays[0])
+	if delays[0] != 250*time.Millisecond {
+		t.Fatalf("expected a 250ms wait for the user's next slot (4 per second), got %s", delays[0])
 	}
 }
 
@@ -156,11 +156,13 @@ func TestHTTPClient429BackoffGrowsExponentiallyAndRespectsRetryAfter(t *testing.
 	defer server.Close()
 
 	client := NewHTTPClient(server.URL, server.Client())
-	client.clock = func() time.Time { return time.Unix(0, 0) }
+	now := time.Unix(0, 0)
+	client.clock = func() time.Time { return now }
 	client.randomFloat = func() float64 { return 0 } // disable jitter for determinism
 	var sleepDelays []time.Duration
 	client.sleep = func(ctx context.Context, delay time.Duration) error {
 		sleepDelays = append(sleepDelays, delay)
+		now = now.Add(delay)
 		return nil
 	}
 
@@ -171,7 +173,7 @@ func TestHTTPClient429BackoffGrowsExponentiallyAndRespectsRetryAfter(t *testing.
 		t.Fatalf("expected 4 HTTP calls (3 retries), got %d", calls)
 	}
 
-	// Filter out per-user (20ms) and per-base (token bucket) limiter sleeps;
+	// Filter out per-user and per-base limiter sleeps;
 	// keep only the multi-second 429 backoff sleeps.
 	var backoffs []time.Duration
 	for _, d := range sleepDelays {
@@ -309,10 +311,11 @@ func TestHTTPClientPerBaseLimiterIsolatesBases(t *testing.T) {
 	}
 	client.baseRateBurst = 1
 
-	if _, err := client.GetBaseSchema(context.Background(), "token", "appA"); err != nil {
+	// Distinct users, so only the per-base buckets are in play.
+	if _, err := client.GetBaseSchema(context.Background(), "token-a", "appA"); err != nil {
 		t.Fatalf("GetBaseSchema(appA) returned error: %v", err)
 	}
-	if _, err := client.GetBaseSchema(context.Background(), "token", "appB"); err != nil {
+	if _, err := client.GetBaseSchema(context.Background(), "token-b", "appB"); err != nil {
 		t.Fatalf("GetBaseSchema(appB) returned error: %v", err)
 	}
 
@@ -320,6 +323,206 @@ func TestHTTPClientPerBaseLimiterIsolatesBases(t *testing.T) {
 		if d >= 100*time.Millisecond {
 			t.Fatalf("expected no per-base bucket sleep across distinct bases, got %s (all=%v)", d, sleepDelays)
 		}
+	}
+}
+
+// virtualClockClient returns a client whose sleeps advance a fake clock, plus
+// a way to read that clock.
+func virtualClockClient(t *testing.T, handler http.HandlerFunc) (*HTTPClient, func() time.Time, func(time.Duration)) {
+	t.Helper()
+	server := httptest.NewServer(handler)
+	t.Cleanup(server.Close)
+
+	client := NewHTTPClient(server.URL, server.Client())
+	now := time.Unix(0, 0)
+	client.clock = func() time.Time { return now }
+	client.randomFloat = func() float64 { return 0 }
+	client.sleep = func(ctx context.Context, delay time.Duration) error {
+		now = now.Add(delay)
+		return nil
+	}
+	return client, func() time.Time { return now }, func(d time.Duration) { now = now.Add(d) }
+}
+
+func emptySchemaHandler(w http.ResponseWriter, r *http.Request) {
+	json.NewEncoder(w).Encode(map[string]any{"tables": []map[string]any{}})
+}
+
+func TestHTTPClientSharesOneUserBudgetAcrossBases(t *testing.T) {
+	client, clock, _ := virtualClockClient(t, emptySchemaHandler)
+
+	// One user, eight different bases: no per-base bucket ever fills, so any
+	// spacing comes from the user's own budget.
+	started := clock()
+	for index := 0; index < 8; index++ {
+		baseID := "appUser" + string(rune('A'+index))
+		if _, err := client.GetBaseSchema(context.Background(), "one-user", baseID); err != nil {
+			t.Fatalf("GetBaseSchema(%s) returned error: %v", baseID, err)
+		}
+	}
+	if elapsed, want := clock().Sub(started), 7*250*time.Millisecond; elapsed != want {
+		t.Fatalf("eight requests for one user across bases took %s, want %s (4 per second in total)", elapsed, want)
+	}
+
+	// A second user is not held back by the first.
+	before := clock()
+	if _, err := client.GetBaseSchema(context.Background(), "another-user", "appOther"); err != nil {
+		t.Fatalf("GetBaseSchema() returned error: %v", err)
+	}
+	if waited := clock().Sub(before); waited != 0 {
+		t.Fatalf("a different user waited %s behind the first user's requests", waited)
+	}
+}
+
+func TestHTTPClientKeepsRoomForSmallRequestsDuringBulkDownload(t *testing.T) {
+	client, clock, _ := virtualClockClient(t, emptySchemaHandler)
+	bulk := WithBulkRequests(context.Background())
+
+	started := clock()
+	for index := 0; index < 13; index++ {
+		baseID := "appBulk" + string(rune('A'+index))
+		if _, err := client.GetBaseSchema(bulk, "one-user", baseID); err != nil {
+			t.Fatalf("bulk GetBaseSchema(%s) returned error: %v", baseID, err)
+		}
+	}
+	// Thirteen bulk requests at 3 per second span four seconds, where the
+	// user's full 4 per second would have taken three.
+	if elapsed := clock().Sub(started); elapsed < 3900*time.Millisecond || elapsed > 4100*time.Millisecond {
+		t.Fatalf("thirteen bulk requests took %s, want about 4s (3 per second)", elapsed)
+	}
+
+	// A small request for the same user gets the next slot, not a place at
+	// the back of the download.
+	before := clock()
+	if _, err := client.GetBaseSchema(context.Background(), "one-user", "appSmall"); err != nil {
+		t.Fatalf("GetBaseSchema() returned error: %v", err)
+	}
+	if waited := clock().Sub(before); waited > 250*time.Millisecond {
+		t.Fatalf("a small request waited %s behind a bulk download, want at most 250ms", waited)
+	}
+}
+
+func TestHTTPClientHalvesUserBudgetAfterRateLimit(t *testing.T) {
+	var calls int
+	client, clock, advance := virtualClockClient(t, func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if calls == 1 {
+			w.Header().Set("Retry-After", "30")
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		emptySchemaHandler(w, r)
+	})
+	// The rejected request's own wait must not move the clock, so the
+	// requests below land inside the slow period like other goroutines would.
+	baseSleep := client.sleep
+	client.sleep = func(ctx context.Context, delay time.Duration) error {
+		if delay >= time.Second {
+			return nil
+		}
+		return baseSleep(ctx, delay)
+	}
+
+	if _, err := client.GetBaseSchema(context.Background(), "one-user", "appFirst"); err != nil {
+		t.Fatalf("GetBaseSchema() returned error: %v", err)
+	}
+
+	spacing := func(label string) time.Duration {
+		t.Helper()
+		if _, err := client.GetBaseSchema(context.Background(), "one-user", "app"+label+"1"); err != nil {
+			t.Fatalf("GetBaseSchema() returned error: %v", err)
+		}
+		before := clock()
+		if _, err := client.GetBaseSchema(context.Background(), "one-user", "app"+label+"2"); err != nil {
+			t.Fatalf("GetBaseSchema() returned error: %v", err)
+		}
+		return clock().Sub(before)
+	}
+
+	if got := spacing("Slow"); got != 500*time.Millisecond {
+		t.Fatalf("spacing right after a 429 was %s, want 500ms (half rate)", got)
+	}
+	advance(31 * time.Second)
+	if got := spacing("Recovered"); got != 250*time.Millisecond {
+		t.Fatalf("spacing after the slow period was %s, want 250ms", got)
+	}
+}
+
+// TestHTTPClientConcurrentDownloadsStayInsideOneUsersLimit runs on the real
+// clock: two bulk downloads and a stream of small requests share one user,
+// against a server that counts that user's requests like Airtable does.
+func TestHTTPClientConcurrentDownloadsStayInsideOneUsersLimit(t *testing.T) {
+	if testing.Short() {
+		t.Skip("runs for a few seconds on the real clock")
+	}
+
+	var mu sync.Mutex
+	var arrivals []time.Time
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		arrivals = append(arrivals, time.Now())
+		mu.Unlock()
+		emptySchemaHandler(w, r)
+	}))
+	defer server.Close()
+	client := NewHTTPClient(server.URL, server.Client())
+
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer cancel()
+	var wg sync.WaitGroup
+	for _, baseID := range []string{"appBigOne", "appBigTwo"} {
+		for worker := 0; worker < 5; worker++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				bulk := WithBulkRequests(ctx)
+				for ctx.Err() == nil {
+					_, _ = client.GetBaseSchema(bulk, "one-user", baseID)
+				}
+			}()
+		}
+	}
+
+	var slowestSmall time.Duration
+	var smallCount int
+	for ctx.Err() == nil {
+		started := time.Now()
+		if _, err := client.GetBaseSchema(ctx, "one-user", "appSmall"); err != nil {
+			break
+		}
+		smallCount++
+		if waited := time.Since(started); waited > slowestSmall {
+			slowestSmall = waited
+		}
+		select {
+		case <-ctx.Done():
+		case <-time.After(700 * time.Millisecond):
+		}
+	}
+	wg.Wait()
+
+	mu.Lock()
+	defer mu.Unlock()
+	busiest := 0
+	for start := range arrivals {
+		count := 0
+		for _, at := range arrivals[start:] {
+			if at.Sub(arrivals[start]) < time.Second {
+				count++
+			}
+		}
+		if count > busiest {
+			busiest = count
+		}
+	}
+	if busiest > 5 {
+		t.Fatalf("one user sent %d requests inside a second, want at most 5", busiest)
+	}
+	if len(arrivals) < 12 {
+		t.Fatalf("expected the downloads to keep moving, saw only %d requests in 4s", len(arrivals))
+	}
+	if smallCount < 3 || slowestSmall > time.Second {
+		t.Fatalf("small requests were starved: %d completed, slowest waited %s", smallCount, slowestSmall)
 	}
 }
 

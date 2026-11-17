@@ -243,7 +243,7 @@ recTask2,2026-04-01T13:15:00Z,QA revised layout
 
 **Behavior:**
 - Resolves base by ID or name (via `list_bases` internally if name is given)
-- If the base has no local snapshot yet, initializes schema immediately, creates empty/queryable DuckDB tables, starts a background sync, and waits until the first page for every table has been ingested (or an empty first page proves that table currently has no records) before returning
+- If the base has no local snapshot yet, initializes schema immediately, creates empty/queryable DuckDB tables, starts a background sync, and waits up to 8 seconds for the first page of every table (or an empty first page that proves the table has no records). Past that it returns the schema with the samples loaded so far, and the tables still waiting are marked as not started
 - Returns up to 3 sample rows per table from the DuckDB cache
 - Includes the metadata mapping (Airtable IDs ↔ DuckDB names) so the agent can construct mutations later
 - Includes top-level sync progress plus per-table sync state
@@ -855,7 +855,7 @@ DuckDB files are **shared across all users** who have access to the same base fo
 - Sync uses a designated authorized user's token with read access to refresh the shared cache
 - Before allowing a user to query a base, verify they have a valid Airtable token with access to that base
 - Before allowing a user to mutate a base, verify they still have access to the base, then execute the mutation using that same requesting user's Airtable token so Airtable enforces that user's write permissions
-- **Global rate limiter per base ID** ensures that even with many users, we respect Airtable's 5 req/sec/base limit
+- **Rate limiters per base ID and per user** keep the server inside Airtable's per-base limit however many users share a base, and inside each user's own limit however many bases they have syncing
 - DuckDB concurrent access: one write connection (sync worker), multiple read-only connections (query handlers)
 - During the first sync of a base, reads use the active partial snapshot
 - During a refresh of an already-complete base, reads stay on the last complete snapshot until the staging refresh finishes successfully
@@ -1283,8 +1283,10 @@ All configuration via environment variables:
 ## 11. Rate Limiting & Performance
 
 ### Airtable API
-- **5 requests/sec per base** — enforced by a global rate limiter keyed on base ID
-- **50 requests/sec per user token** — enforced per-user
+- **4 requests/sec per base** (Airtable documents 5), enforced by a rate limiter keyed on base ID
+- **4 requests/sec per user across all of their bases**, enforced by a rate limiter keyed on the user's Airtable token. Airtable throttles an OAuth user's total traffic at about the rate of one base: in production logs, two bases syncing on one user's token drew ten times the 429s of the same syncs on different users' tokens
+- **Full downloads take at most 3 of a user's 4 requests/sec**, so the same user's delta refreshes, writes and schema reads never queue behind a download
+- After a 429 the user's budget runs at half rate for as long as Airtable asked the rejected request to wait
 - **10 records per batch** for create/update/delete
 - **429 responses**: back off for 30 seconds
 - Record sync requests are scheduled round-robin across tables and pushed as hard as the limiter allows

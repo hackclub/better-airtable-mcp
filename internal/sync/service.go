@@ -529,7 +529,9 @@ func (s *Service) runSync(ctx context.Context, tokens AccessTokenFunc, base Base
 	}
 
 	if len(plans) > 0 {
-		workerCtx, cancel := context.WithCancel(ctx)
+		// A full download is the one large job a base has. Marking its pages
+		// keeps the user's other requests ahead of it in their Airtable budget.
+		workerCtx, cancel := context.WithCancel(WithBulkRequests(ctx))
 		defer cancel()
 
 		jobs := make(chan syncJob, len(plans))
