@@ -238,3 +238,63 @@ func TestLookupAndCountFieldsAreCached(t *testing.T) {
 		t.Fatalf("row = %v, want count 2 and a two-element lookup starting with Ada", result.Rows[0])
 	}
 }
+
+// A record can link to thousands of others (a program linked to every survey
+// response about it). Comparing old and new links must not carry each row's
+// whole list alongside every one of its links: on the Unified YSWS DB (427
+// programs, up to 7,403 survey links each) that ran the delta out of memory
+// and left the base stuck behind Airtable.
+func TestApplyDeltaComparesManyLongLinkLists(t *testing.T) {
+	ctx := context.Background()
+	path, startedAt := seedDeltaTestFile(t)
+
+	const hubs, linksPerHub = 40, 7500
+	links := func(hub, from, to int) []string {
+		ids := make([]string, 0, to-from)
+		for index := from; index < to; index++ {
+			ids = append(ids, fmt.Sprintf("recF%03dx%05d", hub, index))
+		}
+		return ids
+	}
+	hubRecords := func(from, to int) []RecordSnapshot {
+		records := make([]RecordSnapshot, 0, hubs)
+		for hub := 0; hub < hubs; hub++ {
+			records = append(records, deltaTestRecord(fmt.Sprintf("recHub%03d", hub), "Hub", 1, links(hub, from, to)...))
+		}
+		return records
+	}
+
+	if _, err := ApplyDelta(ctx, path, []DeltaTable{{
+		Table:       deltaTestTable(hubRecords(0, linksPerHub)...),
+		LinkColumns: []string{"friends"},
+	}}, startedAt.Add(time.Hour)); err != nil {
+		t.Fatalf("seed the long lists: %v", err)
+	}
+
+	// Every hub drops its first link and gains one.
+	results, err := ApplyDelta(ctx, path, []DeltaTable{{
+		Table:       deltaTestTable(hubRecords(1, linksPerHub+1)...),
+		WatchAny:    true,
+		LinkColumns: []string{"friends"},
+	}}, startedAt.Add(2*time.Hour))
+	if err != nil {
+		t.Fatalf("ApplyDelta with %d records of %d links: %v", hubs, linksPerHub, err)
+	}
+	got := results[0]
+	dropped, added := got.DroppedLinks["friends"], got.AddedLinks["friends"]
+	if len(dropped) != hubs || len(added) != hubs {
+		t.Fatalf("expected %d dropped and %d added links, got %d and %d", hubs, hubs, len(dropped), len(added))
+	}
+	if dropped[0] != "recF000x00000" || !containsID(added, fmt.Sprintf("recF000x%05d", linksPerHub)) {
+		t.Fatalf("unexpected link changes: dropped[0]=%q", dropped[0])
+	}
+}
+
+func containsID(ids []string, want string) bool {
+	for _, id := range ids {
+		if id == want {
+			return true
+		}
+	}
+	return false
+}

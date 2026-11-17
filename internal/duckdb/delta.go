@@ -353,11 +353,18 @@ func applyDeltaTable(ctx context.Context, conn *sql.Conn, table DeltaTable) (Del
 		}
 		for _, column := range uniqueStrings(table.LinkColumns) {
 			quotedColumn := quoteIdent(column)
+			// Both comparisons are set differences over (row, linked id)
+			// pairs. Joining each link against its row's whole list instead
+			// copies that list once per link: a few rows with thousands of
+			// links each need hundreds of MiB at once and run the write out
+			// of memory.
 			ids, err := queryIDs(ctx, conn, fmt.Sprintf(
-				`SELECT DISTINCT u.target FROM (SELECT id, unnest(%s) AS target FROM _delta_old) u
-				 LEFT JOIN %s n ON n.id = u.id
-				 WHERE n.id IS NULL OR n.%s IS NULL OR NOT list_contains(n.%s, u.target)`,
-				quotedColumn, quotedTable, quotedColumn, quotedColumn,
+				`SELECT DISTINCT target FROM (
+					SELECT id, unnest(%s) AS target FROM _delta_old
+					EXCEPT
+					SELECT id, unnest(%s) AS target FROM %s WHERE id IN (SELECT id FROM _delta_old)
+				 ) WHERE target IS NOT NULL ORDER BY target`,
+				quotedColumn, quotedColumn, quotedTable,
 			))
 			if err != nil {
 				return result, fmt.Errorf("compare links %s of %s: %w", column, name, err)
@@ -371,10 +378,12 @@ func applyDeltaTable(ctx context.Context, conn *sql.Conn, table DeltaTable) (Del
 				return result, err
 			}
 			added, err := queryIDs(ctx, conn, fmt.Sprintf(
-				`SELECT DISTINCT u.target FROM (SELECT id, unnest(%s) AS target FROM %s WHERE id IN (SELECT unnest(%s))) u
-				 LEFT JOIN _delta_old o ON o.id = u.id
-				 WHERE o.id IS NULL OR o.%s IS NULL OR NOT list_contains(o.%s, u.target)`,
-				quotedColumn, quotedTable, upsertList, quotedColumn, quotedColumn,
+				`SELECT DISTINCT target FROM (
+					SELECT id, unnest(%s) AS target FROM %s WHERE id IN (SELECT unnest(%s))
+					EXCEPT
+					SELECT id, unnest(%s) AS target FROM _delta_old
+				 ) WHERE target IS NOT NULL ORDER BY target`,
+				quotedColumn, quotedTable, upsertList, quotedColumn,
 			))
 			if err != nil {
 				return result, fmt.Errorf("compare new links %s of %s: %w", column, name, err)
