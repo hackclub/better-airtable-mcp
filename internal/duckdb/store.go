@@ -1218,7 +1218,7 @@ func normalizeWriteValue(value any, airtableType string) any {
 			return numeric
 		}
 		return value
-	case "autoNumber", "rating":
+	case "autoNumber", "rating", "count":
 		if numeric, ok := value.(float64); ok {
 			return int64(numeric)
 		}
@@ -1229,7 +1229,7 @@ func normalizeWriteValue(value any, airtableType string) any {
 		return parseTimestamp(value)
 	case "multipleSelects", "multipleRecordLinks":
 		return toStringSlice(value)
-	case "lookup", "multipleAttachments":
+	case "lookup", "multipleLookupValues", "multipleAttachments":
 		return mustMarshalJSON(value)
 	case "rollup", "formula":
 		return stringifyValue(value)

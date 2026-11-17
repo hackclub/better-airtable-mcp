@@ -13,7 +13,7 @@ import (
 
 // CacheFormat is the layout version of a cache file. A file written by an
 // older layout is rebuilt by a full sync instead of being delta-synced.
-const CacheFormat = 2
+const CacheFormat = 3
 
 // ReconcileMeta is what a completed full fetch records about the cache: the
 // schema it was built from and the point in time each table is known to match

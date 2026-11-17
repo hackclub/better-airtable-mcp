@@ -813,7 +813,8 @@ Every data table has these implicit columns:
 | singleSelect | VARCHAR | Choice name as string |
 | multipleSelects | VARCHAR[] | Array of choice names |
 | multipleRecordLinks | VARCHAR[] | Array of record IDs |
-| lookup | JSON | Heterogeneous results |
+| multipleLookupValues (lookup) | JSON | Heterogeneous results |
+| count | BIGINT | Number of linked records |
 | rollup | VARCHAR | Sniff result type; store as string if ambiguous |
 | formula | VARCHAR | Same as rollup |
 | multipleAttachments | JSON | Array of `{id, url, filename, size, type}` |

@@ -2,6 +2,7 @@ package duckdb
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 	"reflect"
 	"testing"
@@ -200,5 +201,40 @@ func TestFindRowsLinkingAndExistingRecordIDs(t *testing.T) {
 	}
 	if _, err := FindRowsLinking(ctx, path, "people", "friends", []string{"rec'; DROP TABLE people; --"}); err == nil {
 		t.Fatalf("expected an invalid record id to be refused")
+	}
+}
+
+func TestLookupAndCountFieldsAreCached(t *testing.T) {
+	for airtableType, want := range map[string]string{"multipleLookupValues": "JSON", "count": "BIGINT"} {
+		mapping, ok := AirtableTypeToDuckDBType(airtableType)
+		if !ok || mapping.Omitted || mapping.DuckDBType != want {
+			t.Fatalf("%s maps to %+v (known %v), want %s", airtableType, mapping, ok, want)
+		}
+	}
+
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "appTypes.db")
+	table := TableSnapshot{
+		AirtableTableID: "tblT", OriginalName: "T", DuckDBTableName: "t",
+		Fields: []FieldSnapshot{
+			{AirtableFieldID: "fldL", OriginalFieldName: "Names", DuckDBColumnName: "names", AirtableFieldType: "multipleLookupValues", DuckDBType: "JSON"},
+			{AirtableFieldID: "fldC", OriginalFieldName: "Count", DuckDBColumnName: "count", AirtableFieldType: "count", DuckDBType: "BIGINT"},
+		},
+	}
+	now := time.Date(2026, 11, 1, 0, 0, 0, 0, time.UTC)
+	if err := InitializeSnapshot(ctx, path, SnapshotInit{BaseID: "appTypes", BaseName: "Types", Tables: []TableSnapshot{table}, SyncStartedAt: now}); err != nil {
+		t.Fatalf("initialize: %v", err)
+	}
+	records := []RecordSnapshot{{ID: "recA", CreatedTime: now, Fields: map[string]any{"Names": []any{"Ada", "Bo"}, "Count": float64(2)}}}
+	info := SyncInfo{SyncStartedAt: now, LastSyncedAt: now, Status: "completed", TotalTables: 1}
+	if err := ApplyTablePage(ctx, path, table, records, TableSyncState{TableName: "t", SyncStatus: "completed", VisibleRecordCount: 1}, info); err != nil {
+		t.Fatalf("apply page: %v", err)
+	}
+	result, err := Query(ctx, path, `SELECT count, json_array_length(names), names->>0 FROM t`)
+	if err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	if got := fmt.Sprint(result.Rows[0]); got != "[2 2 Ada]" {
+		t.Fatalf("row = %v, want count 2 and a two-element lookup starting with Ada", result.Rows[0])
 	}
 }
