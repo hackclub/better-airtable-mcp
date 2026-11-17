@@ -273,6 +273,12 @@ Execute one or more read-only SQL queries against a base's DuckDB cache.
 **Output:**
 ```json
 {
+  "freshness": {
+    "state": "fresh",
+    "as_of": "2026-04-01T12:00:00Z",
+    "reconciled_at": "2026-04-01T08:00:00Z",
+    "tables_catching_up": []
+  },
   "sync": {
     "operation_id": "sync_appXXXXXXXXXX",
     "status": "syncing",
@@ -388,6 +394,17 @@ JOIN tasks t ON t.id = u.task_id
 
 ---
 
+**Freshness.** Every `query` and `list_schema` result starts with a `freshness` block, in both the structured payload and the text the model reads:
+
+| Field | Meaning |
+|---|---|
+| `state` | `fresh`: the cache is current. `catching_up`: a complete cache that is known to lag (a delta is still running or failing, or `tables_catching_up` is not empty). `first_sync`: the base is being downloaded for the first time and results cover only the records loaded so far |
+| `as_of` | Edits and new records made in Airtable up to this time are in the cache |
+| `reconciled_at` | Deletions made in Airtable up to this time are reflected (the last full fetch) |
+| `tables_catching_up` | Tables whose formula, lookup and rollup columns may lag until the next full fetch |
+
+In the `first_sync` state the text result leads with an explicit warning that counts are too low and that zero rows may be wrong, and names the `check_operation` ID to wait on. A partial cache used to be reported only through sync counters, and agents read empty results from it as real.
+
 ### 3.4 `mutate`
 
 Request a record mutation. All mutations go through the approval flow.
@@ -474,14 +491,18 @@ For `delete_records`, `records` may be either objects containing `id` or plain A
 
 ### 3.5 `sync`
 
-Force a refresh of a base's DuckDB cache.
+Refresh a base's DuckDB cache now. Reads already pick up recent Airtable edits on their own (section 4.1), so this is rarely needed.
 
 **Input:**
 ```json
 {
-  "base": "string — base ID or base name"
+  "base": "string — base ID or base name",
+  "mode": "\"delta\" (default) | \"full\""
 }
 ```
+
+- `delta` fetches only what changed since the last sync and usually takes seconds
+- `full` downloads every record again. It is the way to clear a record that was deleted in Airtable but still shows up, or a formula, lookup or rollup value that looks out of date (section 4.2)
 
 **Output:**
 ```json
@@ -504,7 +525,7 @@ Force a refresh of a base's DuckDB cache.
 
 **Behavior:**
 - Non-blocking: returns immediately with an operation ID and ETA
-- ETA is estimated from the last completed sync's duration for this base (or a rough default if no history exists)
+- ETA is estimated from the last completed full sync's duration for this base (or a rough default if no history exists)
 - If a sync is already in progress, returns the existing operation ID
 - Includes live progress counters for the current run
 - The agent can use `check_operation` to poll for completion
@@ -621,37 +642,69 @@ field to "deprecated" and calls it a deletion).
 
 ### 4.1 Sync Worker Lifecycle
 
-Each active base has a dedicated **sync worker** goroutine.
+A base's cache is a DuckDB file that is **kept on disk** for as long as there is room. It is not deleted when the base goes idle or when the server restarts. A base that has been downloaded once answers reads from its cache immediately from then on, and only fetches what changed.
+
+Each base in use has a dedicated **sync worker** goroutine.
 
 ```
-Base becomes active (first query/list_schema)
+Base is used (first query/list_schema/mutate after being idle)
   → Spawn sync worker goroutine
-  → Fetch schema and create an empty/queryable DuckDB snapshot immediately
-  → Mark the base readable as soon as schema initialization succeeds
-  → Continue syncing records in the background
-  → Enter continuous sync loop while active
-  → On each tool call touching this base, reset the TTL timer
+  → Cache file exists and is complete:
+      reads are served from it straight away, and a delta sync starts
+  → No cache file yet:
+      fetch schema, create an empty/queryable snapshot, mark the base readable,
+      and download every record in the background (first sync)
+  → While the base stays in use, run a delta sync every SYNC_INTERVAL_SECONDS
+  → On each tool call touching this base, reset the activity timer
 
-TTL expires (10 minutes with no tool calls)
-  → Stop the sync worker
-  → Delete the DuckDB file from disk
-  → Clean up in-memory state
+Activity window expires (SYNC_TTL_MINUTES with no tool calls)
+  → If the base's last full fetch is older than RECONCILE_INTERVAL_HOURS,
+    run a reconcile now, while nobody is waiting on it
+  → Stop the sync worker and clean up in-memory state
+  → Keep the DuckDB file
 
 Server starts or restarts
-  → Load active bases from `sync_state` where `active_until > now()`
-  → Restore sync workers for those still-active bases
-  → Sweep `DUCKDB_DATA_DIR` for stale `.db` files
-  → Delete any DuckDB file whose base is expired or has no corresponding active `sync_state`
+  → Load bases from `sync_state` where `active_until > now()` and restore their workers
+  → Remove staging files left behind by a refresh that was interrupted
+  → If the cache directory is over CACHE_MAX_MEGABYTES, delete the least
+    recently used cache files (never one with a live worker) until it fits
 ```
 
-**Continuous sync scheduling:**
-- Only one sync may run for a base at a time
-- Let `target_interval = SYNC_INTERVAL_SECONDS`
-- After each sync completes, the next sync start time is `last_sync_started_at + target_interval`
-- If the completed sync took longer than `target_interval`, the next sync starts immediately
-- Manual `sync` requests coalesce onto the in-flight or next-due sync operation instead of starting overlapping syncs
+**Sync modes.** A worker run is one of:
 
-### 4.2 Full Sync Process
+| Mode | When | What it does |
+|---|---|---|
+| Delta | The default, whenever the cache can be patched | Fetches only records created or edited since each table's watermark (section 4.2) |
+| Full | No cache file, a cache written by an older layout, a changed Airtable schema, or a `sync` call with `mode: "full"` | Downloads every record (section 4.2.1) |
+| Reconcile | The last full fetch is older than `RECONCILE_INTERVAL_HOURS` and the base just went idle, or the base has been in constant use for a second full interval | A full download throttled to 2 requests per second, so it leaves most of the base's shared API budget to everything else |
+
+**Scheduling:**
+- Only one run may be in progress for a base at a time
+- After each run, the next delta starts at `last_sync_started_at + SYNC_INTERVAL_SECONDS`
+- Manual `sync` requests coalesce onto the in-flight or next-due run instead of starting overlapping runs
+- A read on a complete cache whose last successful sync started more than `SYNC_INTERVAL_SECONDS` ago asks for a delta and waits up to 5 seconds for it. If the delta is not done by then, the read is served from the cache as it is and reports `catching_up` (section 3.3). A read never fails because a refresh is slow or broken.
+
+### 4.2 Delta Sync Process
+
+A delta brings the cache up to date with a few requests instead of a full download. For a base where nothing changed it costs one schema request plus one record request per table.
+
+1. Fetch the base schema and compare its fingerprint with the one stored in the cache (`_sync_info.schema_hash`). The fingerprint covers table and field IDs, names, types and options; it leaves out views, descriptions and select choices, which change often and do not invalidate stored rows. A different fingerprint means the cache cannot be patched, and a full sync runs instead.
+2. For each table, list the records created or edited after `delta_watermark - 2 minutes` with
+   `IS_AFTER(IF(LAST_MODIFIED_TIME(), LAST_MODIFIED_TIME(), CREATED_TIME()), <time>)`.
+   `LAST_MODIFIED_TIME()` is blank for a record no user has edited, and a blank operand makes `IS_AFTER` an error that drops the record, so those fall back to their creation time. The two minute overlap covers clock skew and computed values that settle a moment after an edit; upserts are idempotent, so re-reading it is harmless.
+3. Upsert the returned records by record ID in one transaction per batch, and advance the table's watermark to the time the listing started. The watermark only moves if it still equals the value the delta was planned against, so a full fetch that swapped a new file in underneath is never skipped past.
+4. **Follow computed dependencies.** Airtable's modified time ignores lookups, rollups and formulas, so a change in one record does not mark the records that compute from it. The schema says which fields those are (`recordLinkFieldId`, `fieldIdInLinkedTable`, and formulas that reference a link field). When an upsert changes a value that another table looks up or rolls up, the rows linking to that record are refetched by record ID. This repeats until no watched value changes.
+5. **Follow links.** Airtable mirrors a link edit on the record at the other end, so both ends normally arrive in step 2. A record that was *deleted* cannot arrive, but it disappears from every link that pointed at it. Record IDs that drop out of (or newly appear in) a link column, and that the delta did not already fetch, are fetched by ID. One Airtable no longer returns is deleted from the cache.
+6. If following dependencies would refetch more than 5,000 rows in one delta, the affected tables are flagged `computed_stale` instead, and their computed columns wait for the next full fetch.
+
+**What a delta cannot see** (a reconcile or a `sync` with `mode: "full"` fixes these):
+- A deleted record that nothing linked to
+- Formulas that change with the clock (`NOW()`, `TODAY()`)
+- A renamed select choice
+
+**Write-through.** After an approved mutation executes, the records it created or updated are refetched by ID and the ones it deleted are removed, followed by steps 4 and 5. The agent's next read sees its own write without waiting for a sync. `mutate` uses the same fetch-by-ID when an update or delete targets a record the cache does not have yet.
+
+### 4.2.1 Full Sync Process
 
 1. Fetch the base schema from Airtable (`GET /v0/meta/bases/{baseId}/tables`)
 2. Create empty DuckDB tables plus `_metadata`, `_sync_info`, and `_table_sync` immediately
@@ -661,16 +714,17 @@ Server starts or restarts
 4. Fetch record pages in a fair round-robin schedule:
    a. At most one outstanding page request per table at a time
    b. First page of every table is fetched before the second page of any table, subject to response timing
-   c. Requests are started as aggressively as allowed by the Airtable rate limiter
+   c. Requests are started as aggressively as allowed by the Airtable rate limiter (a reconcile is additionally capped at 2 requests per second)
 5. Apply each fetched page to DuckDB as it arrives and update `_sync_info` / `_table_sync`
-6. Initial sync behavior:
+6. First sync of a base:
    a. Pages are written directly into the active DuckDB file
-   b. `query` and `list_schema` can read partial data as soon as schema initialization completes
-7. Refresh behavior after a base already has a complete snapshot:
+   b. `query` and `list_schema` can read partial data as soon as schema initialization completes, and say so loudly (`first_sync`)
+7. Full sync of a base that already has a complete snapshot:
    a. Sync into `{base_id}.staging.db`
-   b. Keep serving the last complete active snapshot during the refresh
+   b. Keep serving the active snapshot during the refresh; deltas keep applying to it
    c. Atomically swap the staging DB into place on success
    d. Discard the staging DB on failure
+8. On completion, record the schema fingerprint and set every table's `delta_watermark` to the time the download started, so the next delta picks up anything edited while it ran
 
 ### 4.3 DuckDB Schema
 
@@ -703,7 +757,9 @@ CREATE TABLE _sync_info (
   tables_completed INTEGER,
   pages_fetched BIGINT,
   records_synced_this_run BIGINT,
-  error VARCHAR
+  error VARCHAR,
+  schema_hash VARCHAR,   -- fingerprint of the Airtable schema the tables were built from
+  cache_format INTEGER   -- layout version; an older file is rebuilt by a full sync
 );
 ```
 
@@ -714,7 +770,11 @@ CREATE TABLE _table_sync (
   sync_status VARCHAR,
   visible_record_count BIGINT,
   pages_fetched BIGINT,
-  has_more BOOLEAN
+  has_more BOOLEAN,
+  delta_watermark TIMESTAMP,   -- edits and new records are applied up to here
+  delta_checked_at TIMESTAMP,  -- last successful delta check
+  reconciled_at TIMESTAMP,     -- last full fetch (deletions verified up to here)
+  computed_stale BOOLEAN       -- computed columns may lag until the next full fetch
 );
 ```
 
@@ -973,8 +1033,11 @@ CREATE TABLE sync_state (
   last_sync_duration_ms BIGINT,
   total_records     BIGINT,
   total_tables      INTEGER,
-  active_until      TIMESTAMPTZ,         -- TTL: when to stop syncing
-  sync_token_user_id TEXT REFERENCES users(id)  -- whose token is being used to sync
+  active_until      TIMESTAMPTZ,         -- activity window: when the sync worker goes idle
+  sync_token_user_id TEXT REFERENCES users(id), -- whose token is being used to sync
+  last_used_at      TIMESTAMPTZ,         -- last tool call; orders cache eviction
+  last_reconciled_at TIMESTAMPTZ,        -- last full fetch of the base
+  cache_bytes       BIGINT               -- size of the base's cache file
 );
 
 -- OAuth client registrations (Dynamic Client Registration for MCP clients)
@@ -1161,8 +1224,10 @@ All configuration via environment variables:
 | `AIRTABLE_CLIENT_SECRET` | Airtable OAuth app client secret | required |
 | `BASE_URL` | Public URL of the service | required |
 | `APP_ENCRYPTION_KEY` | 32-byte key for app-level encryption of Airtable tokens and pending operation payloads | required |
-| `SYNC_INTERVAL_SECONDS` | Target seconds between sync starts while a base is active | `60` |
-| `SYNC_TTL_MINUTES` | Minutes of inactivity before cache eviction | `10` |
+| `SYNC_INTERVAL_SECONDS` | Seconds between delta syncs while a base is in use; also how old the last sync may be before a read asks for one | `60` |
+| `SYNC_TTL_MINUTES` | Minutes without a tool call before a base's sync worker goes idle. The cache file is kept | `10` |
+| `RECONCILE_INTERVAL_HOURS` | Hours a base's last full fetch may age before a reconcile is scheduled. `0` disables scheduled reconciles | `6` |
+| `CACHE_MAX_MEGABYTES` | Disk budget for cache files; over it, the least recently used are deleted. `0` means no limit | `8192` |
 | `APPROVAL_TTL_MINUTES` | Minutes before pending approvals expire | `1440` (24 hours) |
 | `QUERY_DEFAULT_LIMIT` | Default row limit for queries | `100` |
 | `QUERY_MAX_LIMIT` | Maximum row limit for queries | `1000` |
@@ -1174,9 +1239,9 @@ All configuration via environment variables:
 
 | Decision | Rationale |
 |---|---|
-| **Full sync, not incremental** | Simpler implementation; Airtable's API doesn't support efficient deltas without webhooks |
+| **Delta sync by modified time, full fetch as the backstop** | A full download of a large base costs thousands of requests against a 5 request per second limit shared with every other integration, and made every idle base start from zero. `filterByFormula` on `LAST_MODIFIED_TIME()` answers in well under a second per table even on a 60,000 row table, so only changes are fetched. A periodic full fetch covers what modified time cannot see |
 | **Schema-first partial reads on initial sync** | Agents can start querying immediately while still seeing explicit sync progress |
-| **Polling, not webhooks** | User reports webhooks are unreliable |
+| **Polling, not webhooks** | Webhook notifications are reported unreliable, and creating a webhook needs a base creator to grant an extra OAuth scope. The webhook payload log could later replace the reconcile for deletions |
 | **Shared DuckDB per base** | Avoids redundant syncs; Airtable permissions are base-level for reads |
 | **Read-only DuckDB + SQL allowlist** | Prevents agents from corrupting the cache or escaping to the filesystem; enforced by connection config and SQL validation |
 | **Approval for all record writes** | Core product thesis — no surprises |
@@ -1184,11 +1249,12 @@ All configuration via environment variables:
 | **Snake_case table/field names** | SQL ergonomics for LLMs; metadata table preserves the mapping |
 | **24-hour default approval expiry** | Allows a full day to review; previews show a snapshot staleness notice |
 | **On-disk DuckDB (not in-memory)** | Survives sync worker restarts; shared across connections |
-| **DuckDB files wiped on redeploy** | Acceptable since they're caches; Postgres is the source of truth for everything durable |
-| **Startup sweep for stale DuckDB files** | TTL-based cleanup is lazy during normal operation, so boot should remove expired or orphaned cache files left behind by crashes/restarts |
+| **DuckDB files kept across idle periods and restarts** | A kept cache answers the next read immediately and is patched by a delta. The files are still only caches: any of them can be deleted and is rebuilt from Airtable |
+| **Disk budget instead of a time limit** | Cache files are evicted least recently used first when the directory outgrows `CACHE_MAX_MEGABYTES`, never because time passed |
 | **Single Airtable OAuth app** | Simpler onboarding; users authorize once, not per-base |
 | **Writes execute as the requesting user** | Shared caches are fine for reads, but Airtable must enforce write permissions for the specific approving/requesting user |
-| **Continuous resync while active** | Avoids drift from a fixed poll loop when sync duration exceeds the nominal interval |
+| **Reconcile when a base goes idle** | The full fetch is the expensive run, so it happens when nobody is waiting on a delta; a base in constant use gets one after a second overdue interval |
+| **Reads never wait long for freshness** | A read waits at most 5 seconds for a delta, then answers from the cache and labels it `catching_up`; a broken refresh degrades freshness, not availability |
 | **Round-robin page scheduling across tables** | Prevents one large table from starving every other table during the first sync |
 | **Staging refreshes after the first complete snapshot** | Keeps existing readers on a full snapshot while a refresh is in flight |
 | **Records-only mutations in V1** | Keeps the approval flow and executor focused on the core use case |
@@ -1212,7 +1278,7 @@ All configuration via environment variables:
 | Medium | 15 | 5,000 | ~15s |
 | Large | 30 | 50,000 | ~120s |
 
-- Active bases run a single continuous sync loop; if a sync takes longer than `SYNC_INTERVAL_SECONDS`, the next sync starts immediately after completion
+- These are first-sync and reconcile times. A delta sync costs one schema request and one record request per table when nothing changed, plus one request per 100 changed records
 
 ### Query Performance
 - DuckDB queries against local files are sub-second for most analytical queries
@@ -1236,7 +1302,10 @@ All configuration via environment variables:
 | Mutate update/delete target not yet synced | Return `records_not_synced_yet` plus sync progress; do not create an approval |
 | Mutate approved but Airtable API fails before any batch succeeds | Operation status → `failed` with error details |
 | Mutate approved but Airtable API fails after one or more batches succeed | Operation status → `partially_completed`; include partial result details and stop on first failed Airtable request |
-| DuckDB file missing (post-redeploy) | Triggers fresh sync transparently |
+| DuckDB file missing (first use, evicted, or deleted) | Triggers a first sync transparently |
+| Delta sync fails | The cache keeps serving its last state; the worker retries with backoff and reads report `catching_up` |
+| Airtable schema changed since the cache was built | The next sync is a full one into a staging file; reads stay on the existing snapshot until it swaps in |
+| Mutate update/delete target missing from the cache | Fetched from Airtable by record ID before the approval is prepared; only a record Airtable does not have is reported missing |
 | DuckDB file unreadable by this build (newer storage version after a rollback, or not a DuckDB file) | The next sync deletes it and rebuilds it from Airtable |
 
 ---
