@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
@@ -21,6 +22,39 @@ type ReconcileMeta struct {
 	SchemaHash   string
 	Watermark    time.Time
 	ReconciledAt time.Time
+}
+
+// pendingTableDDL creates the follow-up queue. A delta write records here, in
+// the same transaction as the rows it wrote, which records now need a
+// follow-up fetch: rows computed from a value that changed, and records at
+// the other end of a link that changed. Keeping the queue in the file means a
+// delta that fails or is killed halfway cannot forget the work it caused.
+const pendingTableDDL = `CREATE TABLE IF NOT EXISTS _delta_pending (
+	generation INTEGER,
+	source_table VARCHAR,
+	kind VARCHAR,
+	column_name VARCHAR,
+	record_id VARCHAR
+)`
+
+// Kinds of follow-up work in _delta_pending.
+const (
+	// PendingChanged: record_id in source_table changed value in column_name.
+	PendingChanged = "changed"
+	// PendingChangedAny: record_id in source_table changed in some column.
+	PendingChangedAny = "changed_any"
+	// PendingLinkEnd: record_id is at the other end of link column_name of
+	// source_table, and that link changed.
+	PendingLinkEnd = "link_end"
+)
+
+// PendingChange is one queued follow-up.
+type PendingChange struct {
+	Generation  int
+	SourceTable string
+	Kind        string
+	Column      string
+	RecordID    string
 }
 
 // TableDeltaState is one table's sync position inside a cache file.
@@ -60,6 +94,15 @@ type DeltaTable struct {
 	// row). Airtable mirrors every link edit on the record at the other end,
 	// so those are the rows whose own link column just changed.
 	LinkColumns []string
+
+	// PendingGeneration, when positive, queues what this write changed in
+	// _delta_pending under that generation.
+	PendingGeneration int
+	// ForceChanged reports every upserted row as changed in every watched
+	// column, without comparing. It is for rows whose dependents may have
+	// been fetched before the row's latest edit, where comparing against the
+	// cache proves nothing.
+	ForceChanged bool
 
 	// AdvanceWatermark moves the table's delta watermark to NewWatermark, but
 	// only while the stored watermark still equals BasedOnWatermark. A full
@@ -134,6 +177,11 @@ func nullableTime(value time.Time) any {
 // ApplyDelta upserts and deletes rows in the active cache file and advances
 // the per-table sync positions, all in one transaction.
 func ApplyDelta(ctx context.Context, path string, tables []DeltaTable, syncedAt time.Time) ([]DeltaTableResult, error) {
+	// Opening read-write would create a missing file as an empty database,
+	// which every later read would then trip over.
+	if !DatabaseFileExists(path) {
+		return nil, fmt.Errorf("cache file %s is gone", filepath.Base(path))
+	}
 	db, err := openDatabase(path, "READ_WRITE")
 	if err != nil {
 		return nil, err
@@ -157,6 +205,9 @@ func ApplyDelta(ctx context.Context, path string, tables []DeltaTable, syncedAt 
 			_, _ = conn.ExecContext(context.WithoutCancel(ctx), `ROLLBACK`)
 		}
 	}()
+	if _, err := conn.ExecContext(ctx, pendingTableDDL); err != nil {
+		return nil, fmt.Errorf("create follow-up queue: %w", err)
+	}
 
 	results := make([]DeltaTableResult, 0, len(tables))
 	for _, table := range tables {
@@ -262,10 +313,18 @@ func applyDeltaTable(ctx context.Context, conn *sql.Conn, table DeltaTable) (Del
 	}
 
 	if watching {
+		columnTypes := make(map[string]string, len(table.Table.Fields))
+		for _, field := range table.Table.Fields {
+			columnTypes[field.DuckDBColumnName] = field.DuckDBType
+		}
 		for _, column := range uniqueStrings(table.WatchColumns) {
+			if table.ForceChanged {
+				result.ChangedByColumn[column] = uniqueSorted(upsertIDs)
+				continue
+			}
 			ids, err := queryIDs(ctx, conn, fmt.Sprintf(
-				`SELECT n.id FROM %s n JOIN _delta_old o ON n.id = o.id WHERE n.%s IS DISTINCT FROM o.%s`,
-				quotedTable, quoteIdent(column), quoteIdent(column),
+				`SELECT n.id FROM %s n JOIN _delta_old o ON n.id = o.id WHERE %s`,
+				quotedTable, distinctCondition(column, columnTypes[column]),
 			))
 			if err != nil {
 				return result, fmt.Errorf("compare column %s of %s: %w", column, name, err)
@@ -274,11 +333,12 @@ func applyDeltaTable(ctx context.Context, conn *sql.Conn, table DeltaTable) (Del
 				result.ChangedByColumn[column] = ids
 			}
 		}
-		if table.WatchAny {
+		if table.WatchAny && table.ForceChanged {
+			result.ChangedAny = uniqueSorted(upsertIDs)
+		} else if table.WatchAny {
 			conditions := make([]string, 0, len(table.Table.Fields))
 			for _, field := range table.Table.Fields {
-				column := quoteIdent(field.DuckDBColumnName)
-				conditions = append(conditions, fmt.Sprintf(`n.%s IS DISTINCT FROM o.%s`, column, column))
+				conditions = append(conditions, distinctCondition(field.DuckDBColumnName, field.DuckDBType))
 			}
 			if len(conditions) > 0 {
 				ids, err := queryIDs(ctx, conn, fmt.Sprintf(
@@ -328,6 +388,47 @@ func applyDeltaTable(ctx context.Context, conn *sql.Conn, table DeltaTable) (Del
 		}
 	}
 
+	if table.PendingGeneration > 0 {
+		queue := func(kind, column string, ids []string) error {
+			valid := make([]string, 0, len(ids))
+			for _, id := range ids {
+				if recordIDPattern.MatchString(id) {
+					valid = append(valid, id)
+				}
+			}
+			if len(valid) == 0 {
+				return nil
+			}
+			list, err := recordIDList(valid)
+			if err != nil {
+				return err
+			}
+			_, err = conn.ExecContext(ctx,
+				fmt.Sprintf(`INSERT INTO _delta_pending SELECT ?, ?, ?, ?, unnest(%s)`, list),
+				table.PendingGeneration, name, kind, column,
+			)
+			if err != nil {
+				return fmt.Errorf("queue follow-up for %s: %w", name, err)
+			}
+			return nil
+		}
+		for column, ids := range result.ChangedByColumn {
+			if err := queue(PendingChanged, column, ids); err != nil {
+				return result, err
+			}
+		}
+		if err := queue(PendingChangedAny, "", result.ChangedAny); err != nil {
+			return result, err
+		}
+		for _, links := range []map[string][]string{result.DroppedLinks, result.AddedLinks} {
+			for column, ids := range links {
+				if err := queue(PendingLinkEnd, column, ids); err != nil {
+					return result, err
+				}
+			}
+		}
+	}
+
 	if err := conn.QueryRowContext(ctx, fmt.Sprintf(`SELECT count(*) FROM %s`, quotedTable)).Scan(&result.RecordCount); err != nil {
 		return result, fmt.Errorf("count rows of %s: %w", name, err)
 	}
@@ -356,6 +457,20 @@ func applyDeltaTable(ctx context.Context, conn *sql.Conn, table DeltaTable) (Del
 	}
 
 	return result, nil
+}
+
+// distinctCondition compares one column between the new row (n) and the row
+// it replaced (o). Attachment URLs are signed and differ on every read, and
+// attachments reach JSON columns both directly and through lookups, so URLs
+// are blanked before JSON values are compared; otherwise every refetch of a
+// row with an attachment would look like a change.
+func distinctCondition(column, duckDBType string) string {
+	quoted := quoteIdent(column)
+	if duckDBType != "JSON" {
+		return fmt.Sprintf(`n.%s IS DISTINCT FROM o.%s`, quoted, quoted)
+	}
+	const blankURLs = `regexp_replace(CAST(%s.%s AS VARCHAR), '"url":\s*"[^"]*"', '"url":""', 'g')`
+	return fmt.Sprintf(blankURLs+` IS DISTINCT FROM `+blankURLs, "n", quoted, "o", quoted)
 }
 
 func nullableBool(value *bool) any {
@@ -557,4 +672,63 @@ func ExistingRecordIDs(ctx context.Context, path, tableName string, ids []string
 		return nil, fmt.Errorf("look up records of %s: %w", tableName, err)
 	}
 	return found, nil
+}
+
+// ReadPending returns the queued follow-ups up to and including a generation,
+// and the highest generation present in the queue.
+func ReadPending(ctx context.Context, path string, throughGeneration int) (pending []PendingChange, highest int, err error) {
+	db, err := openDatabase(path, "READ_ONLY")
+	if err != nil {
+		return nil, 0, err
+	}
+	defer db.Close()
+
+	exists, err := tableExists(ctx, db, "_delta_pending")
+	if err != nil || !exists {
+		return nil, 0, err
+	}
+	var highestGeneration sql.NullInt64
+	if err := db.QueryRowContext(ctx, `SELECT max(generation) FROM _delta_pending`).Scan(&highestGeneration); err != nil {
+		return nil, 0, fmt.Errorf("read follow-up queue: %w", err)
+	}
+	rows, err := db.QueryContext(ctx,
+		`SELECT DISTINCT generation, source_table, kind, column_name, record_id FROM _delta_pending WHERE generation <= ? ORDER BY ALL`,
+		throughGeneration,
+	)
+	if err != nil {
+		return nil, 0, fmt.Errorf("read follow-up queue: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var change PendingChange
+		var column sql.NullString
+		if err := rows.Scan(&change.Generation, &change.SourceTable, &change.Kind, &column, &change.RecordID); err != nil {
+			return nil, 0, fmt.Errorf("scan follow-up: %w", err)
+		}
+		change.Column = column.String
+		pending = append(pending, change)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, 0, fmt.Errorf("iterate follow-up queue: %w", err)
+	}
+	return pending, int(highestGeneration.Int64), nil
+}
+
+// ClearPending removes queued follow-ups up to and including a generation.
+func ClearPending(ctx context.Context, path string, throughGeneration int) error {
+	if !DatabaseFileExists(path) {
+		return fmt.Errorf("cache file %s is gone", filepath.Base(path))
+	}
+	db, err := openDatabase(path, "READ_WRITE")
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	if _, err := db.ExecContext(ctx, pendingTableDDL); err != nil {
+		return fmt.Errorf("create follow-up queue: %w", err)
+	}
+	if _, err := db.ExecContext(ctx, `DELETE FROM _delta_pending WHERE generation <= ?`, throughGeneration); err != nil {
+		return fmt.Errorf("clear follow-up queue: %w", err)
+	}
+	return nil
 }

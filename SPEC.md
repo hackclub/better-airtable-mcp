@@ -695,7 +695,13 @@ A delta brings the cache up to date with a few requests instead of a full downlo
 3. Upsert the returned records by record ID in one transaction per batch, and advance the table's watermark to the time the listing started. The watermark only moves if it still equals the value the delta was planned against, so a full fetch that swapped a new file in underneath is never skipped past.
 4. **Follow computed dependencies.** Airtable's modified time ignores lookups, rollups and formulas, so a change in one record does not mark the records that compute from it. The schema says which fields those are (`recordLinkFieldId`, `fieldIdInLinkedTable`, and formulas that reference a link field). When an upsert changes a value that another table looks up or rolls up, the rows linking to that record are refetched by record ID. This repeats until no watched value changes.
 5. **Follow links.** Airtable mirrors a link edit on the record at the other end, so both ends normally arrive in step 2. A record that was *deleted* cannot arrive, but it disappears from every link that pointed at it. Record IDs that drop out of (or newly appear in) a link column, and that the delta did not already fetch, are fetched by ID. One Airtable no longer returns is deleted from the cache.
-6. If following dependencies would refetch more than 5,000 rows in one delta, the affected tables are flagged `computed_stale` instead, and their computed columns wait for the next full fetch.
+6. If following steps 4 and 5 would refetch more than 5,000 rows in one delta, the affected tables are flagged `computed_stale` instead and wait for the next full fetch. A flagged table makes the base's reconcile due at its next idle moment, whatever its age.
+
+**The follow-up queue.** Steps 4 and 5 are driven by a queue stored in the cache file (`_delta_pending`). The write that upserts a row records, in the same transaction, which follow-up fetches it calls for. A delta that fails or is killed partway therefore cannot forget them: once a changed row is in the cache, the next listing returns it equal to the cache and a comparison would find nothing to follow. The next run, or the next write-through, drains the queue first.
+
+**The first delta after a full fetch** treats every row its listings return as changed, without comparing. A full fetch reads its tables one after another, so a row edited while it ran can be cached with its new value while a row computed from it was read before the edit.
+
+**Comparing values.** Attachment URLs are signed and differ on every read, so URLs are blanked before JSON columns are compared; otherwise every refetch of a row with an attachment would look like a change.
 
 **What a delta cannot see** (a reconcile or a `sync` with `mode: "full"` fixes these):
 - A deleted record that nothing linked to
@@ -774,7 +780,18 @@ CREATE TABLE _table_sync (
   delta_watermark TIMESTAMP,   -- edits and new records are applied up to here
   delta_checked_at TIMESTAMP,  -- last successful delta check
   reconciled_at TIMESTAMP,     -- last full fetch (deletions verified up to here)
-  computed_stale BOOLEAN       -- computed columns may lag until the next full fetch
+  computed_stale BOOLEAN       -- rows may lag until the next full fetch
+);
+```
+
+**Follow-up queue** (`_delta_pending`, section 4.2):
+```sql
+CREATE TABLE _delta_pending (
+  generation INTEGER,     -- which pass of which run queued it
+  source_table VARCHAR,   -- table whose write caused the follow-up
+  kind VARCHAR,           -- 'changed' | 'changed_any' | 'link_end'
+  column_name VARCHAR,    -- the changed column, or the link column
+  record_id VARCHAR
 );
 ```
 
@@ -1303,7 +1320,9 @@ All configuration via environment variables:
 | Mutate approved but Airtable API fails before any batch succeeds | Operation status → `failed` with error details |
 | Mutate approved but Airtable API fails after one or more batches succeed | Operation status → `partially_completed`; include partial result details and stop on first failed Airtable request |
 | DuckDB file missing (first use, evicted, or deleted) | Triggers a first sync transparently |
-| Delta sync fails | The cache keeps serving its last state; the worker retries with backoff and reads report `catching_up` |
+| Delta sync fails | The cache keeps serving its last state; the worker retries with backoff and reads report `catching_up`. Follow-up fetches the failed run still owed stay queued in the cache file |
+| Scheduled reconcile fails | Deltas continue; another reconcile is not attempted for 30 minutes |
+| Cache file unreadable | The next sync is a full one that rebuilds it |
 | Airtable schema changed since the cache was built | The next sync is a full one into a staging file; reads stay on the existing snapshot until it swaps in |
 | Mutate update/delete target missing from the cache | Fetched from Airtable by record ID before the approval is prepared; only a record Airtable does not have is reported missing |
 | DuckDB file unreadable by this build (newer storage version after a rollback, or not a DuckDB file) | The next sync deletes it and rebuilds it from Airtable |

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"regexp"
 	"sort"
 	"sync"
 	"time"
@@ -106,22 +107,28 @@ type deltaRun struct {
 	base    Base
 	touch   func()
 
-	plans      map[string]syncTablePlan // by Airtable table ID
-	positions  map[string]duckdb.TableDeltaState
-	graph      schemaGraph
-	tableOrder []string
+	plans       map[string]syncTablePlan // by Airtable table ID
+	tableIDs    map[string]string        // DuckDB table name -> Airtable table ID
+	positions   map[string]duckdb.TableDeltaState
+	graph       schemaGraph
+	tableOrder  []string
+	generation0 int // highest generation already queued in the cache file
 
-	mu       sync.Mutex
-	written  map[string]map[string]struct{} // table ID -> record IDs written this run
-	changed  map[computedEdge][]string      // edge -> source record IDs whose watched value changed
-	linkEnds map[string][]string            // table ID -> record IDs at the other end of a link that changed
-	stale    map[string]struct{}            // table IDs whose computed columns may lag
-	budget   int
-	result   DeltaResult
-	lastPage time.Time
+	mu sync.Mutex
+	// generation is what new follow-ups are queued under. The follow phase
+	// reads everything up to a generation, bumps it, and clears what it read
+	// once the fetches that work caused have been written.
+	generation int
+	// following is set once the per-table listings are done. Only rows
+	// fetched after that are known to reflect every change this run saw.
+	following bool
+	followed  map[string]map[string]struct{} // table ID -> record IDs fetched in the follow phase
+	stale     map[string]struct{}            // table IDs whose rows may lag until a full fetch
+	budget    int
+	result    DeltaResult
 }
 
-func (s *Service) newDeltaRun(ctx context.Context, tokens AccessTokenFunc, base Base, tables []Table, plans []syncTablePlan, state duckdb.CacheState, touch func()) *deltaRun {
+func (s *Service) newDeltaRun(ctx context.Context, tokens AccessTokenFunc, base Base, tables []Table, plans []syncTablePlan, state duckdb.CacheState, touch func()) (*deltaRun, error) {
 	run := &deltaRun{
 		service:   s,
 		ctx:       ctx,
@@ -129,23 +136,37 @@ func (s *Service) newDeltaRun(ctx context.Context, tokens AccessTokenFunc, base 
 		base:      base,
 		touch:     touch,
 		plans:     make(map[string]syncTablePlan, len(plans)),
+		tableIDs:  make(map[string]string, len(plans)),
 		positions: make(map[string]duckdb.TableDeltaState, len(state.Tables)),
 		graph:     buildSchemaGraph(tables, plans),
-		written:   map[string]map[string]struct{}{},
-		changed:   map[computedEdge][]string{},
-		linkEnds:  map[string][]string{},
+		followed:  map[string]map[string]struct{}{},
 		stale:     map[string]struct{}{},
 		budget:    s.propagationBudget(),
 		result:    DeltaResult{BaseID: base.ID, BaseName: base.Name},
 	}
 	for _, plan := range plans {
 		run.plans[plan.Table.AirtableTableID] = plan
+		run.tableIDs[plan.Table.DuckDBTableName] = plan.Table.AirtableTableID
 		run.tableOrder = append(run.tableOrder, plan.Table.AirtableTableID)
 	}
 	for _, table := range state.Tables {
 		run.positions[table.TableName] = table
 	}
-	return run
+
+	// Follow-ups a previous run queued but never got to are still in the
+	// file. Queue this run's work after them so one pass picks up both.
+	unlock, err := s.lockDuckRead(ctx, base.ID)
+	if err != nil {
+		return nil, err
+	}
+	_, highest, err := duckdb.ReadPending(ctx, s.basePath(base.ID), 0)
+	unlock()
+	if err != nil {
+		return nil, err
+	}
+	run.generation0 = highest
+	run.generation = highest + 1
+	return run, nil
 }
 
 // watermarkAdvance asks apply to move a table's delta watermark.
@@ -155,9 +176,9 @@ type watermarkAdvance struct {
 	checkedAt time.Time
 }
 
-// apply writes one batch of fetched records (and deletions) for a table and
-// collects what the write says changed.
-func (r *deltaRun) apply(tableID string, records []Record, deleteIDs []string, advance *watermarkAdvance) error {
+// apply writes one batch of fetched records (and deletions) for a table. The
+// write queues, in the cache file, whatever follow-up fetches it calls for.
+func (r *deltaRun) apply(tableID string, records []Record, deleteIDs []string, advance *watermarkAdvance, forceChanged bool) error {
 	plan, ok := r.plans[tableID]
 	if !ok {
 		return fmt.Errorf("delta for unknown table %s", tableID)
@@ -177,6 +198,10 @@ func (r *deltaRun) apply(tableID string, records []Record, deleteIDs []string, a
 		snapshots = append(snapshots, snapshot)
 	}
 
+	r.mu.Lock()
+	generation, following := r.generation, r.following
+	r.mu.Unlock()
+
 	columns, watchAny := r.graph.watchFor(tableID)
 	table := duckdb.DeltaTable{
 		Table: duckdb.TableSnapshot{
@@ -186,10 +211,12 @@ func (r *deltaRun) apply(tableID string, records []Record, deleteIDs []string, a
 			Fields:          plan.Table.Fields,
 			Records:         snapshots,
 		},
-		DeleteIDs:    deleteIDs,
-		WatchColumns: columns,
-		WatchAny:     watchAny,
-		LinkColumns:  r.graph.linkColumnNames(tableID),
+		DeleteIDs:         deleteIDs,
+		WatchColumns:      columns,
+		WatchAny:          watchAny,
+		LinkColumns:       r.graph.linkColumnNames(tableID),
+		PendingGeneration: generation,
+		ForceChanged:      forceChanged,
 	}
 	if advance != nil {
 		table.AdvanceWatermark = true
@@ -211,29 +238,15 @@ func (r *deltaRun) apply(tableID string, records []Record, deleteIDs []string, a
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.written[tableID] == nil {
-		r.written[tableID] = map[string]struct{}{}
-	}
-	for _, snapshot := range snapshots {
-		r.written[tableID][snapshot.ID] = struct{}{}
-	}
-	for _, id := range deleteIDs {
-		r.written[tableID][id] = struct{}{}
-	}
-	for _, edge := range r.graph.edgesBySource[tableID] {
-		ids := written.ChangedAny
-		if edge.SourceColumn != "" {
-			ids = written.ChangedByColumn[edge.SourceColumn]
+	if following {
+		if r.followed[tableID] == nil {
+			r.followed[tableID] = map[string]struct{}{}
 		}
-		if len(ids) > 0 {
-			r.changed[edge] = append(r.changed[edge], ids...)
+		for _, snapshot := range snapshots {
+			r.followed[tableID][snapshot.ID] = struct{}{}
 		}
-	}
-	for _, links := range []map[string][]string{written.DroppedLinks, written.AddedLinks} {
-		for column, ids := range links {
-			if target := r.graph.linkColumns[tableID][column]; target != "" {
-				r.linkEnds[target] = append(r.linkEnds[target], ids...)
-			}
+		for _, id := range deleteIDs {
+			r.followed[tableID][id] = struct{}{}
 		}
 	}
 	r.result.RecordsUpserted += written.Upserted
@@ -264,6 +277,13 @@ func (r *deltaRun) syncTable(tableID string) error {
 	position := r.positions[plan.Table.DuckDBTableName]
 	fetchStartedAt := r.service.now().UTC()
 
+	// The first delta after a full fetch cannot trust a comparison with the
+	// cache. The full fetch read its tables one after another, so a row
+	// edited while it ran may already be cached with its new value while a
+	// row computed from it was read before the edit. Every row this listing
+	// returns is therefore treated as changed, once.
+	forceChanged := !position.ReconciledAt.IsZero() && position.CheckedAt.Equal(position.ReconciledAt)
+
 	options := ListRecordsPageOptions{ModifiedSince: position.Watermark.Add(-deltaOverlap)}
 	var batch []Record
 	for {
@@ -277,7 +297,7 @@ func (r *deltaRun) syncTable(tableID string) error {
 		}
 		options.Offset = page.Offset
 		if len(batch) >= deltaFlushRecords {
-			if err := r.apply(tableID, batch, nil, nil); err != nil {
+			if err := r.apply(tableID, batch, nil, nil, forceChanged); err != nil {
 				return err
 			}
 			batch = nil
@@ -287,12 +307,21 @@ func (r *deltaRun) syncTable(tableID string) error {
 		basedOn:   position.Watermark,
 		to:        fetchStartedAt,
 		checkedAt: r.service.now().UTC(),
-	})
+	}, forceChanged)
 }
+
+var validRecordID = regexp.MustCompile(`^rec[A-Za-z0-9]{1,40}$`)
 
 // fetchByIDs reads specific records of a table. It returns the records that
 // still exist and the IDs that do not.
 func (r *deltaRun) fetchByIDs(tableID string, ids []string) (records []Record, missing []string, err error) {
+	for _, id := range ids {
+		// IDs end up inside an Airtable formula, and some come from tool
+		// arguments.
+		if !validRecordID.MatchString(id) {
+			return nil, nil, fmt.Errorf("invalid airtable record id %q", id)
+		}
+	}
 	for start := 0; start < len(ids); start += MaxRecordIDsPerRequest {
 		chunk := ids[start:min(start+MaxRecordIDsPerRequest, len(ids))]
 		found := make(map[string]struct{}, len(chunk))
@@ -329,17 +358,20 @@ func (r *deltaRun) refetch(tableID string, ids []string) error {
 		if err != nil {
 			return err
 		}
-		if err := r.apply(tableID, records, missing, nil); err != nil {
+		if err := r.apply(tableID, records, missing, nil, false); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (r *deltaRun) notWritten(tableID string, ids []string) []string {
+// notFollowed drops IDs already fetched in the follow phase. Rows written by
+// the per-table listings are not skipped: a listing may have read a row
+// before the edit that made it a dependent.
+func (r *deltaRun) notFollowed(tableID string, ids []string) []string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	seen := r.written[tableID]
+	seen := r.followed[tableID]
 	unique := map[string]struct{}{}
 	out := make([]string, 0, len(ids))
 	for _, id := range ids {
@@ -356,87 +388,65 @@ func (r *deltaRun) notWritten(tableID string, ids []string) []string {
 	return out
 }
 
-// refetchLinkEnds brings the records at the other end of every changed link
-// up to date. Airtable mirrors a link edit on both records, so in a normal
-// delta those records were already fetched as modified and nothing is left
-// to do. What remains are records the listing could not return: one that was
-// deleted (it vanishes from the links that pointed at it, and from Airtable),
-// and, when a mutation is written through, the records the mutation linked
-// to. A record Airtable no longer has is removed from the cache.
-func (r *deltaRun) refetchLinkEnds() (fetched bool, err error) {
+// settle works through the follow-up queue until it is empty.
+//
+// Two kinds of follow-up exist. A changed value means the rows that compute
+// from it (lookups, rollups, formulas over a link) must be refetched, because
+// Airtable's modified time ignores computed fields. A changed link means the
+// record at its other end must be refetched: Airtable mirrors a link edit on
+// both records, so normally that record was already listed as modified, but
+// a record that was deleted can only be noticed this way (it vanishes from
+// the links that pointed at it and is no longer returned by ID), and a
+// write-through never lists anything. Fetching a row can queue more work, so
+// this repeats; work the budget or the round limit cannot cover flags the
+// table as stale instead of being dropped.
+func (r *deltaRun) settle() error {
 	r.mu.Lock()
-	ends := r.linkEnds
-	r.linkEnds = map[string][]string{}
+	r.following = true
 	r.mu.Unlock()
 
-	tableIDs := make([]string, 0, len(ends))
-	for tableID := range ends {
-		tableIDs = append(tableIDs, tableID)
-	}
-	sort.Strings(tableIDs)
-	for _, tableID := range tableIDs {
-		if _, ok := r.plans[tableID]; !ok {
-			continue
-		}
-		ids := r.notWritten(tableID, ends[tableID])
-		if len(ids) == 0 {
-			continue
-		}
+	for pass := 0; ; pass++ {
 		r.mu.Lock()
-		affordable := len(ids) <= r.budget
-		if affordable {
-			r.budget -= len(ids)
-			r.result.RecordsFollowed += len(ids)
-		}
+		through := r.generation
+		r.generation++
 		r.mu.Unlock()
-		if !affordable {
-			// These records really were edited in Airtable, so the next
-			// delta's modified-since listing returns them anyway.
-			continue
-		}
-		if err := r.refetch(tableID, ids); err != nil {
-			return fetched, err
-		}
-		fetched = true
-	}
-	return fetched, nil
-}
 
-// settle follows link ends and computed dependencies until a pass changes
-// nothing more.
-func (r *deltaRun) settle() error {
-	for pass := 0; pass < deltaMaxRounds; pass++ {
-		fetched, err := r.refetchLinkEnds()
+		unlock, err := r.service.lockDuckRead(r.ctx, r.base.ID)
 		if err != nil {
 			return err
 		}
-		if err := r.propagate(); err != nil {
+		pending, _, err := duckdb.ReadPending(r.ctx, r.service.basePath(r.base.ID), through)
+		unlock()
+		if err != nil {
 			return err
 		}
-		r.mu.Lock()
-		pending := len(r.linkEnds) > 0
-		r.mu.Unlock()
-		if !fetched && !pending {
-			return nil
-		}
-	}
-	return nil
-}
-
-// propagate refetches rows whose computed values depend on rows this run
-// changed, following the dependency edges until nothing more changes.
-func (r *deltaRun) propagate() error {
-	for round := 0; ; round++ {
-		r.mu.Lock()
-		work := r.changed
-		r.changed = map[computedEdge][]string{}
-		r.mu.Unlock()
-		if len(work) == 0 {
+		if len(pending) == 0 {
 			return nil
 		}
 
-		edges := make([]computedEdge, 0, len(work))
-		for edge := range work {
+		refetch := map[string][]string{}
+		changed := map[computedEdge][]string{}
+		for _, change := range pending {
+			sourceID, ok := r.tableIDs[change.SourceTable]
+			if !ok {
+				continue
+			}
+			switch change.Kind {
+			case duckdb.PendingLinkEnd:
+				if target := r.graph.linkColumns[sourceID][change.Column]; target != "" {
+					refetch[target] = append(refetch[target], change.RecordID)
+				}
+			case duckdb.PendingChanged, duckdb.PendingChangedAny:
+				for _, edge := range r.graph.edgesBySource[sourceID] {
+					if (change.Kind == duckdb.PendingChangedAny) == (edge.SourceColumn == "") && edge.SourceColumn == change.Column {
+						changed[edge] = append(changed[edge], change.RecordID)
+					}
+				}
+			}
+		}
+
+		edges := make([]computedEdge, 0, len(changed))
+		for edge := range changed {
 			edges = append(edges, edge)
 		}
 		sort.Slice(edges, func(i, j int) bool {
@@ -449,97 +459,122 @@ func (r *deltaRun) propagate() error {
 			}
 			return a.SourceColumn < b.SourceColumn
 		})
-
-		// Collect every dependent row of this round per table first, so a
-		// row reached through several edges is fetched once.
-		dependents := map[string][]string{}
 		for _, edge := range edges {
 			plan, ok := r.plans[edge.DependentTableID]
 			if !ok || edge.LinkColumn == "" {
-				continue
-			}
-			if round >= deltaMaxRounds {
-				r.markStale(edge.DependentTableID)
 				continue
 			}
 			unlock, err := r.service.lockDuckRead(r.ctx, r.base.ID)
 			if err != nil {
 				return err
 			}
-			rows, err := duckdb.FindRowsLinking(r.ctx, r.service.basePath(r.base.ID), plan.Table.DuckDBTableName, edge.LinkColumn, work[edge])
+			rows, err := duckdb.FindRowsLinking(r.ctx, r.service.basePath(r.base.ID), plan.Table.DuckDBTableName, edge.LinkColumn, changed[edge])
 			unlock()
 			if err != nil {
 				return err
 			}
-			dependents[edge.DependentTableID] = append(dependents[edge.DependentTableID], rows...)
+			refetch[edge.DependentTableID] = append(refetch[edge.DependentTableID], rows...)
 		}
 
-		tableIDs := make([]string, 0, len(dependents))
-		for tableID := range dependents {
+		lastPass := pass >= deltaMaxRounds
+		tableIDs := make([]string, 0, len(refetch))
+		for tableID := range refetch {
 			tableIDs = append(tableIDs, tableID)
 		}
 		sort.Strings(tableIDs)
 		for _, tableID := range tableIDs {
-			ids := r.notWritten(tableID, dependents[tableID])
+			if _, ok := r.plans[tableID]; !ok {
+				continue
+			}
+			ids := r.notFollowed(tableID, refetch[tableID])
 			if len(ids) == 0 {
 				continue
 			}
 			r.mu.Lock()
-			affordable := len(ids) <= r.budget
+			affordable := !lastPass && len(ids) <= r.budget
 			if affordable {
 				r.budget -= len(ids)
 				r.result.RecordsFollowed += len(ids)
+			} else {
+				r.stale[tableID] = struct{}{}
 			}
 			r.mu.Unlock()
 			if !affordable {
-				r.markStale(tableID)
 				continue
 			}
 			if err := r.refetch(tableID, ids); err != nil {
 				return err
 			}
 		}
+
+		// Everything this pass read is now either written or accounted for
+		// by a stale flag (recorded below before the queue is cleared).
+		if err := r.flagStale(); err != nil {
+			return err
+		}
+		unlock, err = r.service.lockDuckWrite(r.ctx, r.base.ID)
+		if err != nil {
+			return err
+		}
+		err = duckdb.ClearPending(r.ctx, r.service.basePath(r.base.ID), through)
+		unlock()
+		if err != nil {
+			return err
+		}
+		if lastPass {
+			return nil
+		}
 	}
 }
 
-func (r *deltaRun) markStale(tableID string) {
-	r.mu.Lock()
-	r.stale[tableID] = struct{}{}
-	r.mu.Unlock()
-}
-
-// finish stamps the run on the cache file: tables whose computed columns
-// could not be fully followed, and (when syncedAt is set) the base-level
-// freshness time.
-func (r *deltaRun) finish(syncedAt time.Time) error {
+// flagStale records, in the cache file, the tables whose rows could not all
+// be followed.
+func (r *deltaRun) flagStale() error {
 	r.mu.Lock()
 	staleIDs := make([]string, 0, len(r.stale))
 	for tableID := range r.stale {
 		staleIDs = append(staleIDs, tableID)
 	}
 	r.mu.Unlock()
+	if len(staleIDs) == 0 {
+		return nil
+	}
 	sort.Strings(staleIDs)
 
 	stale := true
 	tables := make([]duckdb.DeltaTable, 0, len(staleIDs))
+	names := make([]string, 0, len(staleIDs))
 	for _, tableID := range staleIDs {
 		plan := r.plans[tableID]
 		tables = append(tables, duckdb.DeltaTable{
 			Table:         duckdb.TableSnapshot{DuckDBTableName: plan.Table.DuckDBTableName, Fields: plan.Table.Fields},
 			ComputedStale: &stale,
 		})
-		r.result.StaleTables = append(r.result.StaleTables, plan.Table.DuckDBTableName)
+		names = append(names, plan.Table.DuckDBTableName)
 	}
-	if len(tables) == 0 && syncedAt.IsZero() {
-		return nil
+	unlock, err := r.service.lockDuckWrite(r.ctx, r.base.ID)
+	if err != nil {
+		return err
 	}
+	_, err = duckdb.ApplyDelta(r.ctx, r.service.basePath(r.base.ID), tables, time.Time{})
+	unlock()
+	if err != nil {
+		return err
+	}
+	r.mu.Lock()
+	r.result.StaleTables = names
+	r.mu.Unlock()
+	return nil
+}
 
+// stampSynced records the base-level freshness time of a completed delta.
+func (r *deltaRun) stampSynced(syncedAt time.Time) error {
 	unlock, err := r.service.lockDuckWrite(r.ctx, r.base.ID)
 	if err != nil {
 		return err
 	}
 	defer unlock()
-	_, err = duckdb.ApplyDelta(r.ctx, r.service.basePath(r.base.ID), tables, syncedAt)
+	_, err = duckdb.ApplyDelta(r.ctx, r.service.basePath(r.base.ID), nil, syncedAt)
 	return err
 }
 
@@ -553,7 +588,13 @@ func (s *Service) runDelta(ctx context.Context, tokens AccessTokenFunc, base Bas
 
 	state, ok, err := s.readCacheState(ctx, base.ID)
 	if err != nil {
-		return result, err
+		if ctx.Err() != nil {
+			return result, err
+		}
+		// A cache file that cannot be read is no use to a delta; a full sync
+		// rebuilds it.
+		result.NeedsFull, result.Reason = true, "cache file is unreadable: "+logx.ErrorPreview(err)
+		return result, nil
 	}
 	if !ok {
 		result.NeedsFull, result.Reason = true, "no cache file"
@@ -577,7 +618,10 @@ func (s *Service) runDelta(ctx context.Context, tokens AccessTokenFunc, base Bas
 
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	run := s.newDeltaRun(runCtx, tokens, base, tables, plans, state, touch)
+	run, err := s.newDeltaRun(runCtx, tokens, base, tables, plans, state, touch)
+	if err != nil {
+		return result, err
+	}
 
 	jobs := make(chan string, len(run.tableOrder))
 	for _, tableID := range run.tableOrder {
@@ -620,7 +664,7 @@ func (s *Service) runDelta(ctx context.Context, tokens AccessTokenFunc, base Bas
 	if err := run.settle(); err != nil {
 		return result, err
 	}
-	if err := run.finish(startedAt); err != nil {
+	if err := run.stampSynced(startedAt); err != nil {
 		return result, err
 	}
 
@@ -677,12 +721,23 @@ func (s *Service) RefreshRecords(ctx context.Context, tokens AccessTokenFunc, ba
 		return fmt.Errorf("%w: %s", errCacheNotPatchable, reason)
 	}
 
-	run := s.newDeltaRun(ctx, tokens, base, tables, plans, state, nil)
+	run, err := s.newDeltaRun(ctx, tokens, base, tables, plans, state, nil)
+	if err != nil {
+		return err
+	}
 	if _, ok := run.plans[tableID]; !ok {
 		return fmt.Errorf("%w: table %s is not cached", errCacheNotPatchable, tableID)
 	}
+	// Everything here is fetched by ID after the mutation ran, so it counts
+	// as followed from the start.
+	run.following = true
 	if len(deletedIDs) > 0 {
-		if err := run.apply(tableID, nil, deletedIDs, nil); err != nil {
+		for _, id := range deletedIDs {
+			if !validRecordID.MatchString(id) {
+				return fmt.Errorf("invalid airtable record id %q", id)
+			}
+		}
+		if err := run.apply(tableID, nil, deletedIDs, nil, false); err != nil {
 			return err
 		}
 	}
@@ -691,29 +746,34 @@ func (s *Service) RefreshRecords(ctx context.Context, tokens AccessTokenFunc, ba
 			return err
 		}
 	}
-	if err := run.settle(); err != nil {
-		return err
-	}
-	return run.finish(time.Time{})
+	return run.settle()
 }
 
-// oldestReconciledAt returns the oldest table's last full fetch, or the zero
-// time when the cache has no reconcile record.
-func (s *Service) oldestReconciledAt(ctx context.Context, baseID string) time.Time {
+// reconcileState returns the oldest table's last full fetch (the zero time
+// when the cache has no reconcile record) and whether any table is flagged
+// as lagging until the next full fetch.
+func (s *Service) reconcileState(ctx context.Context, baseID string) (oldest time.Time, stale bool) {
 	state, ok, err := s.readCacheState(ctx, baseID)
 	if err != nil || !ok {
-		return time.Time{}
+		return time.Time{}, false
 	}
-	var oldest time.Time
+	complete := true
 	for _, table := range state.Tables {
+		if table.ComputedStale {
+			stale = true
+		}
 		if table.ReconciledAt.IsZero() {
-			return time.Time{}
+			complete = false
+			continue
 		}
 		if oldest.IsZero() || table.ReconciledAt.Before(oldest) {
 			oldest = table.ReconciledAt
 		}
 	}
-	return oldest
+	if !complete {
+		return time.Time{}, stale
+	}
+	return oldest, stale
 }
 
 // cacheFileBytes is the on-disk size of a base's cache.

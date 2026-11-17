@@ -297,6 +297,14 @@ func TestDeltaRandomizedEditsMatchFullSync(t *testing.T) {
 				// Sometimes sync right away, sometimes long after the overlap
 				// window has passed.
 				sim.advance(time.Duration(1+rng.Intn(600)) * time.Second)
+				// Now and then Airtable fails partway through a delta. The
+				// run after it has to end up correct all the same.
+				if rng.Intn(4) == 0 {
+					sim.failSoon(1 + rng.Intn(8))
+					_, _ = service.runDelta(context.Background(), StaticAccessToken("token"), simBase, nil)
+					sim.recover()
+					sim.advance(time.Duration(1+rng.Intn(300)) * time.Second)
+				}
 				if result := simDelta(t, service); len(result.StaleTables) != 0 {
 					t.Fatalf("step %d: unexpected stale tables %v", step, result.StaleTables)
 				}
@@ -365,11 +373,11 @@ func TestDeltaFlagsTablesWhenFollowingComputedValuesIsTooExpensive(t *testing.T)
 	sim := newSimAirtable()
 	_, programs, _ := seedSim(sim)
 	service := newSimService(t, sim)
-	service.deltaBudget = 1
 	simFullSync(t, service)
 	sim.advance(time.Hour)
 	simDelta(t, service) // move past the first delta, which re-reads everything recent
 	sim.advance(time.Hour)
+	service.deltaBudget = 1
 
 	// Renaming a program changes a lookup in every project linked to it:
 	// more rows than the budget of one allows.
@@ -438,5 +446,88 @@ func TestRefreshRecordsWritesAMutationThrough(t *testing.T) {
 		if !table.Watermark.Equal(before.Tables[i].Watermark) {
 			t.Fatalf("write-through moved the watermark of %s", table.TableName)
 		}
+	}
+}
+
+// A delta that dies after writing a changed row must not lose the rows that
+// compute from it: the next run compares that row with the cache, finds it
+// equal, and would see nothing to follow.
+func TestDeltaFailureDoesNotLoseComputedFollowUps(t *testing.T) {
+	sim := newSimAirtable()
+	_, programs, _ := seedSim(sim)
+	service := newSimService(t, sim)
+	simFullSync(t, service)
+	sim.advance(time.Hour)
+	simDelta(t, service)
+	sim.advance(time.Hour)
+
+	// The rename is written, then the run fails on another table before the
+	// projects that look the name up are refetched.
+	sim.setText(simPrograms, programs[0], "Name", "Renamed")
+	sim.mu.Lock()
+	sim.failTable = simOrgs
+	sim.mu.Unlock()
+	if _, err := service.runDelta(context.Background(), StaticAccessToken("token"), simBase, nil); err == nil {
+		t.Fatalf("expected the delta to fail")
+	}
+	result, err := duckdb.Query(context.Background(), service.basePath(simBase.ID), `SELECT name FROM programs WHERE id = '`+programs[0]+`'`)
+	if err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	if result.Rows[0][0] != "Renamed" {
+		t.Skipf("the failing run did not write the rename (table order), nothing to prove here")
+	}
+
+	sim.recover()
+	sim.advance(10 * time.Minute)
+	simDelta(t, service)
+	requireCacheMatchesAirtable(t, service, sim, nil, "after the retry")
+}
+
+// A full download reads its tables one after another. An edit that lands in
+// between can leave a row cached with its new value while a row computed
+// from it was read before the edit; the next delta has to repair that even
+// though the edited row already matches the cache.
+func TestDeltaRepairsEditsThatLandDuringAFullDownload(t *testing.T) {
+	for _, editAfter := range []string{simProjects, simPrograms, simOrgs} {
+		t.Run(editAfter, func(t *testing.T) {
+			sim := newSimAirtable()
+			sim.pageSize = 100
+			_, programs, projects := seedSim(sim)
+			sim.advance(time.Hour)
+			service := newSimService(t, sim)
+
+			edited := false
+			sim.mu.Lock()
+			sim.afterPage = func(tableID string) {
+				if tableID != editAfter || edited {
+					return
+				}
+				edited = true
+				sim.setText(simPrograms, programs[0], "Name", "Renamed mid-download")
+				sim.setNumber(simProjects, projects[0], "Hours", 500)
+			}
+			sim.mu.Unlock()
+			simFullSync(t, service)
+			sim.mu.Lock()
+			sim.afterPage = nil
+			sim.mu.Unlock()
+
+			sim.advance(30 * time.Minute)
+			simDelta(t, service)
+			requireCacheMatchesAirtable(t, service, sim, nil, "after the first delta")
+		})
+	}
+}
+
+func TestFetchByIDsRefusesMalformedRecordIDs(t *testing.T) {
+	sim := newSimAirtable()
+	seedSim(sim)
+	service := newSimService(t, sim)
+	simFullSync(t, service)
+
+	err := service.RefreshRecords(context.Background(), StaticAccessToken("token"), simBase, simProjects, []string{`rec1')),TRUE(`}, nil)
+	if err == nil {
+		t.Fatalf("expected a malformed record id to be refused")
 	}
 }

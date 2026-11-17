@@ -31,6 +31,16 @@ type simAirtable struct {
 	schemaCalls int
 	pageCalls   int
 	extraField  bool // adds a field to the schema, to simulate a schema change
+
+	// failAfter, when positive, lets that many more record requests succeed
+	// and then fails every one after it, until it is set back to zero.
+	failAfter int
+	failing   bool
+	// failTable fails every record request for one table.
+	failTable string
+	// afterPage runs after a page of a table has been read, before it is
+	// returned: a hook for edits that land in the middle of a download.
+	afterPage func(tableID string)
 }
 
 type simTable struct {
@@ -319,10 +329,32 @@ func (s *simAirtable) GetBaseSchema(context.Context, string, string) ([]Table, e
 	return []Table{projects, programs, orgs}, nil
 }
 
-func (s *simAirtable) ListRecordsPage(_ context.Context, _ string, _ string, tableID string, options ListRecordsPageOptions) (ListRecordsPageResult, error) {
+func (s *simAirtable) ListRecordsPage(ctx context.Context, token string, baseID string, tableID string, options ListRecordsPageOptions) (ListRecordsPageResult, error) {
+	result, err := s.listRecordsPage(tableID, options)
+	s.mu.Lock()
+	hook := s.afterPage
+	s.mu.Unlock()
+	if err == nil && hook != nil {
+		hook(tableID)
+	}
+	return result, err
+}
+
+func (s *simAirtable) listRecordsPage(tableID string, options ListRecordsPageOptions) (ListRecordsPageResult, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.pageCalls++
+	if s.failTable == tableID {
+		return ListRecordsPageResult{}, fmt.Errorf("simulated airtable failure for %s", tableID)
+	}
+	if s.failAfter > 0 {
+		s.failAfter--
+		if s.failAfter == 0 {
+			s.failing = true
+		}
+	} else if s.failing {
+		return ListRecordsPageResult{}, fmt.Errorf("simulated airtable failure")
+	}
 	table := s.tables[tableID]
 	if table == nil {
 		return ListRecordsPageResult{}, fmt.Errorf("unknown table %s", tableID)
@@ -382,4 +414,17 @@ func (s *simAirtable) counts() (schema, pages int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.schemaCalls, s.pageCalls
+}
+
+// failSoon makes record requests start failing after a few more succeed.
+func (s *simAirtable) failSoon(after int) {
+	s.mu.Lock()
+	s.failAfter, s.failing = after, false
+	s.mu.Unlock()
+}
+
+func (s *simAirtable) recover() {
+	s.mu.Lock()
+	s.failAfter, s.failing, s.failTable = 0, false, ""
+	s.mu.Unlock()
 }

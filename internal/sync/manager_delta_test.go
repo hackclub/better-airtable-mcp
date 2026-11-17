@@ -50,6 +50,7 @@ func TestManagerReusesCacheAfterIdleAndOnlyFetchesChanges(t *testing.T) {
 	if _, err := os.Stat(service.DatabasePath(base.ID)); err != nil {
 		t.Fatalf("cache file should survive idling: %v", err)
 	}
+	_, pagesBeforeReturn := sim.counts()
 
 	// Time passes and somebody edits a record in Airtable.
 	sim.advance(3 * time.Hour)
@@ -66,8 +67,10 @@ func TestManagerReusesCacheAfterIdleAndOnlyFetchesChanges(t *testing.T) {
 		t.Fatalf("read after idle returned %v, want the edited value 77", result.Rows)
 	}
 
+	// One listing per table, plus the program and the org whose rollups the
+	// edited project feeds.
 	_, pagesNow := sim.counts()
-	if delta := pagesNow - fullSyncPages; delta >= fullSyncPages/2 {
+	if delta := pagesNow - pagesBeforeReturn; delta > 6 {
 		t.Fatalf("catching up after idle made %d record requests; the first full download made %d", delta, fullSyncPages)
 	}
 	freshness, ok := manager.Freshness(context.Background(), base.ID)

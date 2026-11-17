@@ -709,6 +709,7 @@ func createMetadataTables(ctx context.Context, tx *sql.Tx) error {
 			reconciled_at TIMESTAMP,
 			computed_stale BOOLEAN
 		)`,
+		pendingTableDDL,
 	}
 
 	for _, statement := range statements {

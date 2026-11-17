@@ -105,6 +105,10 @@ type workerState struct {
 	lastFreshAt time.Time
 	// oldestReconciledAt is the oldest table's last full fetch.
 	oldestReconciledAt time.Time
+	// cacheStale means some table is flagged as lagging until a full fetch.
+	cacheStale bool
+	// reconcileRetryAt holds off another scheduled reconcile after one failed.
+	reconcileRetryAt time.Time
 	// idleReconcileTried stops an expired worker retrying its reconcile.
 	idleReconcileTried bool
 }
@@ -133,6 +137,7 @@ const (
 	// per base to interactive work and to every other integration.
 	defaultReconcileRate = 2.0
 	defaultFreshenWait   = 5 * time.Second
+	reconcileRetryDelay  = 30 * time.Minute
 )
 
 // SetReconcileInterval changes how often a base in use gets a full fetch.
@@ -279,6 +284,15 @@ func (m *Manager) enforceCacheBudget(ctx context.Context) error {
 		unlock, err := m.service.lockDuckWrite(ctx, file.baseID)
 		if err != nil {
 			return errors.Join(removeErr, err)
+		}
+		// A worker may have started for this base since the candidates were
+		// listed; its cache is in use again.
+		m.mu.Lock()
+		_, active := m.workers[file.baseID]
+		m.mu.Unlock()
+		if active {
+			unlock()
+			continue
 		}
 		path := m.service.basePath(file.baseID)
 		for _, target := range []string{path, path + ".wal"} {
@@ -630,6 +644,11 @@ func (w *workerState) run() {
 			w.lastError = err.Error()
 			w.lastFailedAt = completedAt
 			w.consecutiveFailures++
+			if mode == syncModeReconcile {
+				// A reconcile that keeps failing must not crowd out the
+				// deltas that keep the cache fresh.
+				w.reconcileRetryAt = completedAt.Add(reconcileRetryDelay)
+			}
 			if w.readSnapshotComplete {
 				// A failed refresh should not block readers when a complete snapshot already exists.
 				// Fall back to the existing snapshot and retry on the normal schedule.
@@ -644,6 +663,7 @@ func (w *workerState) run() {
 			w.needsInitialRefresh = false
 			w.lastFreshAt = startedAt
 			w.oldestReconciledAt = outcome.OldestReconciledAt
+			w.cacheStale = outcome.CacheStale
 			w.lastResult = result
 			w.baseName = result.BaseName
 			w.tablesTotal = result.TablesSynced
@@ -660,11 +680,13 @@ func (w *workerState) run() {
 // Callers must hold w.mu.
 func (w *workerState) reconcileOverdue(now time.Time) (overdue time.Duration, due bool) {
 	interval := w.manager.reconcileInterval
-	if interval <= 0 || w.oldestReconciledAt.IsZero() || !w.readSnapshotComplete {
+	if interval <= 0 || w.oldestReconciledAt.IsZero() || !w.readSnapshotComplete || now.Before(w.reconcileRetryAt) {
 		return 0, false
 	}
 	age := now.Sub(w.oldestReconciledAt)
-	return age - interval, age >= interval
+	// A table flagged stale wants its full fetch at the next idle moment,
+	// whatever its age; it does not make an in-use base more overdue.
+	return age - interval, age >= interval || w.cacheStale
 }
 
 func (w *workerState) nextAction(now time.Time) (shouldSync bool, waitFor time.Duration, userID string, mode string) {
@@ -807,7 +829,7 @@ func (w *workerState) seedFromSnapshot() {
 		w.readSnapshotComplete = true
 		w.needsInitialRefresh = true
 		w.lastFreshAt = info.LastSyncedAt
-		w.oldestReconciledAt = w.manager.service.oldestReconciledAt(context.Background(), w.baseID)
+		w.oldestReconciledAt, w.cacheStale = w.manager.service.reconcileState(context.Background(), w.baseID)
 		completedAt := info.LastSyncedAt
 		w.lastCompletedAt = &completedAt
 		w.lastResult = SyncResult{
@@ -1192,6 +1214,7 @@ type syncOutcome struct {
 	Result             SyncResult
 	Mode               string // "delta" or "full": what actually ran
 	OldestReconciledAt time.Time
+	CacheStale         bool
 }
 
 func (m *Manager) syncOnce(ctx context.Context, userID, baseID, baseName, mode string, progress func(SyncProgress)) (syncOutcome, error) {
@@ -1285,7 +1308,7 @@ func (m *Manager) syncOnce(ctx context.Context, userID, baseID, baseName, mode s
 	}
 
 	result := outcome.Result
-	outcome.OldestReconciledAt = m.service.oldestReconciledAt(ctx, baseID)
+	outcome.OldestReconciledAt, outcome.CacheStale = m.service.reconcileState(ctx, baseID)
 	if m.store != nil {
 		lastSyncedAt := result.LastSyncedAt.UTC()
 		durationMS := result.SyncDuration.Milliseconds()
