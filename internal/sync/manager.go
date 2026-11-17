@@ -38,6 +38,9 @@ type Manager struct {
 	reconcileRate float64
 	// freshenWait bounds how long a read waits for an in-flight delta.
 	freshenWait time.Duration
+	// schemaSampleWait bounds how long list_schema waits for every table of
+	// a downloading base to have sample rows.
+	schemaSampleWait time.Duration
 	// cacheMaxBytes is the disk budget for cache files. Zero means no limit.
 	cacheMaxBytes int64
 
@@ -131,6 +134,7 @@ func NewManager(service *Service, store *db.Store, tokens TokenSource, interval,
 		reconcileInterval: defaultReconcileInterval,
 		reconcileRate:     defaultReconcileRate,
 		freshenWait:       defaultFreshenWait,
+		schemaSampleWait:  defaultSchemaSampleWait,
 	}
 }
 
@@ -140,7 +144,12 @@ const (
 	// per base to interactive work and to every other integration.
 	defaultReconcileRate = 2.0
 	defaultFreshenWait   = 5 * time.Second
-	reconcileRetryDelay  = 30 * time.Minute
+	// defaultSchemaSampleWait is how long list_schema holds out for sample
+	// rows from every table of a base that is still downloading. The schema
+	// itself is ready as soon as the download starts, so past this the tool
+	// answers with the samples it has instead of failing on its deadline.
+	defaultSchemaSampleWait = 8 * time.Second
+	reconcileRetryDelay     = 30 * time.Minute
 )
 
 // SetReconcileInterval changes how often a base in use gets a full fetch.
@@ -366,7 +375,17 @@ func (m *Manager) EnsureBaseSchemaSampled(ctx context.Context, userID, baseRef s
 	}
 
 	worker.requestImmediateSync()
-	if err := worker.waitUntilSchemaSampled(ctx); err != nil {
+	if err := worker.waitUntilReadable(ctx); err != nil {
+		return Base{}, err
+	}
+	sampleCtx, cancel := context.WithTimeout(ctx, m.schemaSampleWait)
+	defer cancel()
+	if err := worker.waitUntilSchemaSampled(sampleCtx); err != nil {
+		if ctx.Err() == nil && errors.Is(err, context.DeadlineExceeded) {
+			// Some tables have no rows yet. Their schema is readable and
+			// their sync status says they have not started.
+			return base, nil
+		}
 		return Base{}, err
 	}
 	return base, nil

@@ -422,6 +422,71 @@ func TestManagerEnsureBaseSchemaSampledWaitsForFirstPageAcrossTables(t *testing.
 	}
 }
 
+func TestManagerEnsureBaseSchemaSampledStopsWaitingForStalledTables(t *testing.T) {
+	releaseTasks := make(chan struct{})
+	defer close(releaseTasks)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v0/meta/bases":
+			writeManagerJSON(t, w, map[string]any{
+				"bases": []map[string]any{{"id": "appProjects", "name": "Project Tracker", "permissionLevel": "create"}},
+			})
+		case "/v0/meta/bases/appProjects/tables":
+			writeManagerJSON(t, w, map[string]any{
+				"tables": []map[string]any{
+					{"id": "tblProjects", "name": "Projects", "fields": []map[string]any{{"id": "fldProjectName", "name": "Name", "type": "singleLineText"}}},
+					{"id": "tblTasks", "name": "Tasks", "fields": []map[string]any{{"id": "fldTaskName", "name": "Name", "type": "singleLineText"}}},
+				},
+			})
+		case "/v0/appProjects/tblProjects", "/v0/appProjects/tblProjects/listRecords":
+			writeManagerJSON(t, w, map[string]any{
+				"records": []map[string]any{
+					{"id": "recProject1", "createdTime": "2026-04-01T12:00:00Z", "fields": map[string]any{"Name": "Website Redesign"}},
+				},
+			})
+		case "/v0/appProjects/tblTasks":
+			// Stands in for a table stuck behind Airtable's rate limit.
+			select {
+			case <-releaseTasks:
+			case <-r.Context().Done():
+			}
+			writeManagerJSON(t, w, map[string]any{"records": []map[string]any{}})
+		default:
+			t.Fatalf("unexpected path %q", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	service := NewService(NewHTTPClient(server.URL, server.Client()), t.TempDir())
+	manager := NewManager(service, nil, staticTokenSource{}, time.Hour, time.Minute)
+	manager.schemaSampleWait = 150 * time.Millisecond
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	started := time.Now()
+	base, err := manager.EnsureBaseSchemaSampled(ctx, "user_1", "Project Tracker")
+	if err != nil {
+		t.Fatalf("EnsureBaseSchemaSampled() returned error: %v", err)
+	}
+	if waited := time.Since(started); waited > 10*time.Second {
+		t.Fatalf("expected the sample wait to give up quickly, waited %s", waited)
+	}
+
+	schema, err := service.ListResolvedSchema(context.Background(), base.ID, base.Name)
+	if err != nil {
+		t.Fatalf("ListResolvedSchema() returned error: %v", err)
+	}
+	if len(schema.Tables) != 2 {
+		t.Fatalf("expected both tables in the schema while one is still loading, got %#v", schema.Tables)
+	}
+	for _, table := range schema.Tables {
+		if table.DuckDBTableName == "tasks" && (table.TableComplete || len(table.Fields) == 0) {
+			t.Fatalf("expected the stalled table to be listed with its fields and marked incomplete, got %#v", table)
+		}
+	}
+}
+
 func TestManagerContinuouslyResyncsWhileActive(t *testing.T) {
 	var generation atomic.Int32
 	var recordCalls atomic.Int32
