@@ -411,12 +411,11 @@ func TestManagerEnsureBaseSchemaSampledWaitsForFirstPageAcrossTables(t *testing.
 	if len(schema.Tables) != 2 {
 		t.Fatalf("expected 2 tables after schema-sampled wait, got %#v", schema.Tables)
 	}
-	var foundTaskSample bool
-	for _, table := range schema.Tables {
-		if table.DuckDBTableName == "tasks" && len(table.SampleRows) == 1 {
-			foundTaskSample = table.SampleRows[0]["name"] == "Design homepage"
-		}
+	stats, err := service.ColumnStats(context.Background(), base.ID, schema.Tables)
+	if err != nil {
+		t.Fatalf("ColumnStats() returned error: %v", err)
 	}
+	foundTaskSample := stats["tasks"].Rows == 1 && stats["tasks"].Columns["name"].Example == "Design homepage"
 	if !foundTaskSample {
 		t.Fatalf("expected schema samples to include the first tasks page, got %#v", schema.Tables)
 	}

@@ -12,11 +12,6 @@ import (
 	syncer "github.com/hackclub/better-airtable-mcp/internal/sync"
 )
 
-const (
-	schemaSampleValueMaxChars = 100
-	schemaSampleTruncationTag = " [truncated]"
-)
-
 type formattedSyncStatus struct {
 	OperationID          string
 	Status               string
@@ -102,35 +97,6 @@ func formatBatchQueryCSV(results []formattedQueryResult, syncStatus *formattedSy
 			fmt.Sprintf("query_%d_rows", index+1),
 			csvSection(result.Columns, csvRows(result.Rows)),
 		)
-	}
-
-	return joinSections(sections...)
-}
-
-func formatSchemaCSV(baseID, baseName string, tables []map[string]any, syncStatus *formattedSyncStatus) string {
-	sort.SliceStable(tables, func(i, j int) bool {
-		return fmt.Sprint(tables[i]["duckdb_table_name"]) < fmt.Sprint(tables[j]["duckdb_table_name"])
-	})
-
-	sections := make([]string, 0, len(tables)*2+4)
-	if syncStatus != nil {
-		sections = append(sections, "sync_status", formatSyncStatusCSV(*syncStatus))
-	}
-	sections = append(
-		sections,
-		"base",
-		csvSection(
-			[]string{"base_id", "base_name"},
-			[][]string{{baseID, baseName}},
-		),
-		"tables",
-	)
-
-	for _, table := range tables {
-		tableName := fmt.Sprint(table["duckdb_table_name"])
-		headers := schemaTableHeaders(table)
-		rows := schemaSampleRows(table, headers)
-		sections = append(sections, "# "+tableName, csvSection(headers, rows))
 	}
 
 	return joinSections(sections...)
@@ -249,43 +215,6 @@ func joinSections(sections ...string) string {
 		}
 	}
 	return buffer.String()
-}
-
-func schemaTableHeaders(table map[string]any) []string {
-	headers := []string{"id", "created_time"}
-	if fields, ok := table["fields"].([]map[string]any); ok {
-		for _, field := range fields {
-			headers = append(headers, fmt.Sprint(field["duckdb_column_name"]))
-		}
-	}
-	return headers
-}
-
-func schemaSampleRows(table map[string]any, headers []string) [][]string {
-	samples, _ := table["sample_rows"].([]map[string]any)
-	rows := make([][]string, 0, len(samples))
-	for _, sample := range samples {
-		row := make([]string, 0, len(headers))
-		for _, header := range headers {
-			row = append(row, truncateSchemaSampleValue(csvCell(sample[header])))
-		}
-		rows = append(rows, row)
-	}
-	return rows
-}
-
-func truncateSchemaSampleValue(value string) string {
-	runes := []rune(value)
-	if len(runes) <= schemaSampleValueMaxChars {
-		return value
-	}
-
-	suffix := []rune(schemaSampleTruncationTag)
-	if len(suffix) >= schemaSampleValueMaxChars {
-		return string(suffix[:schemaSampleValueMaxChars])
-	}
-
-	return string(runes[:schemaSampleValueMaxChars-len(suffix)]) + schemaSampleTruncationTag
 }
 
 // freshnessPayload is the structured freshness block attached to read results.

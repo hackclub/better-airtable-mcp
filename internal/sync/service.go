@@ -2,8 +2,10 @@
 package syncer
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -836,6 +838,9 @@ func buildSyncPlans(tables []Table) ([]syncTablePlan, error) {
 				DuckDBColumnName:  sanitizedFieldNames[sanitizedIndex].Sanitized,
 				AirtableFieldType: field.Type,
 				DuckDBType:        mapping.DuckDBType,
+				Description:       strings.TrimSpace(field.Description),
+				Options:           compactFieldOptions(field.Options),
+				IsPrimary:         field.ID != "" && field.ID == table.PrimaryFieldID,
 			})
 			sanitizedIndex++
 		}
@@ -845,6 +850,7 @@ func buildSyncPlans(tables []Table) ([]syncTablePlan, error) {
 				AirtableTableID: table.ID,
 				OriginalName:    table.Name,
 				DuckDBTableName: sanitizedTableNames[tableIndex].Sanitized,
+				Description:     strings.TrimSpace(table.Description),
 				Fields:          fields,
 			},
 			Sort: ListRecordsPageOptions{
@@ -855,6 +861,62 @@ func buildSyncPlans(tables []Table) ([]syncTablePlan, error) {
 	}
 
 	return plans, nil
+}
+
+// compactFieldOptions returns a field's Airtable options as compact JSON text
+// for the cache file, or "" when the field has none.
+func compactFieldOptions(options json.RawMessage) string {
+	trimmed := bytes.TrimSpace(options)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return ""
+	}
+	var compact bytes.Buffer
+	if err := json.Compact(&compact, trimmed); err != nil {
+		return ""
+	}
+	return compact.String()
+}
+
+// refreshFieldDetails keeps the descriptions, options and primary flags in
+// the cache file in step with Airtable. They are outside the schema hash, so
+// a delta is the only thing that would otherwise never notice them change;
+// it also fills them into files written before they were stored.
+func (s *Service) refreshFieldDetails(ctx context.Context, baseID string, plans []syncTablePlan) error {
+	tables := make([]duckdb.TableSnapshot, 0, len(plans))
+	for _, plan := range plans {
+		tables = append(tables, plan.Table)
+	}
+
+	current, err := func() (bool, error) {
+		unlock, err := s.lockDuckRead(ctx, baseID)
+		if err != nil {
+			return false, err
+		}
+		defer unlock()
+		return duckdb.FieldDetailsCurrent(ctx, s.basePath(baseID), tables)
+	}()
+	if err != nil || current {
+		return err
+	}
+
+	unlock, err := s.lockDuckWrite(ctx, baseID)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	return duckdb.WriteFieldDetails(ctx, s.basePath(baseID), tables)
+}
+
+// ColumnStats reads fill counts and example values for the given tables of
+// an already-resolved base. Like ListResolvedSchema it performs no access
+// check.
+func (s *Service) ColumnStats(ctx context.Context, baseID string, tables []duckdb.TableSchema) (map[string]duckdb.TableStats, error) {
+	unlock, err := s.lockDuckRead(ctx, baseID)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
+	return duckdb.ReadColumnStats(ctx, s.basePath(baseID), tables)
 }
 
 func (s *Service) shouldUseStaging(baseID string) bool {

@@ -32,8 +32,10 @@ type TableSnapshot struct {
 	AirtableTableID string
 	OriginalName    string
 	DuckDBTableName string
-	Fields          []FieldSnapshot
-	Records         []RecordSnapshot
+	// Description is the table's Airtable description, if it has one.
+	Description string
+	Fields      []FieldSnapshot
+	Records     []RecordSnapshot
 }
 
 type FieldSnapshot struct {
@@ -42,6 +44,12 @@ type FieldSnapshot struct {
 	DuckDBColumnName  string
 	AirtableFieldType string
 	DuckDBType        string
+	// Description, Options and IsPrimary are the field details list_schema
+	// shows. Options is Airtable's type-specific configuration as compact
+	// JSON (select choices, link target, lookup wiring), or "" for none.
+	Description string
+	Options     string
+	IsPrimary   bool
 }
 
 type RecordSnapshot struct {
@@ -69,14 +77,18 @@ type BaseSchema struct {
 	BaseName     string
 	LastSyncedAt time.Time
 	Tables       []TableSchema
+	// DetailsLoaded is false for a cache file written before field details
+	// were stored: descriptions, options and primary flags are then blank
+	// until the base's next sync fills them in.
+	DetailsLoaded bool
 }
 
 type TableSchema struct {
 	AirtableTableID    string
 	DuckDBTableName    string
 	OriginalName       string
+	Description        string
 	Fields             []FieldSchema
-	SampleRows         []map[string]any
 	TotalRecordCount   int64
 	VisibleRecordCount int64
 	TableComplete      bool
@@ -91,6 +103,10 @@ type FieldSchema struct {
 	OriginalName     string
 	Type             string
 	AirtableType     string
+	Description      string
+	// Options is Airtable's field configuration as JSON text, or "".
+	Options   string
+	IsPrimary bool
 }
 
 type QueryResult struct {
@@ -424,6 +440,14 @@ func ReadSchema(ctx context.Context, path, baseID, baseName string) (BaseSchema,
 		return BaseSchema{}, err
 	}
 
+	detailsLoaded, err := columnExists(ctx, db, "_metadata", "field_options")
+	if err != nil {
+		return BaseSchema{}, err
+	}
+	detailColumns := `'' AS field_description, '' AS field_options, FALSE AS is_primary_field, '' AS table_description`
+	if detailsLoaded {
+		detailColumns = `COALESCE(field_description, ''), COALESCE(CAST(field_options AS VARCHAR), ''), COALESCE(is_primary_field, FALSE), COALESCE(table_description, '')`
+	}
 	rows, err := db.QueryContext(ctx, `
 		SELECT
 			duckdb_table_name,
@@ -433,7 +457,8 @@ func ReadSchema(ctx context.Context, path, baseID, baseName string) (BaseSchema,
 			original_field_name,
 			airtable_field_id,
 			airtable_field_type,
-			duckdb_type
+			duckdb_type,
+			`+detailColumns+`
 		FROM _metadata
 		ORDER BY duckdb_table_name, rowid
 	`)
@@ -455,6 +480,10 @@ func ReadSchema(ctx context.Context, path, baseID, baseName string) (BaseSchema,
 			airtableFieldID   string
 			airtableFieldType string
 			duckType          string
+			fieldDescription  string
+			fieldOptions      string
+			isPrimary         bool
+			tableDescription  string
 		)
 
 		if err := rows.Scan(
@@ -466,6 +495,10 @@ func ReadSchema(ctx context.Context, path, baseID, baseName string) (BaseSchema,
 			&airtableFieldID,
 			&airtableFieldType,
 			&duckType,
+			&fieldDescription,
+			&fieldOptions,
+			&isPrimary,
+			&tableDescription,
 		); err != nil {
 			return BaseSchema{}, fmt.Errorf("scan metadata row: %w", err)
 		}
@@ -476,6 +509,7 @@ func ReadSchema(ctx context.Context, path, baseID, baseName string) (BaseSchema,
 				AirtableTableID: airtableTableID,
 				DuckDBTableName: duckTableName,
 				OriginalName:    originalTableName,
+				Description:     tableDescription,
 			}
 			tablesByName[duckTableName] = table
 			order = append(order, duckTableName)
@@ -487,6 +521,9 @@ func ReadSchema(ctx context.Context, path, baseID, baseName string) (BaseSchema,
 			OriginalName:     originalFieldName,
 			Type:             duckType,
 			AirtableType:     airtableFieldType,
+			Description:      fieldDescription,
+			Options:          fieldOptions,
+			IsPrimary:        isPrimary,
 		})
 	}
 	if err := rows.Err(); err != nil {
@@ -522,12 +559,6 @@ func ReadSchema(ctx context.Context, path, baseID, baseName string) (BaseSchema,
 	for _, tableName := range order {
 		table := tablesByName[tableName]
 
-		sampleRows, err := queryRowsAsMaps(ctx, db, fmt.Sprintf(`SELECT * FROM %s LIMIT 3`, quoteIdent(table.DuckDBTableName)))
-		if err != nil {
-			return BaseSchema{}, fmt.Errorf("load sample rows for %s: %w", table.DuckDBTableName, err)
-		}
-		table.SampleRows = sampleRows
-
 		if err := db.QueryRowContext(ctx, fmt.Sprintf(`SELECT COUNT(*) FROM %s`, quoteIdent(table.DuckDBTableName))).Scan(&table.TotalRecordCount); err != nil {
 			return BaseSchema{}, fmt.Errorf("count rows for %s: %w", table.DuckDBTableName, err)
 		}
@@ -547,10 +578,11 @@ func ReadSchema(ctx context.Context, path, baseID, baseName string) (BaseSchema,
 	}
 
 	return BaseSchema{
-		BaseID:       baseID,
-		BaseName:     baseName,
-		LastSyncedAt: syncInfo.LastSyncedAt,
-		Tables:       tables,
+		BaseID:        baseID,
+		BaseName:      baseName,
+		LastSyncedAt:  syncInfo.LastSyncedAt,
+		Tables:        tables,
+		DetailsLoaded: detailsLoaded,
 	}, nil
 }
 
@@ -681,7 +713,11 @@ func createMetadataTables(ctx context.Context, tx *sql.Tx) error {
 			original_field_name VARCHAR,
 			airtable_field_id VARCHAR,
 			airtable_field_type VARCHAR,
-			duckdb_type VARCHAR
+			duckdb_type VARCHAR,
+			field_description VARCHAR,
+			field_options JSON,
+			is_primary_field BOOLEAN,
+			table_description VARCHAR
 		)`,
 		`CREATE TABLE _sync_info (
 			sync_started_at TIMESTAMP,
@@ -851,8 +887,12 @@ func insertMetadataRows(ctx context.Context, tx *sql.Tx, table TableSnapshot) er
 				original_field_name,
 				airtable_field_id,
 				airtable_field_type,
-				duckdb_type
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+				duckdb_type,
+				field_description,
+				field_options,
+				is_primary_field,
+				table_description
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			table.DuckDBTableName,
 			table.OriginalName,
 			table.AirtableTableID,
@@ -861,6 +901,10 @@ func insertMetadataRows(ctx context.Context, tx *sql.Tx, table TableSnapshot) er
 			field.AirtableFieldID,
 			field.AirtableFieldType,
 			field.DuckDBType,
+			nullableString(field.Description),
+			nullableString(field.Options),
+			field.IsPrimary,
+			nullableString(table.Description),
 		); err != nil {
 			return fmt.Errorf("insert metadata row for %s.%s: %w", table.DuckDBTableName, field.DuckDBColumnName, err)
 		}
@@ -1156,35 +1200,6 @@ func columnExists(ctx context.Context, db *sql.DB, tableName, columnName string)
 		return false, fmt.Errorf("check column %s.%s exists: %w", tableName, columnName, err)
 	}
 	return exists, nil
-}
-
-func queryRowsAsMaps(ctx context.Context, db *sql.DB, query string) ([]map[string]any, error) {
-	rows, err := db.QueryContext(ctx, query)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	columns, err := rows.Columns()
-	if err != nil {
-		return nil, err
-	}
-
-	results := make([]map[string]any, 0)
-	for rows.Next() {
-		values, err := scanRow(rows, len(columns))
-		if err != nil {
-			return nil, err
-		}
-
-		row := make(map[string]any, len(columns))
-		for index, column := range columns {
-			row[column] = values[index]
-		}
-		results = append(results, row)
-	}
-
-	return results, rows.Err()
 }
 
 func scanRow(rows *sql.Rows, columnCount int) ([]any, error) {

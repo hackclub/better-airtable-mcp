@@ -615,6 +615,17 @@ func (s *Service) runDelta(ctx context.Context, tokens AccessTokenFunc, base Bas
 		result.NeedsFull, result.Reason = true, reason
 		return result, nil
 	}
+	if err := s.refreshFieldDetails(ctx, base.ID, plans); err != nil {
+		if ctx.Err() != nil {
+			return result, err
+		}
+		// Details only feed list_schema's descriptions; rows are unaffected,
+		// so the delta carries on and the next one tries again.
+		logx.Event(ctx, "sync_service", "sync.field_details_refresh_failed",
+			"base_id", base.ID,
+			"error_message", logx.ErrorPreview(err),
+		)
+	}
 
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()

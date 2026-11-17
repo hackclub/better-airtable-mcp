@@ -320,6 +320,62 @@ func TestDeltaRandomizedEditsMatchFullSync(t *testing.T) {
 	}
 }
 
+func TestDeltaRefreshesFieldDetailsWithoutAFullSync(t *testing.T) {
+	sim := newSimAirtable()
+	seedSim(sim)
+	service := newSimService(t, sim)
+	simFullSync(t, service)
+
+	readProjects := func() (duckdb.BaseSchema, duckdb.TableSchema) {
+		t.Helper()
+		schema, err := service.ListResolvedSchema(context.Background(), simBase.ID, simBase.Name)
+		if err != nil {
+			t.Fatalf("ListResolvedSchema: %v", err)
+		}
+		for _, table := range schema.Tables {
+			if table.DuckDBTableName == "projects" {
+				return schema, table
+			}
+		}
+		t.Fatalf("projects table missing from %#v", schema.Tables)
+		return schema, duckdb.TableSchema{}
+	}
+
+	schema, projects := readProjects()
+	if !schema.DetailsLoaded {
+		t.Fatal("expected a full sync to store field details")
+	}
+	if projects.Description != "" || !projects.Fields[0].IsPrimary {
+		t.Fatalf("unexpected details after the full sync: %#v", projects)
+	}
+	var link duckdb.FieldSchema
+	for _, field := range projects.Fields {
+		if field.DuckDBColumnName == "program" {
+			link = field
+		}
+	}
+	if link.Options != `{"inverseLinkFieldId":"fldGProjects","linkedTableId":"`+simPrograms+`"}` {
+		t.Fatalf("expected the link's options to be stored, got %q", link.Options)
+	}
+
+	// A description is outside the schema hash: a delta must pick it up
+	// without asking for a full sync.
+	sim.projectsNote = "Every shipped project"
+	sim.advance(time.Hour)
+	simDelta(t, service)
+	_, projects = readProjects()
+	if projects.Description != "Every shipped project" || projects.Fields[0].Description != "Every shipped project" {
+		t.Fatalf("expected the delta to refresh descriptions, got %#v", projects)
+	}
+
+	// With nothing changed the details are left alone.
+	sim.advance(time.Hour)
+	simDelta(t, service)
+	if _, after := readProjects(); !reflect.DeepEqual(after.Fields, projects.Fields) {
+		t.Fatalf("details changed on an idle delta: %#v", after.Fields)
+	}
+}
+
 func TestDeltaLeavesUnlinkedDeletionForReconcile(t *testing.T) {
 	sim := newSimAirtable()
 	seedSim(sim)

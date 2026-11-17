@@ -20,6 +20,7 @@ type Syncer interface {
 	SyncBase(ctx context.Context, accessToken, baseRef string) (syncer.SyncResult, error)
 	ListSchema(ctx context.Context, accessToken, baseRef string) (duckdb.BaseSchema, error)
 	ListResolvedSchema(ctx context.Context, baseID, baseName string) (duckdb.BaseSchema, error)
+	ColumnStats(ctx context.Context, baseID string, tables []duckdb.TableSchema) (map[string]duckdb.TableStats, error)
 	QueryBase(ctx context.Context, accessToken, baseRef, query string) (duckdb.QueryResult, error)
 	QueryResolvedBase(ctx context.Context, baseID, query string) (duckdb.QueryResult, error)
 }

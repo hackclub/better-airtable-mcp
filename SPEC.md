@@ -160,94 +160,72 @@ Search for Airtable bases the user has access to.
 
 ### 3.2 `list_schema`
 
-List all tables in a base with field metadata and sample data.
+Describe a base's tables and columns so an agent can write SQL and mutations against it.
 
 **Input:**
 ```json
 {
-  "base": "string — base ID or base name"
+  "base": "string — base ID or base name",
+  "tables": ["optional: tables to show every column of"],
+  "search": "optional: words to find in column names and descriptions"
 }
 ```
 
-**Output:**
-```json
-{
-  "base_id": "appXXXXXXXXXX",
-  "base_name": "Project Tracker",
-  "last_synced_at": "",
-  "sync": {
-    "operation_id": "sync_appXXXXXXXXXX",
-    "status": "syncing",
-    "read_snapshot": "partial",
-    "sync_started_at": "2026-04-01T12:00:00Z",
-    "tables_total": 8,
-    "tables_started": 8,
-    "tables_completed": 1,
-    "pages_fetched": 8,
-    "records_visible": 430,
-    "records_synced_this_run": 430
-  },
-  "tables": [
-    {
-      "airtable_table_id": "tblXXXXXXXXXX",
-      "duckdb_table_name": "projects",
-      "original_name": "Projects",
-      "fields": [
-        {
-          "airtable_field_id": "fldXXXXXXXXXX",
-          "duckdb_column_name": "name",
-          "original_name": "Name",
-          "type": "VARCHAR",
-          "airtable_type": "singleLineText"
-        }
-      ],
-      "sample_rows": [
-        {"id": "recXXX", "name": "Website Redesign", "status": "In Progress"},
-        {"id": "recYYY", "name": "API Migration", "status": "Done"},
-        {"id": "recZZZ", "name": "Mobile App", "status": "Planning"}
-      ],
-      "visible_record_count": 37,
-      "total_record_count": null,
-      "table_complete": false,
-      "sync_status": "syncing"
-    }
-  ]
-}
-```
+**Output:** text only, tab-separated, with no structured copy. Clients that receive structured content show it to the model in place of the text, and a JSON copy of a schema is several times larger than the table.
 
-**MCP tool result text format:**
+Which view comes back depends on the input:
+
+| Input | View |
+|---|---|
+| `base` only, and every column fits in about 12,000 characters | every column of every table |
+| `base` only, larger base | table overview: one row per table |
+| `tables` | every column of those tables, capped at about 40,000 characters (tables that do not fit are named so they can be asked for separately) |
+| `search` | columns whose DuckDB name, Airtable name or description contains any of the words, across all tables or only the ones in `tables` (first 150 matches) |
+
+`tables` entries may be the DuckDB table name, the Airtable table name or the Airtable table ID. An unknown table is an error that lists the base's tables.
+
+**Every-column view:**
 ```text
-sync_status
-operation_id,status,read_snapshot,sync_started_at,last_synced_at,tables_total,tables_started,tables_completed,pages_fetched,records_visible,records_synced_this_run,error
-sync_appXXXXXXXXXX,syncing,partial,2026-04-01T12:00:00Z,,8,8,1,8,430,430,
+base: Project Tracker (appXXXXXXXXXX), 2 tables, 6 columns
+Every table also has id (VARCHAR, the Airtable record ID) and created_time (TIMESTAMP). filled is the share of rows that hold a value; example is one stored value.
 
-base
-base_id,base_name
-appXXXXXXXXXX,Project Tracker
+# projects: 37 rows, 4 columns (Airtable table "Projects", tblXXXXXXXXXX)
+column	type	airtable	filled	example	description
+name	VARCHAR	singleLineText, primary	100%	Website Redesign	
+status	VARCHAR	singleSelect: Planning | In Progress | Done	95%	In Progress	Where the project stands
+linked_tasks	VARCHAR[]	link to tasks	81%	[recTask1, recTask2]	
+task_hours	JSON	rollup via linked_tasks (number), read-only	81%	12.5	
 
-tables
-
-# projects
-id,created_time,name,status
-recXXX,2026-04-01T12:00:00Z,Website Redesign,In Progress
-recYYY,2026-04-01T12:05:00Z,API Migration,Done
-recZZZ,2026-04-01T12:10:00Z,Mobile App,Planning
-
-# tasks
-id,created_time,name
-recTask1,2026-04-01T13:00:00Z,Design new homepage
-recTask2,2026-04-01T13:15:00Z,QA revised layout
+# tasks: 112 rows so far (still downloading), 2 columns (Airtable table "Tasks", tblYYYYYYYYYY)
+column	type	airtable	filled	example
+name	VARCHAR	singleLineText, primary	100%	Design new homepage
+hours	DOUBLE	number	64%	2.5
 ```
 
-- In the text output only, each sample cell is capped at 100 characters; truncated values end with ` [truncated]`
+**Table overview:**
+```text
+base: Unified YSWS Projects DB (appXXXXXXXXXX), 14 tables, 425 columns
+This base has too many columns to list at once. Call list_schema again with tables set to the ones you need, or with search to find columns by name across every table.
+
+table	rows	columns	primary	links_to
+approved_projects	59826	87	record_id	ysws_programs, ysws_authors
+ysws_programs	412	73	name	approved_projects
+```
+
+Column rows:
+
+- `column` and `type` are the DuckDB column name and type, which is what `query` and `mutate` take.
+- `airtable` is the Airtable field type plus what an agent needs to use the field: the choices of a select (the first 20, then a count of the rest), the table a link points to, the link column a lookup, rollup or count reads through, the result type of a formula, rollup or lookup, `primary` for the table's primary field, and `read-only` for fields Airtable computes (`mutate` cannot write them).
+- `filled` is the share of cached rows with a value. `0%` and `100%` are exact; anything else is between `1%` and `99%`.
+- `example` is one stored value, cut to 60 characters.
+- `description` is the field's Airtable description, cut to 120 characters. The column is left out when no field in the table has one.
 
 **Behavior:**
 - Resolves base by ID or name (via `list_bases` internally if name is given)
-- If the base has no local snapshot yet, initializes schema immediately, creates empty/queryable DuckDB tables, starts a background sync, and waits up to 8 seconds for the first page of every table (or an empty first page that proves the table has no records). Past that it returns the schema with the samples loaded so far, and the tables still waiting are marked as not started
-- Returns up to 3 sample rows per table from the DuckDB cache
-- Includes the metadata mapping (Airtable IDs ↔ DuckDB names) so the agent can construct mutations later
-- Includes top-level sync progress plus per-table sync state
-- `last_synced_at` is blank until the first full sync completes
+- If the base has no local snapshot yet, initializes schema immediately, creates empty/queryable DuckDB tables, starts a background sync, and waits up to 8 seconds for the first page of every table (or an empty first page that proves the table has no records). Past that it returns the schema with what has loaded so far
+- A table that is still downloading shows its row count as `N rows so far (still downloading)` (`N+` in the overview)
+- `filled` and `example` come from one aggregate query per shown table against the DuckDB cache, at call time. Nothing is stored for them, and they are only computed for the tables being shown
+- Select choices, link targets, descriptions and primary flags come from `_metadata`. A cache file written before they were stored is read with them blank, and the result ends with a note saying they appear after the base's next sync
 - `visible_record_count` is the number of rows currently queryable from that table
 - `total_record_count` is only authoritative after `table_complete=true`
 - `content[0].text` is organized as `sync_status`, `base`, `tables`, then one `# {duckdb_table_name}` CSV section per table using the queryable column names as headers (`id`, `created_time`, and sanitized Airtable field names)
@@ -394,7 +372,7 @@ JOIN tasks t ON t.id = u.task_id
 
 ---
 
-**Freshness.** Every `query` and `list_schema` result starts with a `freshness` block, in both the structured payload and the text the model reads:
+**Freshness.** Every `query` and `list_schema` result starts with a `freshness` block, in both the structured payload (`query` only; `list_schema` returns text alone) and the text the model reads:
 
 | Field | Meaning |
 |---|---|
@@ -746,9 +724,15 @@ CREATE TABLE _metadata (
   original_field_name VARCHAR,
   airtable_field_id  VARCHAR,
   airtable_field_type VARCHAR,
-  duckdb_type        VARCHAR
+  duckdb_type        VARCHAR,
+  field_description  VARCHAR,
+  field_options      JSON,     -- Airtable's field options, verbatim
+  is_primary_field   BOOLEAN,
+  table_description  VARCHAR
 );
 ```
+
+The last four columns are field details for `list_schema`. They are left out of the schema hash, so a renamed select choice or an edited description never forces a full sync: every delta compares them with Airtable's schema and rewrites them in place when they differ. A file written before they existed gets the columns added by its next delta, with no re-download.
 
 **Sync info table** (`_sync_info`):
 ```sql

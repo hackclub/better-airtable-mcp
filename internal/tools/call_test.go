@@ -20,6 +20,9 @@ type fakeSyncer struct {
 	queryBaseCalls     int
 	queryErr           error
 	result             duckdb.QueryResult
+	schema             duckdb.BaseSchema
+	stats              map[string]duckdb.TableStats
+	statsTables        []string
 }
 
 func (f *fakeSyncer) SearchBases(ctx context.Context, accessToken, query string) ([]syncer.Base, error) {
@@ -31,11 +34,19 @@ func (f *fakeSyncer) SyncBase(ctx context.Context, accessToken, baseRef string) 
 }
 
 func (f *fakeSyncer) ListSchema(ctx context.Context, accessToken, baseRef string) (duckdb.BaseSchema, error) {
-	return duckdb.BaseSchema{}, nil
+	return f.schema, nil
 }
 
 func (f *fakeSyncer) ListResolvedSchema(ctx context.Context, baseID, baseName string) (duckdb.BaseSchema, error) {
-	return duckdb.BaseSchema{}, nil
+	return f.schema, nil
+}
+
+func (f *fakeSyncer) ColumnStats(ctx context.Context, baseID string, tables []duckdb.TableSchema) (map[string]duckdb.TableStats, error) {
+	f.statsTables = nil
+	for _, table := range tables {
+		f.statsTables = append(f.statsTables, table.DuckDBTableName)
+	}
+	return f.stats, nil
 }
 
 func (f *fakeSyncer) QueryBase(ctx context.Context, accessToken, baseRef, query string) (duckdb.QueryResult, error) {

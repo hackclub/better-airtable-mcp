@@ -31,6 +31,9 @@ type simAirtable struct {
 	schemaCalls int
 	pageCalls   int
 	extraField  bool // adds a field to the schema, to simulate a schema change
+	// projectsNote, when set, is the description of the Projects table and
+	// of its Name field: a details edit that leaves the layout alone.
+	projectsNote string
 
 	// failAfter, when positive, lets that many more record requests succeed
 	// and then fails every one after it, until it is set back to zero.
@@ -311,6 +314,10 @@ func (s *simAirtable) GetBaseSchema(context.Context, string, string) ([]Table, e
 		{ID: "fldPProgramName", Name: "Program Name", Type: "multipleLookupValues", Options: simOptions(map[string]any{"recordLinkFieldId": "fldPProgram", "fieldIdInLinkedTable": "fldGName", "isValid": true})},
 		{ID: "fldPLabel", Name: "Label", Type: "formula", Options: simOptions(map[string]any{"formula": "{fldPName}&'/'&{fldPProgram}", "referencedFieldIds": []string{"fldPName", "fldPProgram"}, "isValid": true})},
 	}}
+	if s.projectsNote != "" {
+		projects.Description = s.projectsNote
+		projects.Fields[0].Description = s.projectsNote
+	}
 	if s.extraField {
 		projects.Fields = append(projects.Fields, Field{ID: "fldPNotes", Name: "Notes", Type: "singleLineText"})
 	}
