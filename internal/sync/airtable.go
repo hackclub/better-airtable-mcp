@@ -44,6 +44,15 @@ const (
 	defaultUserRateLimit     = rate.Limit(4)
 	defaultUserBulkRateLimit = rate.Limit(3)
 
+	// A download also stands aside while the same user's small requests are
+	// arriving, so a refresh of many tables runs at the user's full rate
+	// instead of the share the download leaves. bulkYieldWindow is how long
+	// after a small request a download page holds off, and bulkYieldMaxWaits
+	// bounds the holding off so a long run of small requests cannot stall a
+	// download outright.
+	bulkYieldWindow   = 300 * time.Millisecond
+	bulkYieldMaxWaits = 20
+
 	// 6 attempts is 5 retries. With Airtable's 30s Retry-After hint and the
 	// exponential schedule below, the worst-case total wait per request is
 	// bounded by maxRetryBackoff * (maxRetryAttempts-1).
@@ -115,7 +124,9 @@ type userLimiterEntry struct {
 	bulk *rate.Limiter
 	// slowUntil is set after a 429: until then both limiters run at half rate.
 	slowUntil time.Time
-	lastSeen  time.Time
+	// lastSmallAt is when the user's latest non-bulk request asked for a slot.
+	lastSmallAt time.Time
+	lastSeen    time.Time
 }
 
 type bulkRequestsKey struct{}
@@ -783,15 +794,43 @@ func (c *HTTPClient) waitForUserRateLimit(ctx context.Context, accessToken strin
 		entry.bulk.SetLimitAt(now, c.userBulkRateLimit)
 		entry.slowUntil = time.Time{}
 	}
+	bulk := isBulkRequest(ctx)
+	if !bulk {
+		entry.lastSmallAt = now
+	}
 	c.pruneUserLimitersLocked(now)
 	c.mu.Unlock()
 
-	if isBulkRequest(ctx) {
+	if bulk {
+		if err := c.yieldToSmallRequests(ctx, entry); err != nil {
+			return err
+		}
 		if err := c.waitForLimiter(ctx, entry.bulk, "user "+tokenKey[:8]+" bulk"); err != nil {
 			return err
 		}
 	}
 	return c.waitForLimiter(ctx, entry.all, "user "+tokenKey[:8])
+}
+
+// yieldToSmallRequests holds a download page back while the same user's small
+// requests are still arriving.
+func (c *HTTPClient) yieldToSmallRequests(ctx context.Context, entry *userLimiterEntry) error {
+	for attempt := 0; attempt < bulkYieldMaxWaits; attempt++ {
+		c.mu.Lock()
+		lastSmallAt := entry.lastSmallAt
+		c.mu.Unlock()
+		if lastSmallAt.IsZero() {
+			return nil
+		}
+		wait := bulkYieldWindow - c.clock().Sub(lastSmallAt)
+		if wait <= 0 {
+			return nil
+		}
+		if err := c.sleep(ctx, wait); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // slowUserAfterRateLimit halves a user's budget for as long as Airtable asked

@@ -402,6 +402,47 @@ func TestHTTPClientKeepsRoomForSmallRequestsDuringBulkDownload(t *testing.T) {
 	}
 }
 
+func TestHTTPClientDownloadStandsAsideForSmallRequests(t *testing.T) {
+	client, clock, advance := virtualClockClient(t, emptySchemaHandler)
+	bulk := WithBulkRequests(context.Background())
+
+	if _, err := client.GetBaseSchema(context.Background(), "one-user", "appSmall"); err != nil {
+		t.Fatalf("GetBaseSchema() returned error: %v", err)
+	}
+	// A download page asked for right behind a small request waits out the
+	// yield window, which is longer than the user's 250ms slot spacing.
+	before := clock()
+	if _, err := client.GetBaseSchema(bulk, "one-user", "appBig"); err != nil {
+		t.Fatalf("bulk GetBaseSchema() returned error: %v", err)
+	}
+	if waited := clock().Sub(before); waited < bulkYieldWindow {
+		t.Fatalf("a download page waited %s behind a small request, want at least %s", waited, bulkYieldWindow)
+	}
+
+	// Once the small requests stop, the download runs at its own pace again.
+	advance(5 * time.Second)
+	before = clock()
+	if _, err := client.GetBaseSchema(bulk, "one-user", "appBigTwo"); err != nil {
+		t.Fatalf("bulk GetBaseSchema() returned error: %v", err)
+	}
+	if waited := clock().Sub(before); waited != 0 {
+		t.Fatalf("a download page waited %s with no small requests around", waited)
+	}
+
+	// Another user's small requests do not hold this user's download back.
+	if _, err := client.GetBaseSchema(context.Background(), "another-user", "appOther"); err != nil {
+		t.Fatalf("GetBaseSchema() returned error: %v", err)
+	}
+	advance(time.Second)
+	before = clock()
+	if _, err := client.GetBaseSchema(bulk, "one-user", "appBigThree"); err != nil {
+		t.Fatalf("bulk GetBaseSchema() returned error: %v", err)
+	}
+	if waited := clock().Sub(before); waited != 0 {
+		t.Fatalf("a download page waited %s behind a different user's request", waited)
+	}
+}
+
 func TestHTTPClientHalvesUserBudgetAfterRateLimit(t *testing.T) {
 	var calls int
 	client, clock, advance := virtualClockClient(t, func(w http.ResponseWriter, r *http.Request) {
