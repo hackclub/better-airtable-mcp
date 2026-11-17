@@ -284,7 +284,7 @@ func (r *deltaRun) syncTable(tableID string) error {
 	// returns is therefore treated as changed, once.
 	forceChanged := !position.ReconciledAt.IsZero() && position.CheckedAt.Equal(position.ReconciledAt)
 
-	options := ListRecordsPageOptions{ModifiedSince: position.Watermark.Add(-deltaOverlap)}
+	options := ListRecordsPageOptions{ModifiedSince: position.Watermark.Add(-r.service.overlap())}
 	var batch []Record
 	for {
 		page, err := r.listPage(tableID, options)
@@ -793,4 +793,12 @@ func (s *Service) propagationBudget() int {
 		return s.deltaBudget
 	}
 	return deltaPropagationBudget
+}
+
+// overlap is deltaOverlap unless a test shortened it.
+func (s *Service) overlap() time.Duration {
+	if s.deltaOverlapOverride > 0 {
+		return s.deltaOverlapOverride
+	}
+	return deltaOverlap
 }

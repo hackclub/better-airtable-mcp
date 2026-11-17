@@ -30,6 +30,8 @@ type Service struct {
 
 	// deltaBudget overrides deltaPropagationBudget when positive.
 	deltaBudget int
+	// deltaOverlapOverride overrides deltaOverlap when positive.
+	deltaOverlapOverride time.Duration
 }
 
 // baseListCacheTTL bounds how long a fetched base list is reused for base
