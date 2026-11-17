@@ -6,8 +6,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"strings"
 
 	"github.com/hackclub/better-airtable-mcp/internal/mcp"
+	syncer "github.com/hackclub/better-airtable-mcp/internal/sync"
 )
 
 const (
@@ -284,4 +286,48 @@ func truncateSchemaSampleValue(value string) string {
 	}
 
 	return string(runes[:schemaSampleValueMaxChars-len(suffix)]) + schemaSampleTruncationTag
+}
+
+// freshnessPayload is the structured freshness block attached to read results.
+func freshnessPayload(freshness syncer.Freshness) map[string]any {
+	payload := map[string]any{
+		"state":         freshness.State,
+		"as_of":         formatTimeOrBlank(freshness.AsOf),
+		"reconciled_at": formatTimeOrBlank(freshness.ReconciledAt),
+	}
+	if len(freshness.TablesCatchingUp) > 0 {
+		payload["tables_catching_up"] = freshness.TablesCatchingUp
+	}
+	return payload
+}
+
+// withFreshness puts the freshness block ahead of a tool's text result, with
+// a plain-language warning whenever the data may be incomplete.
+func withFreshness(text, baseID string, freshness syncer.Freshness) string {
+	sections := []string{
+		"freshness",
+		csvSection(
+			[]string{"state", "as_of", "reconciled_at", "tables_catching_up"},
+			[][]string{{
+				freshness.State,
+				formatTimeOrBlank(freshness.AsOf),
+				formatTimeOrBlank(freshness.ReconciledAt),
+				strings.Join(freshness.TablesCatchingUp, " "),
+			}},
+		),
+	}
+	switch freshness.State {
+	case syncer.FreshnessFirstSync:
+		sections = append(sections, fmt.Sprintf(
+			"warning: INCOMPLETE DATA. This base is being downloaded for the first time, so results only cover the records loaded so far: counts are too low and a query can return zero rows for records that exist. Wait for the download before trusting results: call check_operation with operation_id %q until its status is completed, then run the query again.",
+			"sync_"+baseID,
+		))
+	case syncer.FreshnessCatchingUp:
+		note := "note: the cache is catching up with Airtable. Edits made after as_of may be missing."
+		if len(freshness.TablesCatchingUp) > 0 {
+			note += " Formula, lookup and rollup columns in tables_catching_up may lag until the next full sync (sync with mode \"full\" forces one)."
+		}
+		sections = append(sections, note)
+	}
+	return joinSections(sections...) + "\n" + text
 }

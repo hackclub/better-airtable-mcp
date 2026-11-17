@@ -88,7 +88,7 @@ func TestMutateApprovalFlowOverMCP(t *testing.T) {
 					},
 				},
 			})
-		case r.URL.Path == "/v0/appProjects/tblProjects" && r.Method == http.MethodGet:
+		case isAirtableRecordList(r, "/v0/appProjects/tblProjects"):
 			recordListCalls.Add(1)
 			recordsMu.Lock()
 			defer recordsMu.Unlock()
@@ -365,7 +365,7 @@ func TestConcurrentApproveExecutesMutationExactlyOnce(t *testing.T) {
 					},
 				},
 			})
-		case r.URL.Path == "/v0/appProjects/tblProjects" && r.Method == http.MethodGet:
+		case isAirtableRecordList(r, "/v0/appProjects/tblProjects"):
 			recordsMu.Lock()
 			defer recordsMu.Unlock()
 			payload := make([]map[string]any, 0, len(records))
@@ -580,7 +580,7 @@ func TestMutateApprovalFlowLogsWithoutLeakingPayloadValues(t *testing.T) {
 					},
 				},
 			})
-		case r.URL.Path == "/v0/appProjects/tblProjects" && r.Method == http.MethodGet:
+		case isAirtableRecordList(r, "/v0/appProjects/tblProjects"):
 			payload := make([]map[string]any, 0, len(records))
 			for id, fields := range records {
 				payload = append(payload, map[string]any{
@@ -772,7 +772,7 @@ func TestCheckOperationRejectsMutationStatusForDifferentUser(t *testing.T) {
 					},
 				},
 			})
-		case r.URL.Path == "/v0/appProjects/tblProjects" && r.Method == http.MethodGet:
+		case isAirtableRecordList(r, "/v0/appProjects/tblProjects"):
 			writeMCPJSON(t, w, map[string]any{
 				"records": []map[string]any{
 					{
@@ -938,7 +938,7 @@ func TestMutateCreateRecordsAcceptsOriginalAirtableFieldNamesOverMCP(t *testing.
 					},
 				},
 			})
-		case r.URL.Path == "/v0/appProjects/tblTable1" && r.Method == http.MethodGet:
+		case isAirtableRecordList(r, "/v0/appProjects/tblTable1"):
 			recordsMu.Lock()
 			defer recordsMu.Unlock()
 
@@ -1172,7 +1172,7 @@ func TestMutateDeleteRecordIDsOverMCP(t *testing.T) {
 					},
 				},
 			})
-		case r.URL.Path == "/v0/appProjects/tblProjects" && r.Method == http.MethodGet:
+		case isAirtableRecordList(r, "/v0/appProjects/tblProjects"):
 			writeMCPJSON(t, w, map[string]any{
 				"records": []map[string]any{
 					{
@@ -1338,7 +1338,7 @@ func TestMutateReturnsNotReadyWhenTargetRecordHasNotSyncedYetOverMCP(t *testing.
 					},
 				},
 			})
-		case r.URL.Path == "/v0/appProjects/tblProjects" && r.Method == http.MethodGet:
+		case isAirtableRecordList(r, "/v0/appProjects/tblProjects"):
 			recordRequests.Add(1)
 			time.Sleep(250 * time.Millisecond)
 			writeMCPJSON(t, w, map[string]any{

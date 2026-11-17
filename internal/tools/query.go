@@ -220,12 +220,22 @@ func (t QueryTool) Call(ctx context.Context, raw json.RawMessage) (mcp.ToolCallR
 	if syncPayload != nil {
 		payload["sync"] = syncPayload
 	}
+	text := formatBatchQueryCSV(formattedResults, syncStatus)
+	freshnessState := ""
+	if t.runtime.SyncManager != nil {
+		if freshness, ok := t.runtime.SyncManager.Freshness(ctx, baseID); ok {
+			payload["freshness"] = freshnessPayload(freshness)
+			text = withFreshness(text, baseID, freshness)
+			freshnessState = freshness.State
+		}
+	}
 	logToolCompleted(ctx, "query",
 		"user_id", userID,
 		"base_id", baseID,
 		"query_count", len(normalizedQueries),
+		"freshness", freshnessState,
 	)
-	return textOnlyResult(formatBatchQueryCSV(formattedResults, syncStatus), payload), nil
+	return textOnlyResult(text, payload), nil
 }
 
 func applyQueryResultLimit(result duckdb.QueryResult, normalized NormalizedQuery) (duckdb.QueryResult, bool) {

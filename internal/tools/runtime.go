@@ -31,6 +31,8 @@ type SyncManager interface {
 	EnsureBaseReadable(ctx context.Context, userID, baseRef string) (syncer.Base, error)
 	EnsureBaseSchemaSampled(ctx context.Context, userID, baseRef string) (syncer.Base, error)
 	RequestSync(ctx context.Context, userID, baseRef string) (syncer.SyncOperationStatus, error)
+	RequestFullSync(ctx context.Context, userID, baseRef string) (syncer.SyncOperationStatus, error)
+	Freshness(ctx context.Context, baseID string) (syncer.Freshness, bool)
 	CheckOperation(ctx context.Context, operationID string) (syncer.SyncOperationStatus, bool, error)
 	BaseStatus(baseID string) (syncer.SyncOperationStatus, bool)
 }

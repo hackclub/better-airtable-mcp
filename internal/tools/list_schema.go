@@ -147,8 +147,12 @@ func (t ListSchemaTool) Call(ctx context.Context, raw json.RawMessage) (mcp.Tool
 		"base_id", schema.BaseID,
 		"table_count", len(schema.Tables),
 	)
-	return textOnlyResult(
-		formatSchemaCSV(schema.BaseID, schema.BaseName, tables, syncStatus),
-		payload,
-	), nil
+	text := formatSchemaCSV(schema.BaseID, schema.BaseName, tables, syncStatus)
+	if t.runtime.SyncManager != nil {
+		if freshness, ok := t.runtime.SyncManager.Freshness(ctx, baseID); ok {
+			payload["freshness"] = freshnessPayload(freshness)
+			text = withFreshness(text, baseID, freshness)
+		}
+	}
+	return textOnlyResult(text, payload), nil
 }

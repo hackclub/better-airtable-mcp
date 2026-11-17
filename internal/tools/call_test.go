@@ -57,6 +57,8 @@ func (f *fakeSyncer) QueryResolvedBase(ctx context.Context, baseID, query string
 // fakeSyncManager implements the SyncManager interface without a database.
 type fakeSyncManager struct {
 	ensureReadableCalls int
+	fullSyncCalls       int
+	freshness           syncer.Freshness
 }
 
 func (f *fakeSyncManager) base() syncer.Base {
@@ -78,6 +80,15 @@ func (f *fakeSyncManager) EnsureBaseSchemaSampled(ctx context.Context, userID, b
 
 func (f *fakeSyncManager) RequestSync(ctx context.Context, userID, baseRef string) (syncer.SyncOperationStatus, error) {
 	return syncer.SyncOperationStatus{OperationID: "sync_appProjects", Status: "syncing"}, nil
+}
+
+func (f *fakeSyncManager) RequestFullSync(ctx context.Context, userID, baseRef string) (syncer.SyncOperationStatus, error) {
+	f.fullSyncCalls++
+	return syncer.SyncOperationStatus{OperationID: "sync_appProjects", Status: "syncing"}, nil
+}
+
+func (f *fakeSyncManager) Freshness(ctx context.Context, baseID string) (syncer.Freshness, bool) {
+	return f.freshness, f.freshness.State != ""
 }
 
 func (f *fakeSyncManager) CheckOperation(ctx context.Context, operationID string) (syncer.SyncOperationStatus, bool, error) {

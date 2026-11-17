@@ -147,6 +147,29 @@ type ExecutionResult struct {
 	DeletedRecordIDs []string `json:"deleted_record_ids,omitempty"`
 	CompletedBatches int      `json:"completed_batches"`
 	FailedBatch      *int     `json:"failed_batch,omitempty"`
+
+	// written groups the records each batch touched by Airtable table, so
+	// they can be written through to the read cache. It is not stored.
+	written map[string]*writtenRecords
+}
+
+// writtenRecords are the records an executed mutation changed in one table.
+type writtenRecords struct {
+	changed []string
+	deleted []string
+}
+
+func (r *ExecutionResult) noteWritten(tableID string, changed, deleted []string) {
+	if r.written == nil {
+		r.written = map[string]*writtenRecords{}
+	}
+	entry := r.written[tableID]
+	if entry == nil {
+		entry = &writtenRecords{}
+		r.written[tableID] = entry
+	}
+	entry.changed = append(entry.changed, changed...)
+	entry.deleted = append(entry.deleted, deleted...)
 }
 
 type pendingPayload struct {
@@ -302,10 +325,30 @@ func (s *Service) PrepareMutation(ctx context.Context, userID string, request Mu
 				id, _ := row["id"].(string)
 				currentRows[id] = row
 			}
-			missingRecordIDs := make([]string, 0)
-			for _, recordID := range recordIDs {
-				if _, ok := currentRows[recordID]; !ok {
-					missingRecordIDs = append(missingRecordIDs, recordID)
+			missingFromCache := func() []string {
+				missing := make([]string, 0)
+				for _, recordID := range recordIDs {
+					if _, ok := currentRows[recordID]; !ok {
+						missing = append(missing, recordID)
+					}
+				}
+				return missing
+			}
+			missingRecordIDs := missingFromCache()
+			if len(missingRecordIDs) > 0 && s.syncManager != nil {
+				// The cache may simply not have seen these records yet (they
+				// were created moments ago, outside this server). Fetch them
+				// from Airtable by ID before deciding they do not exist.
+				if err := s.syncManager.RefreshRecords(ctx, userID, base.ID, table.AirtableTableID, missingRecordIDs, nil); err == nil {
+					rows, err := s.syncer.ReadTableRowsByIDs(ctx, base.ID, table.DuckDBTableName, missingRecordIDs)
+					if err != nil {
+						return fail(err)
+					}
+					for _, row := range rows {
+						id, _ := row["id"].(string)
+						currentRows[id] = row
+					}
+					missingRecordIDs = missingFromCache()
 				}
 			}
 			if len(missingRecordIDs) > 0 {
@@ -580,6 +623,19 @@ func (s *Service) Approve(ctx context.Context, operationID string) (OperationVie
 	logx.Event(ctx, "approval", "approval.execute_completed", attrs...)
 
 	if s.syncManager != nil {
+		// Write what the mutation changed straight into the read cache, so
+		// the agent's next query sees its own write. Whatever succeeded is
+		// written through even when a later batch failed. If the cache
+		// cannot be patched in place the follow-up sync below covers it.
+		tableIDs := make([]string, 0, len(result.written))
+		for tableID := range result.written {
+			tableIDs = append(tableIDs, tableID)
+		}
+		sort.Strings(tableIDs)
+		for _, tableID := range tableIDs {
+			written := result.written[tableID]
+			_ = s.syncManager.RefreshRecords(execCtx, operation.UserID, payload.BaseID, tableID, written.changed, written.deleted)
+		}
 		_ = s.syncManager.TriggerSync(ctx, operation.UserID, payload.BaseID)
 	}
 
@@ -707,6 +763,7 @@ func (s *Service) execute(ctx context.Context, userID, operationID string, paylo
 				}
 				for _, record := range created {
 					result.CreatedRecordIDs = append(result.CreatedRecordIDs, record.ID)
+					result.noteWritten(operation.AirtableTableID, []string{record.ID}, nil)
 				}
 			case "update_records":
 				records := make([]syncer.MutationRecord, 0, len(batch))
@@ -734,6 +791,7 @@ func (s *Service) execute(ctx context.Context, userID, operationID string, paylo
 				}
 				for _, record := range updated {
 					result.UpdatedRecordIDs = append(result.UpdatedRecordIDs, record.ID)
+					result.noteWritten(operation.AirtableTableID, []string{record.ID}, nil)
 				}
 			case "delete_records":
 				recordIDs := make([]string, 0, len(batch))
@@ -760,6 +818,7 @@ func (s *Service) execute(ctx context.Context, userID, operationID string, paylo
 					return result, "partially_completed", err.Error()
 				}
 				result.DeletedRecordIDs = append(result.DeletedRecordIDs, deleted...)
+				result.noteWritten(operation.AirtableTableID, nil, deleted)
 			default:
 				return result, "failed", fmt.Sprintf("unsupported mutation type %q", operation.Type)
 			}
