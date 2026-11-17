@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"regexp"
 	"sort"
 )
 
@@ -26,6 +27,9 @@ func (f Field) wiring() fieldWiring {
 	}
 	return wiring
 }
+
+// fieldIDPattern finds Airtable field IDs inside raw option JSON.
+var fieldIDPattern = regexp.MustCompile(`fld[A-Za-z0-9]{14}`)
 
 func rawPresent(raw json.RawMessage) bool {
 	return len(raw) > 0 && string(raw) != "null"
@@ -108,16 +112,34 @@ func buildSchemaGraph(tables []Table, plans []syncTablePlan) schemaGraph {
 				}
 				linkColumn := columnByField[table.ID][wiring.RecordLinkFieldID]
 				conditional := rawPresent(wiring.Filters) || rawPresent(wiring.Sorts) || rawPresent(wiring.RecordLimit)
-				sourceColumn := columnByField[sourceTable][wiring.FieldIDInLinkedTable]
 				if field.Type == "count" && !conditional {
 					// A plain count only depends on which records are linked,
 					// and a link edit already marks this row as modified.
 					continue
 				}
-				if conditional || sourceColumn == "" {
-					sourceColumn = ""
+				// The value depends on the field it reads and on every field
+				// its filter and sort conditions name. If each of those is a
+				// cached column of the source table, only they are watched;
+				// otherwise any change to the source row counts.
+				sourceFields := fieldIDPattern.FindAllString(string(wiring.Filters)+string(wiring.Sorts), -1)
+				if wiring.FieldIDInLinkedTable != "" {
+					sourceFields = append(sourceFields, wiring.FieldIDInLinkedTable)
 				}
-				addEdge(computedEdge{DependentTableID: table.ID, LinkColumn: linkColumn, SourceTableID: sourceTable, SourceColumn: sourceColumn})
+				sourceColumns := make([]string, 0, len(sourceFields))
+				for _, fieldID := range sourceFields {
+					column := columnByField[sourceTable][fieldID]
+					if column == "" {
+						sourceColumns = nil
+						break
+					}
+					sourceColumns = append(sourceColumns, column)
+				}
+				if len(sourceColumns) == 0 {
+					sourceColumns = []string{""}
+				}
+				for _, sourceColumn := range sourceColumns {
+					addEdge(computedEdge{DependentTableID: table.ID, LinkColumn: linkColumn, SourceTableID: sourceTable, SourceColumn: sourceColumn})
+				}
 			}
 			// A formula (or rollup aggregation) that names a link field
 			// renders the linked records' primary field.

@@ -109,6 +109,9 @@ type workerState struct {
 	cacheStale bool
 	// reconcileRetryAt holds off another scheduled reconcile after one failed.
 	reconcileRetryAt time.Time
+	// lastDeltaDuration is how long the most recent delta took, or zero if
+	// the most recent run was not a delta.
+	lastDeltaDuration time.Duration
 	// idleReconcileTried stops an expired worker retrying its reconcile.
 	idleReconcileTried bool
 }
@@ -664,6 +667,10 @@ func (w *workerState) run() {
 			w.lastFreshAt = startedAt
 			w.oldestReconciledAt = outcome.OldestReconciledAt
 			w.cacheStale = outcome.CacheStale
+			w.lastDeltaDuration = 0
+			if outcome.Mode == "delta" {
+				w.lastDeltaDuration = result.SyncDuration
+			}
 			w.lastResult = result
 			w.baseName = result.BaseName
 			w.tablesTotal = result.TablesSynced
@@ -674,6 +681,23 @@ func (w *workerState) run() {
 		}
 		w.mu.Unlock()
 	}
+}
+
+// maxDeltaSpacing caps how far apart refreshInterval lets deltas drift.
+const maxDeltaSpacing = 10 * time.Minute
+
+// refreshInterval is how long after a delta starts the next one is due, and
+// how old the cache may get before a read asks for a refresh. It is the
+// configured interval, stretched when deltas are expensive: while a bulk job
+// rewrites thousands of rows a delta takes tens of seconds, and running them
+// back to back would spend a large share of the base's shared API budget.
+// Callers must hold w.mu.
+func (w *workerState) refreshInterval() time.Duration {
+	interval := w.manager.interval
+	if stretched := 3 * w.lastDeltaDuration; stretched > interval {
+		interval = minDuration(stretched, maxDeltaSpacing)
+	}
+	return interval
 }
 
 // reconcileOverdue reports how far past its reconcile interval the base is.
@@ -734,7 +758,7 @@ func (w *workerState) nextAction(now time.Time) (shouldSync bool, waitFor time.D
 			}
 		}
 
-		dueForRefresh := w.lastStartedAt.IsZero() || !now.Before(w.lastStartedAt.Add(w.manager.interval))
+		dueForRefresh := w.lastStartedAt.IsZero() || !now.Before(w.lastStartedAt.Add(w.refreshInterval()))
 		if !duckdb.DatabaseFileExists(w.manager.service.basePath(w.baseID)) || w.needsInitialRefresh || dueForRefresh {
 			// A base in constant use never goes idle, so its reconcile runs
 			// here once it is a full interval overdue.
@@ -747,7 +771,7 @@ func (w *workerState) nextAction(now time.Time) (shouldSync bool, waitFor time.D
 
 	nextDue := w.activeUntil.Sub(now)
 	if !w.lastStartedAt.IsZero() {
-		if dueIn := w.lastStartedAt.Add(w.manager.interval).Sub(now); dueIn < nextDue {
+		if dueIn := w.lastStartedAt.Add(w.refreshInterval()).Sub(now); dueIn < nextDue {
 			nextDue = dueIn
 		}
 	}
@@ -994,6 +1018,9 @@ func (w *workerState) waitForFresh(ctx context.Context, maxAge, maxWait time.Dur
 	w.mu.Lock()
 	complete := w.readable && w.readSnapshotComplete
 	freshAt := w.lastFreshAt
+	if stretched := w.refreshInterval(); stretched > maxAge {
+		maxAge = stretched
+	}
 	fresh := !freshAt.IsZero() && now.Sub(freshAt) < maxAge
 	skip := !complete || fresh || (w.inProgress && w.runningMode != syncModeAuto) || w.failureBackoff() > 0
 	if !skip && !w.inProgress {
