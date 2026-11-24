@@ -83,10 +83,11 @@ func logToolCompleted(ctx context.Context, toolName string, attrs ...any) {
 }
 
 func logToolFailed(ctx context.Context, toolName string, err error, attrs ...any) {
+	kind, preview := logx.ErrorKind(err), logx.ErrorPreview(err)
 	logAttrs := append([]any{
 		"tool_name", toolName,
-		"error_kind", logx.ErrorKind(err),
-		"error_message", logx.ErrorPreview(err),
+		"error_kind", kind,
+		"error_message", preview,
 	}, attrs...)
-	logx.Event(ctx, "tool", "tool.failed", logAttrs...)
+	logx.EventSummary(ctx, "tool", "tool.failed", toolName+" "+kind+": "+preview, logAttrs...)
 }

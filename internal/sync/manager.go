@@ -1270,7 +1270,7 @@ func (m *Manager) syncOnce(ctx context.Context, userID, baseID, baseName, mode s
 		"mode", mode,
 	)
 	fail := func(err error, message string) (syncOutcome, error) {
-		logx.Event(ctx, "sync_manager", "sync.run_failed",
+		logx.EventSummary(ctx, "sync_manager", "sync.run_failed", baseID+" "+logx.ErrorKind(err)+": "+message,
 			"user_id", userID,
 			"base_id", baseID,
 			"error_kind", logx.ErrorKind(err),

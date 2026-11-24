@@ -48,6 +48,22 @@ func Event(ctx context.Context, component, event string, attrs ...any) {
 	FromContext(ctx).Info(event, append(baseAttrs, attrs...)...)
 }
 
+// EventSummary logs like Event but appends summary to the message. Log stores
+// that index only the message (Orchard's does) then still show why it
+// happened. The summary must already be redacted, e.g. built from
+// ErrorPreview.
+func EventSummary(ctx context.Context, component, event, summary string, attrs ...any) {
+	baseAttrs := []any{
+		"event", event,
+		"component", component,
+	}
+	message := event
+	if summary != "" {
+		message = event + " " + summary
+	}
+	FromContext(ctx).Info(message, append(baseAttrs, attrs...)...)
+}
+
 func RequestID(ctx context.Context) string {
 	meta := requestMetaFromContext(ctx)
 	if meta == nil {
