@@ -6,13 +6,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"strings"
 
 	"github.com/hackclub/better-airtable-mcp/internal/mcp"
-)
-
-const (
-	schemaSampleValueMaxChars = 100
-	schemaSampleTruncationTag = " [truncated]"
+	syncer "github.com/hackclub/better-airtable-mcp/internal/sync"
 )
 
 type formattedSyncStatus struct {
@@ -100,35 +97,6 @@ func formatBatchQueryCSV(results []formattedQueryResult, syncStatus *formattedSy
 			fmt.Sprintf("query_%d_rows", index+1),
 			csvSection(result.Columns, csvRows(result.Rows)),
 		)
-	}
-
-	return joinSections(sections...)
-}
-
-func formatSchemaCSV(baseID, baseName string, tables []map[string]any, syncStatus *formattedSyncStatus) string {
-	sort.SliceStable(tables, func(i, j int) bool {
-		return fmt.Sprint(tables[i]["duckdb_table_name"]) < fmt.Sprint(tables[j]["duckdb_table_name"])
-	})
-
-	sections := make([]string, 0, len(tables)*2+4)
-	if syncStatus != nil {
-		sections = append(sections, "sync_status", formatSyncStatusCSV(*syncStatus))
-	}
-	sections = append(
-		sections,
-		"base",
-		csvSection(
-			[]string{"base_id", "base_name"},
-			[][]string{{baseID, baseName}},
-		),
-		"tables",
-	)
-
-	for _, table := range tables {
-		tableName := fmt.Sprint(table["duckdb_table_name"])
-		headers := schemaTableHeaders(table)
-		rows := schemaSampleRows(table, headers)
-		sections = append(sections, "# "+tableName, csvSection(headers, rows))
 	}
 
 	return joinSections(sections...)
@@ -249,39 +217,46 @@ func joinSections(sections ...string) string {
 	return buffer.String()
 }
 
-func schemaTableHeaders(table map[string]any) []string {
-	headers := []string{"id", "created_time"}
-	if fields, ok := table["fields"].([]map[string]any); ok {
-		for _, field := range fields {
-			headers = append(headers, fmt.Sprint(field["duckdb_column_name"]))
-		}
+// freshnessPayload is the structured freshness block attached to read results.
+func freshnessPayload(freshness syncer.Freshness) map[string]any {
+	payload := map[string]any{
+		"state":         freshness.State,
+		"as_of":         formatTimeOrBlank(freshness.AsOf),
+		"reconciled_at": formatTimeOrBlank(freshness.ReconciledAt),
 	}
-	return headers
+	if len(freshness.TablesCatchingUp) > 0 {
+		payload["tables_catching_up"] = freshness.TablesCatchingUp
+	}
+	return payload
 }
 
-func schemaSampleRows(table map[string]any, headers []string) [][]string {
-	samples, _ := table["sample_rows"].([]map[string]any)
-	rows := make([][]string, 0, len(samples))
-	for _, sample := range samples {
-		row := make([]string, 0, len(headers))
-		for _, header := range headers {
-			row = append(row, truncateSchemaSampleValue(csvCell(sample[header])))
+// withFreshness puts the freshness block ahead of a tool's text result, with
+// a plain-language warning whenever the data may be incomplete.
+func withFreshness(text, baseID string, freshness syncer.Freshness) string {
+	sections := []string{
+		"freshness",
+		csvSection(
+			[]string{"state", "as_of", "reconciled_at", "tables_catching_up"},
+			[][]string{{
+				freshness.State,
+				formatTimeOrBlank(freshness.AsOf),
+				formatTimeOrBlank(freshness.ReconciledAt),
+				strings.Join(freshness.TablesCatchingUp, " "),
+			}},
+		),
+	}
+	switch freshness.State {
+	case syncer.FreshnessFirstSync:
+		sections = append(sections, fmt.Sprintf(
+			"warning: INCOMPLETE DATA. This base is being downloaded for the first time, so results only cover the records loaded so far: counts are too low and a query can return zero rows for records that exist. Wait for the download before trusting results: call check_operation with operation_id %q until its status is completed, then run the query again.",
+			"sync_"+baseID,
+		))
+	case syncer.FreshnessCatchingUp:
+		note := "note: the cache is catching up with Airtable. Edits made after as_of may be missing."
+		if len(freshness.TablesCatchingUp) > 0 {
+			note += " Formula, lookup and rollup columns in tables_catching_up may lag until the next full sync (sync with mode \"full\" forces one)."
 		}
-		rows = append(rows, row)
+		sections = append(sections, note)
 	}
-	return rows
-}
-
-func truncateSchemaSampleValue(value string) string {
-	runes := []rune(value)
-	if len(runes) <= schemaSampleValueMaxChars {
-		return value
-	}
-
-	suffix := []rune(schemaSampleTruncationTag)
-	if len(suffix) >= schemaSampleValueMaxChars {
-		return string(suffix[:schemaSampleValueMaxChars])
-	}
-
-	return string(runes[:schemaSampleValueMaxChars-len(suffix)]) + schemaSampleTruncationTag
+	return joinSections(sections...) + "\n" + text
 }

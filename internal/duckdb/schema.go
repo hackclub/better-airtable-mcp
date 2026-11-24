@@ -36,15 +36,19 @@ var airtableTypeMappings = map[string]TypeMapping{
 	"multipleSelects":     {DuckDBType: "VARCHAR[]"},
 	"multipleRecordLinks": {DuckDBType: "VARCHAR[]"},
 	"lookup":              {DuckDBType: "JSON"},
-	"rollup":              {DuckDBType: "VARCHAR"},
-	"formula":             {DuckDBType: "VARCHAR"},
-	"multipleAttachments": {DuckDBType: "JSON"},
-	"createdBy":           {DuckDBType: "VARCHAR"},
-	"lastModifiedBy":      {DuckDBType: "VARCHAR"},
-	"barcode":             {DuckDBType: "VARCHAR"},
-	"button":              {Omitted: true},
-	"rating":              {DuckDBType: "BIGINT"},
-	"duration":            {DuckDBType: "DOUBLE"},
+	// Airtable's API calls a lookup field multipleLookupValues. Without this
+	// entry every lookup was silently left out of the cache.
+	"multipleLookupValues": {DuckDBType: "JSON"},
+	"count":                {DuckDBType: "BIGINT"},
+	"rollup":               {DuckDBType: "VARCHAR"},
+	"formula":              {DuckDBType: "VARCHAR"},
+	"multipleAttachments":  {DuckDBType: "JSON"},
+	"createdBy":            {DuckDBType: "VARCHAR"},
+	"lastModifiedBy":       {DuckDBType: "VARCHAR"},
+	"barcode":              {DuckDBType: "VARCHAR"},
+	"button":               {Omitted: true},
+	"rating":               {DuckDBType: "BIGINT"},
+	"duration":             {DuckDBType: "DOUBLE"},
 }
 
 func SanitizeIdentifier(name string) string {

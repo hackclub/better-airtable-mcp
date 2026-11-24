@@ -81,7 +81,7 @@ func NewQueryTool(defaultLimit, maxLimit int, runtime *Runtime) mcp.Tool {
 func (QueryTool) Definition() mcp.ToolDefinition {
 	return mcp.ToolDefinition{
 		Name:        "query",
-		Description: "Execute one or more read-only DuckDB SQL queries against a base's cache. Pass sql as an array of SQL strings, even for a single query. If a query contains LIMIT anywhere, the server assumes you are intentionally controlling row count and does not inject its default top-level limit for that query.",
+		Description: "Execute one or more read-only DuckDB SQL queries against a base's cache. Pass sql as an array of SQL strings, even for a single query. If a query contains LIMIT anywhere, the server assumes you are intentionally controlling row count and does not inject its default top-level limit for that query. Every result starts with a freshness block: as_of is the time up to which Airtable edits and new records are included, and reconciled_at is the time up to which records deleted in Airtable have been removed (a record deleted after reconciled_at can still appear; sync with mode \"full\" clears it). State first_sync means the base is still downloading and results are incomplete.",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -220,12 +220,22 @@ func (t QueryTool) Call(ctx context.Context, raw json.RawMessage) (mcp.ToolCallR
 	if syncPayload != nil {
 		payload["sync"] = syncPayload
 	}
+	text := formatBatchQueryCSV(formattedResults, syncStatus)
+	freshnessState := ""
+	if t.runtime.SyncManager != nil {
+		if freshness, ok := t.runtime.SyncManager.Freshness(ctx, baseID); ok {
+			payload["freshness"] = freshnessPayload(freshness)
+			text = withFreshness(text, baseID, freshness)
+			freshnessState = freshness.State
+		}
+	}
 	logToolCompleted(ctx, "query",
 		"user_id", userID,
 		"base_id", baseID,
 		"query_count", len(normalizedQueries),
+		"freshness", freshnessState,
 	)
-	return textOnlyResult(formatBatchQueryCSV(formattedResults, syncStatus), payload), nil
+	return textOnlyResult(text, payload), nil
 }
 
 func applyQueryResultLimit(result duckdb.QueryResult, normalized NormalizedQuery) (duckdb.QueryResult, bool) {

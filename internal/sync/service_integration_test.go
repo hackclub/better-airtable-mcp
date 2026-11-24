@@ -149,11 +149,12 @@ func TestServiceSyncListSchemaAndQuery(t *testing.T) {
 	if projectTable.TotalRecordCount != 2 {
 		t.Fatalf("expected 2 project records, got %d", projectTable.TotalRecordCount)
 	}
-	if len(projectTable.SampleRows) == 0 {
-		t.Fatal("expected project sample rows to be populated")
+	stats, err := service.ColumnStats(ctx, schema.BaseID, schema.Tables)
+	if err != nil {
+		t.Fatalf("ColumnStats() returned error: %v", err)
 	}
-	if projectTable.SampleRows[0]["linked_tasks"] == nil {
-		t.Fatalf("expected linked_tasks sample row data, got %#v", projectTable.SampleRows[0])
+	if linked := stats["projects"].Columns["linked_tasks"]; linked.Filled == 0 || linked.Example == "" {
+		t.Fatalf("expected linked_tasks to be filled with an example, got %#v", stats["projects"])
 	}
 
 	queryResult, err := service.QueryBase(ctx, "test-token", "Project Tracker", `

@@ -110,7 +110,9 @@ Optional, with defaults:
 
 - `PORT` (default `8080`)
 - `DUCKDB_DATA_DIR` (default `/data/duckdb`) - where per-base DuckDB cache files are stored
-- `SYNC_INTERVAL_SECONDS` (default `60`) and `SYNC_TTL_MINUTES` (default `10`)
+- `SYNC_INTERVAL_SECONDS` (default `60`): how often a base in use is checked for changes. `SYNC_TTL_MINUTES` (default `10`): how long after the last tool call a base counts as in use. Its cache is kept either way
+- `RECONCILE_INTERVAL_HOURS` (default `6`): how old a base's last full download may get before another is scheduled; `0` turns scheduled ones off
+- `CACHE_MAX_MEGABYTES` (default `8192`): disk budget for cache files; the least recently used are deleted first. `0` means no limit
 - `APPROVAL_TTL_MINUTES` (default `1440`, or 24 hours) - how long a pending approval stays valid
 - `QUERY_DEFAULT_LIMIT` (default `100`) and `QUERY_MAX_LIMIT` (default `1000`)
 - `SYNC_MAX_CONCURRENT` (default `4`) - how many base syncs may run at once; the rest queue for a slot

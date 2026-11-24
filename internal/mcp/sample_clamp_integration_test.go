@@ -4,7 +4,6 @@ package mcp_test
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -26,10 +25,10 @@ import (
 
 // Reproduces the oversized list_schema output seen on real bases: a linked
 // record cell holding hundreds of record IDs, an attachment cell carrying
-// signed thumbnail URLs, and a very long text cell. The schema preview must
-// clamp all three while the underlying DuckDB cache keeps full fidelity for
-// the query tool.
-func TestListSchemaClampsOversizedSampleValuesOverMCP(t *testing.T) {
+// signed thumbnail URLs, and a very long text cell. The schema shows one
+// short example per column, so none of them can bloat it, while the DuckDB
+// cache keeps full fidelity for the query tool.
+func TestListSchemaStaysSmallForOversizedValuesOverMCP(t *testing.T) {
 	port := mcpFreePort(t)
 	postgres := embeddedpostgres.NewDatabase(
 		embeddedpostgres.DefaultConfig().
@@ -181,67 +180,48 @@ func TestListSchemaClampsOversizedSampleValuesOverMCP(t *testing.T) {
 		if !ok {
 			return false
 		}
-		structured, ok := result["structuredContent"].(map[string]any)
-		if !ok {
+		content, ok := result["content"].([]any)
+		if !ok || len(content) == 0 {
 			return false
 		}
-		tables, ok := structured["tables"].([]any)
-		if !ok || len(tables) != 1 {
-			return false
-		}
-		table := tables[0].(map[string]any)
-		complete, _ := table["table_complete"].(bool)
-		samples, _ := table["sample_rows"].([]any)
-		return complete && len(samples) == 1
+		text, _ := content[0].(map[string]any)["text"].(string)
+		return strings.Contains(text, "# jams: 1 row, ")
 	})
 
-	structured := schemaResponse["result"].(map[string]any)["structuredContent"].(map[string]any)
-	table := structured["tables"].([]any)[0].(map[string]any)
-	sample := table["sample_rows"].([]any)[0].(map[string]any)
-
-	recordID, _ := sample["id"].(string)
-	if recordID != "recJam1" {
-		t.Fatalf("expected sample row to keep its record id, got %#v", sample)
+	if _, ok := schemaResponse["result"].(map[string]any)["structuredContent"]; ok {
+		t.Fatalf("expected list_schema to return text only, got %#v", schemaResponse["result"])
+	}
+	schemaText := firstToolText(t, schemaResponse)
+	if len(schemaText) > 2000 {
+		t.Fatalf("expected the schema to stay small, got %d characters: %q", len(schemaText), schemaText)
+	}
+	var sawLinks, sawNotes, sawScreenshot bool
+	for _, line := range strings.Split(schemaText, "\n") {
+		cells := strings.Split(line, "\t")
+		if len(cells) < 5 {
+			continue
+		}
+		example := cells[4]
+		switch cells[0] {
+		case "sign_up_records":
+			sawLinks = strings.HasPrefix(example, "[recTask0000000000, ") && cells[3] == "100%"
+		case "notes":
+			sawNotes = example != ""
+		case "screenshot":
+			sawScreenshot = example != ""
+		default:
+			continue
+		}
+		if len([]rune(example)) > 60 || !strings.HasSuffix(example, "...") {
+			t.Fatalf("expected the %s example to be cut to 60 characters, got %q", cells[0], example)
+		}
+	}
+	if !sawLinks || !sawNotes || !sawScreenshot {
+		t.Fatalf("expected short examples for the three oversized columns, got %q", schemaText)
 	}
 
-	links, ok := sample["sign_up_records"].([]any)
-	if !ok {
-		t.Fatalf("expected clamped linked record array, got %#v", sample["sign_up_records"])
-	}
-	if len(links) != 4 || links[3] != "[+449 more, 452 total]" {
-		t.Fatalf("expected 3 linked ids plus overflow marker, got %#v", links)
-	}
-
-	notes, _ := sample["notes"].(string)
-	if !strings.HasSuffix(notes, " [truncated]") || len(notes) > 200 {
-		t.Fatalf("expected long notes to be truncated with marker, got %d chars %q", len(notes), notes)
-	}
-
-	attachments, ok := sample["screenshot"].([]any)
-	if !ok || len(attachments) != 1 {
-		t.Fatalf("expected one attachment in sample, got %#v", sample["screenshot"])
-	}
-	attachment := attachments[0].(map[string]any)
-	if _, hasURL := attachment["url"]; hasURL {
-		t.Fatalf("expected signed url to be stripped from attachment, got %#v", attachment)
-	}
-	if _, hasThumbnails := attachment["thumbnails"]; hasThumbnails {
-		t.Fatalf("expected thumbnails to be stripped from attachment, got %#v", attachment)
-	}
-	if attachment["filename"] != "ceiling.gif" {
-		t.Fatalf("expected attachment filename to survive, got %#v", attachment)
-	}
-
-	encoded, err := json.Marshal(structured)
-	if err != nil {
-		t.Fatalf("json.Marshal(structured) returned error: %v", err)
-	}
-	if len(encoded) > 8000 {
-		t.Fatalf("expected clamped schema payload to stay small, got %d bytes", len(encoded))
-	}
-
-	// The clamp is display-only: the query tool must still return the full
-	// values from the DuckDB cache using the record id from the sample.
+	// The cut is display-only: the query tool must still return the full
+	// values from the DuckDB cache.
 	queryResponse := performAuthenticatedToolCall(t, handler, bearerToken, "query", map[string]any{
 		"base": "appBulky",
 		"sql": []string{

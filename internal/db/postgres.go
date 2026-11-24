@@ -189,6 +189,11 @@ func (s *Store) Migrate(ctx context.Context) error {
 			client_name TEXT,
 			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 		)`,
+		// Cache files are kept after a base goes idle, so eviction and
+		// reconcile scheduling need their own durable timestamps.
+		`ALTER TABLE sync_state ADD COLUMN IF NOT EXISTS last_used_at TIMESTAMPTZ`,
+		`ALTER TABLE sync_state ADD COLUMN IF NOT EXISTS last_reconciled_at TIMESTAMPTZ`,
+		`ALTER TABLE sync_state ADD COLUMN IF NOT EXISTS cache_bytes BIGINT`,
 	}
 
 	for _, statement := range statements {
@@ -644,16 +649,65 @@ func (s *Store) TouchSyncState(ctx context.Context, baseID string, activeUntil t
 		INSERT INTO sync_state (
 			base_id,
 			active_until,
-			sync_token_user_id
-		) VALUES ($1, $2, $3)
+			sync_token_user_id,
+			last_used_at
+		) VALUES ($1, $2, $3, NOW())
 		ON CONFLICT (base_id) DO UPDATE
 		SET active_until = EXCLUDED.active_until,
-		    sync_token_user_id = EXCLUDED.sync_token_user_id
+		    sync_token_user_id = EXCLUDED.sync_token_user_id,
+		    last_used_at = EXCLUDED.last_used_at
 	`, baseID, activeUntil, syncTokenUserID)
 	if err != nil {
 		return fmt.Errorf("touch sync state: %w", err)
 	}
 	return nil
+}
+
+// CacheUsage is when a base's cache was last used by a tool call.
+type CacheUsage struct {
+	BaseID     string
+	LastUsedAt time.Time
+}
+
+// RecordCacheStats stores the size of a base's cache file and, when set, the
+// time of its last full reconcile.
+func (s *Store) RecordCacheStats(ctx context.Context, baseID string, cacheBytes int64, lastReconciledAt *time.Time) error {
+	_, err := s.pool.Exec(ctx, `
+		UPDATE sync_state
+		SET cache_bytes = $2,
+		    last_reconciled_at = COALESCE($3, last_reconciled_at)
+		WHERE base_id = $1
+	`, baseID, cacheBytes, lastReconciledAt)
+	if err != nil {
+		return fmt.Errorf("record cache stats: %w", err)
+	}
+	return nil
+}
+
+// ListCacheUsage returns the last-used time of every base that has one.
+func (s *Store) ListCacheUsage(ctx context.Context) ([]CacheUsage, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT base_id, COALESCE(last_used_at, active_until, last_synced_at)
+		FROM sync_state
+		WHERE COALESCE(last_used_at, active_until, last_synced_at) IS NOT NULL
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("list cache usage: %w", err)
+	}
+	defer rows.Close()
+
+	usage := make([]CacheUsage, 0)
+	for rows.Next() {
+		var entry CacheUsage
+		if err := rows.Scan(&entry.BaseID, &entry.LastUsedAt); err != nil {
+			return nil, fmt.Errorf("scan cache usage: %w", err)
+		}
+		usage = append(usage, entry)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate cache usage: %w", err)
+	}
+	return usage, nil
 }
 
 func (s *Store) ListActiveSyncStates(ctx context.Context, now time.Time) ([]SyncState, error) {

@@ -2,6 +2,7 @@ package logx
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"log/slog"
 	"net/http"
@@ -109,5 +110,26 @@ func TestHTTPMiddlewareLogsRouteTemplateAndRequestID(t *testing.T) {
 	}
 	if strings.Contains(output.String(), "op_sensitive") || strings.Contains(output.String(), "code=abc") {
 		t.Fatalf("expected raw path/query to stay out of logs, got %q", output.String())
+	}
+}
+
+func TestEventSummaryKeepsEventAndPutsSummaryInMessage(t *testing.T) {
+	var output bytes.Buffer
+	ctx := WithLogger(context.Background(), NewLogger(&output))
+
+	EventSummary(ctx, "tool", "tool.failed", "query validation: table not found", "tool_name", "query")
+
+	var entry map[string]any
+	if err := json.Unmarshal(output.Bytes(), &entry); err != nil {
+		t.Fatalf("json.Unmarshal() returned error: %v", err)
+	}
+	if got := entry["msg"]; got != "tool.failed query validation: table not found" {
+		t.Fatalf("msg = %#v", got)
+	}
+	if got := entry["event"]; got != "tool.failed" {
+		t.Fatalf("event = %#v", got)
+	}
+	if got := entry["tool_name"]; got != "query" {
+		t.Fatalf("tool_name = %#v", got)
 	}
 }

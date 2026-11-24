@@ -80,7 +80,7 @@ func TestSyncOnceFailsStalledRun(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		_, err := manager.syncOnce(context.Background(), "usr1", "appStall", "Stall", nil)
+		_, err := manager.syncOnce(context.Background(), "usr1", "appStall", "Stall", syncModeAuto, nil)
 		done <- err
 	}()
 

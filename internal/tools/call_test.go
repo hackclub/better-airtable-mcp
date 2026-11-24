@@ -20,6 +20,9 @@ type fakeSyncer struct {
 	queryBaseCalls     int
 	queryErr           error
 	result             duckdb.QueryResult
+	schema             duckdb.BaseSchema
+	stats              map[string]duckdb.TableStats
+	statsTables        []string
 }
 
 func (f *fakeSyncer) SearchBases(ctx context.Context, accessToken, query string) ([]syncer.Base, error) {
@@ -31,11 +34,19 @@ func (f *fakeSyncer) SyncBase(ctx context.Context, accessToken, baseRef string) 
 }
 
 func (f *fakeSyncer) ListSchema(ctx context.Context, accessToken, baseRef string) (duckdb.BaseSchema, error) {
-	return duckdb.BaseSchema{}, nil
+	return f.schema, nil
 }
 
 func (f *fakeSyncer) ListResolvedSchema(ctx context.Context, baseID, baseName string) (duckdb.BaseSchema, error) {
-	return duckdb.BaseSchema{}, nil
+	return f.schema, nil
+}
+
+func (f *fakeSyncer) ColumnStats(ctx context.Context, baseID string, tables []duckdb.TableSchema) (map[string]duckdb.TableStats, error) {
+	f.statsTables = nil
+	for _, table := range tables {
+		f.statsTables = append(f.statsTables, table.DuckDBTableName)
+	}
+	return f.stats, nil
 }
 
 func (f *fakeSyncer) QueryBase(ctx context.Context, accessToken, baseRef, query string) (duckdb.QueryResult, error) {
@@ -57,6 +68,8 @@ func (f *fakeSyncer) QueryResolvedBase(ctx context.Context, baseID, query string
 // fakeSyncManager implements the SyncManager interface without a database.
 type fakeSyncManager struct {
 	ensureReadableCalls int
+	fullSyncCalls       int
+	freshness           syncer.Freshness
 }
 
 func (f *fakeSyncManager) base() syncer.Base {
@@ -78,6 +91,15 @@ func (f *fakeSyncManager) EnsureBaseSchemaSampled(ctx context.Context, userID, b
 
 func (f *fakeSyncManager) RequestSync(ctx context.Context, userID, baseRef string) (syncer.SyncOperationStatus, error) {
 	return syncer.SyncOperationStatus{OperationID: "sync_appProjects", Status: "syncing"}, nil
+}
+
+func (f *fakeSyncManager) RequestFullSync(ctx context.Context, userID, baseRef string) (syncer.SyncOperationStatus, error) {
+	f.fullSyncCalls++
+	return syncer.SyncOperationStatus{OperationID: "sync_appProjects", Status: "syncing"}, nil
+}
+
+func (f *fakeSyncManager) Freshness(ctx context.Context, baseID string) (syncer.Freshness, bool) {
+	return f.freshness, f.freshness.State != ""
 }
 
 func (f *fakeSyncManager) CheckOperation(ctx context.Context, operationID string) (syncer.SyncOperationStatus, bool, error) {

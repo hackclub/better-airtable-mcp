@@ -20,6 +20,7 @@ type Syncer interface {
 	SyncBase(ctx context.Context, accessToken, baseRef string) (syncer.SyncResult, error)
 	ListSchema(ctx context.Context, accessToken, baseRef string) (duckdb.BaseSchema, error)
 	ListResolvedSchema(ctx context.Context, baseID, baseName string) (duckdb.BaseSchema, error)
+	ColumnStats(ctx context.Context, baseID string, tables []duckdb.TableSchema) (map[string]duckdb.TableStats, error)
 	QueryBase(ctx context.Context, accessToken, baseRef, query string) (duckdb.QueryResult, error)
 	QueryResolvedBase(ctx context.Context, baseID, query string) (duckdb.QueryResult, error)
 }
@@ -31,6 +32,8 @@ type SyncManager interface {
 	EnsureBaseReadable(ctx context.Context, userID, baseRef string) (syncer.Base, error)
 	EnsureBaseSchemaSampled(ctx context.Context, userID, baseRef string) (syncer.Base, error)
 	RequestSync(ctx context.Context, userID, baseRef string) (syncer.SyncOperationStatus, error)
+	RequestFullSync(ctx context.Context, userID, baseRef string) (syncer.SyncOperationStatus, error)
+	Freshness(ctx context.Context, baseID string) (syncer.Freshness, bool)
 	CheckOperation(ctx context.Context, operationID string) (syncer.SyncOperationStatus, bool, error)
 	BaseStatus(baseID string) (syncer.SyncOperationStatus, bool)
 }

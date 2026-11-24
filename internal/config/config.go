@@ -19,6 +19,11 @@ const (
 	defaultQueryLimit        = 100
 	defaultQueryMaxLimit     = 1000
 	defaultSyncMaxConcurrent = 4
+
+	// Cache files are kept between uses, so they are bounded by disk space
+	// rather than by time.
+	defaultCacheMaxBytes     = int64(8) << 30
+	defaultReconcileInterval = 6 * time.Hour
 	requiredEncryptionKeyLen = 32
 )
 
@@ -36,6 +41,8 @@ type Config struct {
 	QueryDefaultLimit    int
 	QueryMaxLimit        int
 	SyncMaxConcurrent    int
+	CacheMaxBytes        int64
+	ReconcileInterval    time.Duration
 }
 
 func LoadFromEnv() (Config, error) {
@@ -52,6 +59,8 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 		QueryDefaultLimit: defaultQueryLimit,
 		QueryMaxLimit:     defaultQueryMaxLimit,
 		SyncMaxConcurrent: defaultSyncMaxConcurrent,
+		CacheMaxBytes:     defaultCacheMaxBytes,
+		ReconcileInterval: defaultReconcileInterval,
 	}
 
 	var problems []string
@@ -91,6 +100,16 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 	cfg.QueryDefaultLimit = intWithDefault(lookup, "QUERY_DEFAULT_LIMIT", cfg.QueryDefaultLimit, &problems)
 	cfg.QueryMaxLimit = intWithDefault(lookup, "QUERY_MAX_LIMIT", cfg.QueryMaxLimit, &problems)
 	cfg.SyncMaxConcurrent = intWithDefault(lookup, "SYNC_MAX_CONCURRENT", cfg.SyncMaxConcurrent, &problems)
+	if megabytes := intWithDefault(lookup, "CACHE_MAX_MEGABYTES", int(cfg.CacheMaxBytes>>20), &problems); megabytes >= 0 {
+		cfg.CacheMaxBytes = int64(megabytes) << 20
+	} else {
+		problems = append(problems, "CACHE_MAX_MEGABYTES must not be negative")
+	}
+	if hours := intWithDefault(lookup, "RECONCILE_INTERVAL_HOURS", int(cfg.ReconcileInterval/time.Hour), &problems); hours >= 0 {
+		cfg.ReconcileInterval = time.Duration(hours) * time.Hour
+	} else {
+		problems = append(problems, "RECONCILE_INTERVAL_HOURS must not be negative")
+	}
 
 	if cfg.QueryDefaultLimit <= 0 {
 		problems = append(problems, "QUERY_DEFAULT_LIMIT must be greater than zero")

@@ -97,7 +97,7 @@ func TestRunSyncSurvivesTokenRotationMidRun(t *testing.T) {
 	// way TokenManager.AirtableAccessToken does after a refresh.
 	tokens := func(context.Context) (string, error) { return client.token(), nil }
 
-	result, err := service.runSync(context.Background(), tokens, Base{ID: "appRotate", Name: "Rotate"}, nil)
+	result, err := service.runSync(context.Background(), tokens, Base{ID: "appRotate", Name: "Rotate"}, syncRunOptions{}, nil)
 	if err != nil {
 		t.Fatalf("runSync failed across a token rotation: %v", err)
 	}
@@ -120,7 +120,7 @@ func TestRunSyncWithCapturedTokenFailsAfterRotation(t *testing.T) {
 	client := &rotatingTokenClient{currentToken: "token-1"}
 	service := NewService(client, t.TempDir())
 
-	_, err := service.runSync(context.Background(), StaticAccessToken("token-1"), Base{ID: "appRotate", Name: "Rotate"}, nil)
+	_, err := service.runSync(context.Background(), StaticAccessToken("token-1"), Base{ID: "appRotate", Name: "Rotate"}, syncRunOptions{}, nil)
 	if err == nil || !IsUnauthorized(err) {
 		t.Fatalf("expected a 401 with a captured token, got %v", err)
 	}

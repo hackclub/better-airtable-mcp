@@ -2,14 +2,18 @@
 package syncer
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 	"time"
+
+	"golang.org/x/time/rate"
 
 	"github.com/hackclub/better-airtable-mcp/internal/duckdb"
 	"github.com/hackclub/better-airtable-mcp/internal/logx"
@@ -25,6 +29,11 @@ type Service struct {
 	syncSlots  chan struct{}
 	basesCache map[string]basesCacheEntry
 	now        func() time.Time
+
+	// deltaBudget overrides deltaPropagationBudget when positive.
+	deltaBudget int
+	// deltaOverlapOverride overrides deltaOverlap when positive.
+	deltaOverlapOverride time.Duration
 }
 
 // baseListCacheTTL bounds how long a fetched base list is reused for base
@@ -231,7 +240,7 @@ func (s *Service) SyncBase(ctx context.Context, accessToken, baseRef string) (Sy
 		return SyncResult{}, err
 	}
 	defer releaseSlot()
-	return s.runSync(ctx, StaticAccessToken(accessToken), base, nil)
+	return s.runSync(ctx, StaticAccessToken(accessToken), base, syncRunOptions{}, nil)
 }
 
 func (s *Service) ListSchema(ctx context.Context, accessToken, baseRef string) (duckdb.BaseSchema, error) {
@@ -403,13 +412,26 @@ func (s *Service) stagingPath(baseID string) string {
 	return filepath.Join(s.dataDir, baseID+".staging.db")
 }
 
-func (s *Service) runSync(ctx context.Context, tokens AccessTokenFunc, base Base, progress func(SyncProgress)) (SyncResult, error) {
-	startedAt := time.Now().UTC()
+// syncRunOptions tunes one full sync run.
+type syncRunOptions struct {
+	// requestsPerSecond, when positive, caps how fast the run pages through
+	// Airtable. A background reconcile uses it to leave most of the base's
+	// shared API budget to everything else.
+	requestsPerSecond float64
+}
+
+func (s *Service) runSync(ctx context.Context, tokens AccessTokenFunc, base Base, options syncRunOptions, progress func(SyncProgress)) (SyncResult, error) {
+	startedAt := s.now().UTC()
 	tables, err := withAccessToken(ctx, tokens, func(token string) ([]Table, error) {
 		return s.client.GetBaseSchema(ctx, token, base.ID)
 	})
 	if err != nil {
 		return SyncResult{}, err
+	}
+	reconcileMeta := duckdb.ReconcileMeta{SchemaHash: schemaHash(tables), Watermark: startedAt}
+	var pacer *rate.Limiter
+	if options.requestsPerSecond > 0 {
+		pacer = rate.NewLimiter(rate.Limit(options.requestsPerSecond), 1)
 	}
 
 	plans, err := buildSyncPlans(tables)
@@ -509,7 +531,9 @@ func (s *Service) runSync(ctx context.Context, tokens AccessTokenFunc, base Base
 	}
 
 	if len(plans) > 0 {
-		workerCtx, cancel := context.WithCancel(ctx)
+		// A full download is the one large job a base has. Marking its pages
+		// keeps the user's other requests ahead of it in their Airtable budget.
+		workerCtx, cancel := context.WithCancel(WithBulkRequests(ctx))
 		defer cancel()
 
 		jobs := make(chan syncJob, len(plans))
@@ -527,6 +551,11 @@ func (s *Service) runSync(ctx context.Context, tokens AccessTokenFunc, base Base
 				defer workerWG.Done()
 				for job := range jobs {
 					runtime := runtimes[job.TableIndex]
+					if pacer != nil {
+						if err := pacer.Wait(workerCtx); err != nil {
+							return
+						}
+					}
 					page, err := withAccessToken(workerCtx, tokens, func(token string) (ListRecordsPageResult, error) {
 						return s.client.ListRecordsPage(workerCtx, token, base.ID, runtime.Plan.Table.AirtableTableID, ListRecordsPageOptions{
 							Offset:        job.Offset,
@@ -690,7 +719,7 @@ func (s *Service) runSync(ctx context.Context, tokens AccessTokenFunc, base Base
 		workerWG.Wait()
 	}
 
-	completedAt := time.Now().UTC()
+	completedAt := s.now().UTC()
 	finalInfo := duckdb.SyncInfo{
 		SyncStartedAt:        startedAt,
 		LastSyncedAt:         completedAt,
@@ -705,16 +734,25 @@ func (s *Service) runSync(ctx context.Context, tokens AccessTokenFunc, base Base
 	}
 
 	if !useStaging {
+		reconcileMeta.ReconciledAt = completedAt
 		unlockDuck, err = s.lockDuckWrite(ctx, base.ID)
 		if err == nil {
 			err = duckdb.FinalizeSnapshot(ctx, targetPath, finalInfo)
+			if err == nil {
+				err = duckdb.MarkReconciled(ctx, targetPath, reconcileMeta)
+			}
 			unlockDuck()
 		}
 		if err != nil {
 			return fail(err)
 		}
 	} else {
+		reconcileMeta.ReconciledAt = completedAt
 		if err := session.FinalizeSnapshot(ctx, finalInfo); err != nil {
+			_ = os.Remove(targetPath)
+			return fail(err)
+		}
+		if err := session.MarkReconciled(ctx, reconcileMeta); err != nil {
 			_ = os.Remove(targetPath)
 			return fail(err)
 		}
@@ -800,6 +838,9 @@ func buildSyncPlans(tables []Table) ([]syncTablePlan, error) {
 				DuckDBColumnName:  sanitizedFieldNames[sanitizedIndex].Sanitized,
 				AirtableFieldType: field.Type,
 				DuckDBType:        mapping.DuckDBType,
+				Description:       strings.TrimSpace(field.Description),
+				Options:           compactFieldOptions(field.Options),
+				IsPrimary:         field.ID != "" && field.ID == table.PrimaryFieldID,
 			})
 			sanitizedIndex++
 		}
@@ -809,6 +850,7 @@ func buildSyncPlans(tables []Table) ([]syncTablePlan, error) {
 				AirtableTableID: table.ID,
 				OriginalName:    table.Name,
 				DuckDBTableName: sanitizedTableNames[tableIndex].Sanitized,
+				Description:     strings.TrimSpace(table.Description),
 				Fields:          fields,
 			},
 			Sort: ListRecordsPageOptions{
@@ -819,6 +861,62 @@ func buildSyncPlans(tables []Table) ([]syncTablePlan, error) {
 	}
 
 	return plans, nil
+}
+
+// compactFieldOptions returns a field's Airtable options as compact JSON text
+// for the cache file, or "" when the field has none.
+func compactFieldOptions(options json.RawMessage) string {
+	trimmed := bytes.TrimSpace(options)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return ""
+	}
+	var compact bytes.Buffer
+	if err := json.Compact(&compact, trimmed); err != nil {
+		return ""
+	}
+	return compact.String()
+}
+
+// refreshFieldDetails keeps the descriptions, options and primary flags in
+// the cache file in step with Airtable. They are outside the schema hash, so
+// a delta is the only thing that would otherwise never notice them change;
+// it also fills them into files written before they were stored.
+func (s *Service) refreshFieldDetails(ctx context.Context, baseID string, plans []syncTablePlan) error {
+	tables := make([]duckdb.TableSnapshot, 0, len(plans))
+	for _, plan := range plans {
+		tables = append(tables, plan.Table)
+	}
+
+	current, err := func() (bool, error) {
+		unlock, err := s.lockDuckRead(ctx, baseID)
+		if err != nil {
+			return false, err
+		}
+		defer unlock()
+		return duckdb.FieldDetailsCurrent(ctx, s.basePath(baseID), tables)
+	}()
+	if err != nil || current {
+		return err
+	}
+
+	unlock, err := s.lockDuckWrite(ctx, baseID)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	return duckdb.WriteFieldDetails(ctx, s.basePath(baseID), tables)
+}
+
+// ColumnStats reads fill counts and example values for the given tables of
+// an already-resolved base. Like ListResolvedSchema it performs no access
+// check.
+func (s *Service) ColumnStats(ctx context.Context, baseID string, tables []duckdb.TableSchema) (map[string]duckdb.TableStats, error) {
+	unlock, err := s.lockDuckRead(ctx, baseID)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
+	return duckdb.ReadColumnStats(ctx, s.basePath(baseID), tables)
 }
 
 func (s *Service) shouldUseStaging(baseID string) bool {

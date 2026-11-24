@@ -177,16 +177,19 @@ func TestAuthenticatedReadToolsOverMCP(t *testing.T) {
 		"base": "Project Tracker",
 	})
 	schemaText := firstToolText(t, schemaResponse)
-	if !strings.Contains(schemaText, "sync_status\n") ||
-		!strings.Contains(schemaText, "base\n\nbase_id,base_name\nappProjects,Project Tracker\n") ||
-		!strings.Contains(schemaText, "tables\n\n# projects\n") ||
-		!strings.Contains(schemaText, "# projects\n\nid,created_time,name,linked_tasks\n") ||
-		!strings.Contains(schemaText, "# tasks\n\nid,created_time,name\n") {
-		t.Fatalf("expected list_schema text to contain sync status, base, and per-table sample sections, got %q", schemaText)
+	for _, want := range []string{
+		"base: Project Tracker (appProjects), 2 tables, 3 columns\n",
+		"# projects: ",
+		"column\ttype\tairtable\tfilled\texample\n",
+		"linked_tasks\tVARCHAR[]\tlink\t",
+		"# tasks: ",
+	} {
+		if !strings.Contains(schemaText, want) {
+			t.Fatalf("expected list_schema text to contain %q, got %q", want, schemaText)
+		}
 	}
-	schemaResult := schemaResponse["result"].(map[string]any)["structuredContent"].(map[string]any)
-	if _, ok := schemaResult["sync"].(map[string]any); !ok {
-		t.Fatalf("expected list_schema structured content to include sync metadata, got %#v", schemaResult)
+	if _, ok := schemaResponse["result"].(map[string]any)["structuredContent"]; ok {
+		t.Fatalf("expected list_schema to return text only, got %#v", schemaResponse["result"])
 	}
 
 	queryResponse := waitForToolResult(t, func() map[string]any {

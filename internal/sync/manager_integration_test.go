@@ -151,7 +151,7 @@ func TestManagerRestoreActiveWorkersResumesBackgroundSync(t *testing.T) {
 	t.Fatal("expected restored worker to refresh the snapshot in the background")
 }
 
-func TestManagerSweepStaleDuckDBFilesRemovesExpiredAndOrphanedFiles(t *testing.T) {
+func TestManagerSweepKeepsCachesAndEvictsLeastRecentlyUsedOverBudget(t *testing.T) {
 	port := syncManagerFreePort(t)
 	postgres := embeddedpostgres.NewDatabase(
 		embeddedpostgres.DefaultConfig().
@@ -225,19 +225,41 @@ func TestManagerSweepStaleDuckDBFilesRemovesExpiredAndOrphanedFiles(t *testing.T
 		}
 	}
 
+	staleStaging := filepath.Join(filepath.Dir(service.DatabasePath("appActive")), "appActive.staging.db")
+	if err := os.WriteFile(staleStaging, []byte("left behind by a crashed refresh"), 0o644); err != nil {
+		t.Fatalf("write stale staging file: %v", err)
+	}
+
+	// With room to spare the sweep keeps every cache, used recently or not,
+	// and only clears the staging leftover.
 	manager := NewManager(service, store, staticTokenSource{}, time.Minute, time.Minute)
 	if err := manager.SweepStaleDuckDBFiles(context.Background()); err != nil {
 		t.Fatalf("SweepStaleDuckDBFiles() returned error: %v", err)
 	}
+	var total int64
+	for _, baseID := range []string{"appActive", "appExpired", "appOrphan"} {
+		info, err := os.Stat(service.DatabasePath(baseID))
+		if err != nil {
+			t.Fatalf("expected %s cache to be kept, got %v", baseID, err)
+		}
+		total += info.Size()
+	}
+	if _, err := os.Stat(staleStaging); !os.IsNotExist(err) {
+		t.Fatalf("expected the stale staging file to be removed, got %v", err)
+	}
 
-	if _, err := os.Stat(service.DatabasePath("appActive")); err != nil {
-		t.Fatalf("expected active DuckDB file to remain, got %v", err)
+	// Over the disk budget, the least recently used cache goes first.
+	manager.SetCacheMaxBytes(total - 1)
+	if err := manager.SweepStaleDuckDBFiles(context.Background()); err != nil {
+		t.Fatalf("SweepStaleDuckDBFiles() over budget returned error: %v", err)
 	}
 	if _, err := os.Stat(service.DatabasePath("appExpired")); !os.IsNotExist(err) {
-		t.Fatalf("expected expired DuckDB file to be removed, got %v", err)
+		t.Fatalf("expected the least recently used cache to be evicted, got %v", err)
 	}
-	if _, err := os.Stat(service.DatabasePath("appOrphan")); !os.IsNotExist(err) {
-		t.Fatalf("expected orphan DuckDB file to be removed, got %v", err)
+	for _, baseID := range []string{"appActive", "appOrphan"} {
+		if _, err := os.Stat(service.DatabasePath(baseID)); err != nil {
+			t.Fatalf("expected %s cache to survive eviction, got %v", baseID, err)
+		}
 	}
 }
 

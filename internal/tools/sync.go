@@ -12,6 +12,7 @@ import (
 
 type SyncInput struct {
 	Base string `json:"base"`
+	Mode string `json:"mode,omitempty"`
 }
 
 type SyncTool struct {
@@ -25,13 +26,18 @@ func NewSyncTool(runtime *Runtime) mcp.Tool {
 func (SyncTool) Definition() mcp.ToolDefinition {
 	return mcp.ToolDefinition{
 		Name:        "sync",
-		Description: "Force a refresh of a base's DuckDB cache.",
+		Description: "Refresh a base's cache now. Reads already pick up recent Airtable edits on their own, so this is rarely needed. The default mode \"delta\" fetches only what changed and takes seconds. Mode \"full\" downloads every record again, which can take minutes on a large base; use it only when a record deleted in Airtable still shows up, or a formula, lookup or rollup value looks out of date.",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
 				"base": map[string]any{
 					"type":        "string",
 					"description": "Airtable base ID or base name.",
+				},
+				"mode": map[string]any{
+					"type":        "string",
+					"enum":        []string{"delta", "full"},
+					"description": "\"delta\" (default) fetches only changes. \"full\" downloads everything again.",
 				},
 			},
 			"required":             []string{"base"},
@@ -49,6 +55,13 @@ func (t SyncTool) Call(ctx context.Context, raw json.RawMessage) (mcp.ToolCallRe
 	input.Base = strings.TrimSpace(input.Base)
 	if input.Base == "" {
 		return mcp.ToolCallResult{}, fmt.Errorf("base is required")
+	}
+	input.Mode = strings.ToLower(strings.TrimSpace(input.Mode))
+	if input.Mode == "" {
+		input.Mode = "delta"
+	}
+	if input.Mode != "delta" && input.Mode != "full" {
+		return mcp.ToolCallResult{}, fmt.Errorf("mode must be \"delta\" or \"full\"")
 	}
 
 	userID, ok := authenticatedUserID(ctx)
@@ -90,7 +103,11 @@ func (t SyncTool) Call(ctx context.Context, raw json.RawMessage) (mcp.ToolCallRe
 		}, payload), payload), nil
 	}
 
-	status, err := t.runtime.SyncManager.RequestSync(ctx, userID, input.Base)
+	request := t.runtime.SyncManager.RequestSync
+	if input.Mode == "full" {
+		request = t.runtime.SyncManager.RequestFullSync
+	}
+	status, err := request(ctx, userID, input.Base)
 	if err != nil {
 		logToolFailed(ctx, "sync", err, "user_id", userID)
 		return mcp.ToolCallResult{}, err
